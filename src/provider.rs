@@ -1,14 +1,5 @@
-use std::path::PathBuf;
-
 use crate::domain::{ExchangePanelSnapshot, VenueId, WatchSnapshot};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WatchRequest {
-    pub payload_path: PathBuf,
-    pub commission_rate: f64,
-    pub target_profit: f64,
-    pub stop_loss: f64,
-}
+pub use crate::transport::WorkerConfig as WatchRequest;
 
 pub trait WatchProvider {
     fn load_watch_snapshot(&mut self, request: &WatchRequest) -> color_eyre::Result<WatchSnapshot>;
@@ -23,4 +14,13 @@ pub enum ProviderRequest {
 
 pub trait ExchangeProvider {
     fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot>;
+}
+
+impl<T> ExchangeProvider for Box<T>
+where
+    T: ExchangeProvider + ?Sized,
+{
+    fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
+        (**self).handle(request)
+    }
 }

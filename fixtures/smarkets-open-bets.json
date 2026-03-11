@@ -1,0 +1,20 @@
+{
+  "bets": [
+    {
+      "label": "Arsenal",
+      "market": "Full-time result",
+      "side": "back",
+      "odds": 2.12,
+      "stake": 5.0,
+      "status": "Open"
+    },
+    {
+      "label": "Both Teams To Score",
+      "market": "Bet Builder",
+      "side": "back",
+      "odds": 1.74,
+      "stake": 3.5,
+      "status": "Open"
+    }
+  ]
+}

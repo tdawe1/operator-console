@@ -16,9 +16,13 @@ fn provider_loads_watch_snapshot_from_bet_recorder_cli() {
 
     let snapshot = provider
         .load_watch_snapshot(&WatchRequest {
-            payload_path: PathBuf::from(
+            positions_payload_path: Some(PathBuf::from(
                 "/home/thomas/projects/sabi/console/operator-console/fixtures/smarkets-open-positions.json",
-            ),
+            )),
+            run_dir: None,
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            agent_browser_session: None,
             commission_rate: 0.0,
             target_profit: 1.0,
             stop_loss: 1.0,

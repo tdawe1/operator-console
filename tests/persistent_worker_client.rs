@@ -1,0 +1,309 @@
+use std::fs;
+use std::path::PathBuf;
+
+use operator_console::transport::WorkerConfig;
+use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClient, WorkerRequest};
+use serde_json::Value;
+use tempfile::tempdir;
+
+#[test]
+fn worker_client_reuses_one_process_for_multiple_requests() {
+    let temp_dir = tempdir().expect("temp dir");
+    let src_dir = temp_dir.path().join("src").join("bet_recorder");
+    fs::create_dir_all(&src_dir).expect("package dir");
+    fs::write(src_dir.join("__init__.py"), "").expect("init");
+    fs::write(
+        src_dir.join("__main__.py"),
+        "from bet_recorder.cli import main\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .expect("main");
+
+    let spawn_count_path = temp_dir.path().join("spawn-count.txt");
+    fs::write(&spawn_count_path, "0").expect("spawn count seed");
+    let spawn_count_literal = format!("{:?}", spawn_count_path.to_string_lossy().to_string());
+
+    fs::write(
+        src_dir.join("cli.py"),
+        format!(
+            r#"
+from __future__ import annotations
+import json
+import pathlib
+import sys
+
+SPAWN_COUNT_PATH = pathlib.Path({spawn_count_literal})
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] != "exchange-worker-session":
+        raise SystemExit("unexpected command")
+
+    current = int(SPAWN_COUNT_PATH.read_text())
+    SPAWN_COUNT_PATH.write_text(str(current + 1))
+
+    request_number = 0
+    for line in sys.stdin:
+        request = json.loads(line)
+        request_number += 1
+        if request == {{
+            "LoadDashboard": {{
+                "config": {{
+                    "positions_payload_path": "/tmp/ignored.json",
+                    "run_dir": None,
+                    "account_payload_path": None,
+                    "open_bets_payload_path": None,
+                    "agent_browser_session": None,
+                    "commission_rate": 0.0,
+                    "target_profit": 1.0,
+                    "stop_loss": 1.0,
+                }}
+            }}
+        }}:
+            status_line = "response 1"
+        elif request == "Refresh":
+            status_line = "response 2"
+        else:
+            raise SystemExit(f"unexpected request: {{request}}")
+
+        sys.stdout.write(json.dumps({{
+            "snapshot": {{
+                "worker": {{
+                    "name": "stub-worker",
+                    "status": "ready",
+                    "detail": status_line
+                }},
+                "venues": [],
+                "selected_venue": None,
+                "events": [],
+                "markets": [],
+                "preflight": None,
+                "status_line": status_line,
+                "watch": None
+            }}
+        }}) + "\n")
+        sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
+"#
+        ),
+    )
+    .expect("cli");
+
+    let mut client = BetRecorderWorkerClient::new(
+        PathBuf::from("/usr/bin/python"),
+        temp_dir.path().to_path_buf(),
+    );
+
+    let first = client
+        .send(WorkerRequest::LoadDashboard {
+            config: WorkerConfig {
+                positions_payload_path: Some(PathBuf::from("/tmp/ignored.json")),
+                run_dir: None,
+                account_payload_path: None,
+                open_bets_payload_path: None,
+                agent_browser_session: None,
+                commission_rate: 0.0,
+                target_profit: 1.0,
+                stop_loss: 1.0,
+            },
+        })
+        .expect("first worker response");
+    let second = client
+        .send(WorkerRequest::Refresh)
+        .expect("second worker response");
+
+    assert_eq!(first.snapshot.status_line, "response 1");
+    assert_eq!(second.snapshot.status_line, "response 2");
+    assert_eq!(
+        fs::read_to_string(spawn_count_path).expect("spawn count"),
+        "1"
+    );
+}
+
+#[test]
+fn worker_client_reboots_session_and_replays_bootstrap_after_worker_exit() {
+    let temp_dir = tempdir().expect("temp dir");
+    let src_dir = temp_dir.path().join("src").join("bet_recorder");
+    fs::create_dir_all(&src_dir).expect("package dir");
+    fs::write(src_dir.join("__init__.py"), "").expect("init");
+    fs::write(
+        src_dir.join("__main__.py"),
+        "from bet_recorder.cli import main\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .expect("main");
+
+    let spawn_count_path = temp_dir.path().join("spawn-count.txt");
+    fs::write(&spawn_count_path, "0").expect("spawn count seed");
+    let spawn_count_literal = format!("{:?}", spawn_count_path.to_string_lossy().to_string());
+
+    let request_log_path = temp_dir.path().join("request-log.txt");
+    let request_log_literal = format!("{:?}", request_log_path.to_string_lossy().to_string());
+
+    fs::write(
+        src_dir.join("cli.py"),
+        format!(
+            r#"
+from __future__ import annotations
+import json
+import pathlib
+import sys
+
+SPAWN_COUNT_PATH = pathlib.Path({spawn_count_literal})
+REQUEST_LOG_PATH = pathlib.Path({request_log_literal})
+
+LOAD_DASHBOARD = {{
+    "LoadDashboard": {{
+            "config": {{
+                "positions_payload_path": "/tmp/ignored.json",
+                "run_dir": None,
+                "account_payload_path": None,
+                "open_bets_payload_path": None,
+                "agent_browser_session": None,
+                "commission_rate": 0.0,
+                "target_profit": 1.0,
+                "stop_loss": 1.0,
+        }}
+    }}
+}}
+
+def record_request(spawn_number: int, request: object) -> None:
+    with REQUEST_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"{{spawn_number}}:{{json.dumps(request, sort_keys=True)}}\n")
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] != "exchange-worker-session":
+        raise SystemExit("unexpected command")
+
+    spawn_number = int(SPAWN_COUNT_PATH.read_text()) + 1
+    SPAWN_COUNT_PATH.write_text(str(spawn_number))
+
+    if spawn_number == 1:
+        request = json.loads(sys.stdin.readline())
+        record_request(spawn_number, request)
+        if request != LOAD_DASHBOARD:
+            raise SystemExit(f"unexpected first request: {{request}}")
+        sys.stdout.write(json.dumps({{
+            "snapshot": {{
+                "worker": {{"name": "stub-worker", "status": "ready", "detail": "boot-1"}},
+                "venues": [],
+                "selected_venue": None,
+                "events": [],
+                "markets": [],
+                "preflight": None,
+                "status_line": "boot-1",
+                "watch": None
+            }}
+        }}) + "\n")
+        sys.stdout.flush()
+        return
+
+    first = json.loads(sys.stdin.readline())
+    record_request(spawn_number, first)
+    if first != LOAD_DASHBOARD:
+        raise SystemExit(f"unexpected reboot request: {{first}}")
+    sys.stdout.write(json.dumps({{
+        "snapshot": {{
+            "worker": {{"name": "stub-worker", "status": "ready", "detail": "boot-2"}},
+            "venues": [],
+            "selected_venue": None,
+            "events": [],
+            "markets": [],
+            "preflight": None,
+            "status_line": "boot-2",
+            "watch": None
+        }}
+    }}) + "\n")
+    sys.stdout.flush()
+
+    second = json.loads(sys.stdin.readline())
+    record_request(spawn_number, second)
+    if second != "Refresh":
+        raise SystemExit(f"unexpected replayed request: {{second}}")
+    sys.stdout.write(json.dumps({{
+        "snapshot": {{
+            "worker": {{"name": "stub-worker", "status": "ready", "detail": "response 2"}},
+            "venues": [],
+            "selected_venue": None,
+            "events": [],
+            "markets": [],
+            "preflight": None,
+            "status_line": "response 2",
+            "watch": None
+        }}
+    }}) + "\n")
+    sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
+"#
+        ),
+    )
+    .expect("cli");
+
+    let bootstrap_config = WorkerConfig {
+        positions_payload_path: Some(PathBuf::from("/tmp/ignored.json")),
+        run_dir: None,
+        account_payload_path: None,
+        open_bets_payload_path: None,
+        agent_browser_session: None,
+        commission_rate: 0.0,
+        target_profit: 1.0,
+        stop_loss: 1.0,
+    };
+
+    let mut client = BetRecorderWorkerClient::new(
+        PathBuf::from("/usr/bin/python"),
+        temp_dir.path().to_path_buf(),
+    );
+
+    let first = client
+        .send(WorkerRequest::LoadDashboard {
+            config: bootstrap_config.clone(),
+        })
+        .expect("first worker response");
+    let second = client
+        .send(WorkerRequest::Refresh)
+        .expect("refreshed after worker restart");
+
+    assert_eq!(first.snapshot.status_line, "boot-1");
+    assert_eq!(second.snapshot.status_line, "response 2");
+    assert_eq!(
+        fs::read_to_string(spawn_count_path).expect("spawn count"),
+        "2"
+    );
+    let logged_requests = fs::read_to_string(request_log_path)
+        .expect("request log")
+        .lines()
+        .map(parse_logged_request)
+        .collect::<Vec<_>>();
+    let expected_bootstrap = serde_json::json!({
+        "LoadDashboard": {
+                "config": {
+                "positions_payload_path": "/tmp/ignored.json",
+                "run_dir": null,
+                "account_payload_path": null,
+                "open_bets_payload_path": null,
+                "agent_browser_session": null,
+                "commission_rate": 0.0,
+                "target_profit": 1.0,
+                "stop_loss": 1.0,
+            }
+        }
+    });
+    assert_eq!(
+        logged_requests,
+        vec![
+            (1, expected_bootstrap.clone()),
+            (2, expected_bootstrap),
+            (2, serde_json::json!("Refresh")),
+        ]
+    );
+}
+
+fn parse_logged_request(line: &str) -> (usize, Value) {
+    let (spawn_number, payload) = line.split_once(':').expect("spawn separator");
+    (
+        spawn_number.parse::<usize>().expect("spawn number"),
+        serde_json::from_str(payload).expect("payload json"),
+    )
+}

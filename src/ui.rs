@@ -6,9 +6,8 @@ use ratatui::Frame;
 
 use crate::app::{App, Panel};
 use crate::panels;
-use crate::provider::ExchangeProvider;
 
-pub fn render<P: ExchangeProvider>(frame: &mut Frame<'_>, app: &mut App<P>) {
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let layout = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(10),
@@ -16,10 +15,11 @@ pub fn render<P: ExchangeProvider>(frame: &mut Frame<'_>, app: &mut App<P>) {
     ])
     .split(frame.area());
 
-    let titles = ["Dashboard", "Exchanges"];
+    let titles = ["Dashboard", "Exchanges", "Recorder"];
     let selected = match app.active_panel() {
         Panel::Dashboard => 0,
         Panel::Exchanges => 1,
+        Panel::Recorder => 2,
     };
 
     let header = Tabs::new(titles)
@@ -38,6 +38,7 @@ pub fn render<P: ExchangeProvider>(frame: &mut Frame<'_>, app: &mut App<P>) {
             let snapshot = app.snapshot().clone();
             panels::exchanges::render(frame, layout[1], &snapshot, app.exchange_list_state())
         }
+        Panel::Recorder => panels::recorder::render(frame, layout[1], app),
     }
 
     let footer = Paragraph::new(vec![

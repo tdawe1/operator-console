@@ -11,4 +11,6 @@ fn help_command_exits_successfully() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("operator-console"));
+    assert!(stdout.contains("--bet-recorder-payload-path"));
+    assert!(stdout.contains("--bet-recorder-command"));
 }

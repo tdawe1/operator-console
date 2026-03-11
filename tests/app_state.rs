@@ -66,5 +66,9 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         markets: Vec::new(),
         preflight: None,
         status_line: status_line.to_string(),
+        account_stats: None,
+        open_positions: Vec::new(),
+        other_open_bets: Vec::new(),
+        watch: None,
     }
 }

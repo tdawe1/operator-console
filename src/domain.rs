@@ -92,7 +92,38 @@ pub struct PreflightSummary {
     pub stake: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountStats {
+    pub available_balance: f64,
+    pub exposure: f64,
+    pub unrealized_pnl: f64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenPositionRow {
+    pub contract: String,
+    pub market: String,
+    pub price: f64,
+    pub stake: f64,
+    pub liability: f64,
+    pub current_value: f64,
+    pub pnl_amount: f64,
+    pub can_trade_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OtherOpenBetRow {
+    pub label: String,
+    pub market: String,
+    pub side: String,
+    pub odds: f64,
+    pub stake: f64,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExchangePanelSnapshot {
     pub worker: WorkerSummary,
     pub venues: Vec<VenueSummary>,
@@ -101,6 +132,10 @@ pub struct ExchangePanelSnapshot {
     pub markets: Vec<MarketSummary>,
     pub preflight: Option<PreflightSummary>,
     pub status_line: String,
+    pub account_stats: Option<AccountStats>,
+    pub open_positions: Vec<OpenPositionRow>,
+    pub other_open_bets: Vec<OtherOpenBetRow>,
+    pub watch: Option<WatchSnapshot>,
 }
 
 impl ExchangePanelSnapshot {
