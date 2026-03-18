@@ -1,7 +1,6 @@
-pub mod banking;
 pub mod calculator;
-pub mod dashboard;
 pub mod exchanges;
+pub mod oddsmatcher;
 pub mod observability;
 pub mod recorder;
 pub mod trading_markets;

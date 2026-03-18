@@ -28,25 +28,16 @@ use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
-    Dashboard,
     Trading,
-    Banking,
     Observability,
 }
 
 impl Panel {
-    pub const ALL: [Self; 4] = [
-        Self::Dashboard,
-        Self::Trading,
-        Self::Banking,
-        Self::Observability,
-    ];
+    pub const ALL: [Self; 2] = [Self::Trading, Self::Observability];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Dashboard => "Dashboard",
             Self::Trading => "Trading",
-            Self::Banking => "Banking",
             Self::Observability => "Observability",
         }
     }
@@ -83,35 +74,6 @@ impl TradingSection {
             Self::Stats => "Stats",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BankingSection {
-    Accounts,
-    Transfers,
-    Transactions,
-    Reconciliation,
-    Stats,
-}
-
-impl BankingSection {
-    pub const ALL: [Self; 5] = [
-        Self::Accounts,
-        Self::Transfers,
-        Self::Transactions,
-        Self::Reconciliation,
-        Self::Stats,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Accounts => "Accounts",
-            Self::Transfers => "Transfers",
-            Self::Transactions => "Transactions",
-            Self::Reconciliation => "Reconciliation",
-            Self::Stats => "Stats",
         }
     }
 }
@@ -299,7 +261,6 @@ pub struct App {
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
     trading_section: TradingSection,
-    banking_section: BankingSection,
     observability_section: ObservabilitySection,
     exchange_list_state: ListState,
     open_position_table_state: TableState,
@@ -375,7 +336,7 @@ impl App {
     }
 
     pub fn with_dependencies_and_storage(
-        mut provider: Box<dyn ExchangeProvider>,
+        provider: Box<dyn ExchangeProvider>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -383,9 +344,30 @@ impl App {
         recorder_config_path: std::path::PathBuf,
         recorder_config_note: String,
     ) -> Result<Self> {
+        Self::with_dependencies_and_storage_paths(
+            provider,
+            make_stub_provider,
+            make_recorder_provider,
+            recorder_supervisor,
+            recorder_config,
+            recorder_config_path,
+            recorder_config_note,
+            oddsmatcher::default_query_path(),
+        )
+    }
+
+    pub fn with_dependencies_and_storage_paths(
+        mut provider: Box<dyn ExchangeProvider>,
+        make_stub_provider: Box<StubFactory>,
+        make_recorder_provider: Box<ProviderFactory>,
+        recorder_supervisor: Box<dyn RecorderSupervisor>,
+        recorder_config: RecorderConfig,
+        recorder_config_path: std::path::PathBuf,
+        recorder_config_note: String,
+        oddsmatcher_query_path: PathBuf,
+    ) -> Result<Self> {
         let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
         let status_message = snapshot.status_line.clone();
-        let oddsmatcher_query_path = oddsmatcher::default_query_path();
         let (oddsmatcher_query, oddsmatcher_query_note) =
             oddsmatcher::load_query_or_default(&oddsmatcher_query_path).unwrap_or_else(|error| {
                 (
@@ -418,9 +400,8 @@ impl App {
             oddsmatcher_rows: Vec::new(),
             oddsmatcher_table_state: TableState::default(),
             snapshot,
-            active_panel: Panel::Dashboard,
+            active_panel: Panel::Trading,
             trading_section: TradingSection::Accounts,
-            banking_section: BankingSection::Accounts,
             observability_section: ObservabilitySection::Workers,
             exchange_list_state: ListState::default(),
             open_position_table_state,
@@ -454,16 +435,12 @@ impl App {
         self.trading_section = section;
     }
 
-    pub fn active_banking_section(&self) -> BankingSection {
-        self.banking_section
-    }
-
     pub fn active_observability_section(&self) -> ObservabilitySection {
         self.observability_section
     }
 
     pub fn help_text(&self) -> &'static str {
-        "q quit | j/k modules | h/l sections | tab next | arrows nav | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults\ns start recorder | x stop recorder | c cash out | b cycle type | m toggle mode"
+        "q quit | o observability | h/l sections | arrows nav | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults\ns start recorder | x stop recorder | c cash out | b cycle type | m toggle mode"
     }
 
     pub fn selected_exchange_row(&self) -> Option<usize> {
@@ -640,6 +617,16 @@ impl App {
         {
             return self.refresh_oddsmatcher();
         }
+        self.refresh_provider_snapshot()
+    }
+
+    pub fn replace_oddsmatcher_rows(&mut self, rows: Vec<OddsMatcherRow>, status_message: String) {
+        self.oddsmatcher_rows = rows;
+        self.clamp_selected_oddsmatcher_row();
+        self.status_message = status_message;
+    }
+
+    fn refresh_provider_snapshot(&mut self) -> Result<()> {
         match self.provider.handle(ProviderRequest::Refresh) {
             Ok(snapshot) => {
                 self.replace_snapshot(snapshot);
@@ -739,31 +726,17 @@ impl App {
     }
 
     pub fn next_panel(&mut self) {
-        self.active_panel = match self.active_panel {
-            Panel::Dashboard => Panel::Trading,
-            Panel::Trading => Panel::Banking,
-            Panel::Banking => Panel::Observability,
-            Panel::Observability => Panel::Dashboard,
-        };
+        self.toggle_observability_panel();
     }
 
     pub fn previous_panel(&mut self) {
-        self.active_panel = match self.active_panel {
-            Panel::Dashboard => Panel::Observability,
-            Panel::Trading => Panel::Dashboard,
-            Panel::Banking => Panel::Trading,
-            Panel::Observability => Panel::Banking,
-        };
+        self.toggle_observability_panel();
     }
 
     pub fn next_section(&mut self) {
         match self.active_panel {
-            Panel::Dashboard => {}
             Panel::Trading => {
                 self.trading_section = next_from(self.trading_section, &TradingSection::ALL)
-            }
-            Panel::Banking => {
-                self.banking_section = next_from(self.banking_section, &BankingSection::ALL)
             }
             Panel::Observability => {
                 self.observability_section =
@@ -774,12 +747,8 @@ impl App {
 
     pub fn previous_section(&mut self) {
         match self.active_panel {
-            Panel::Dashboard => {}
             Panel::Trading => {
                 self.trading_section = previous_from(self.trading_section, &TradingSection::ALL)
-            }
-            Panel::Banking => {
-                self.banking_section = previous_from(self.banking_section, &BankingSection::ALL)
             }
             Panel::Observability => {
                 self.observability_section =
@@ -901,8 +870,7 @@ impl App {
         match key_code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Esc => self.running = false,
-            KeyCode::Tab => self.next_panel(),
-            KeyCode::BackTab => self.previous_panel(),
+            KeyCode::Char('o') => self.toggle_observability_panel(),
             KeyCode::Right | KeyCode::Char('l') => self.next_section(),
             KeyCode::Left | KeyCode::Char('h') => self.previous_section(),
             KeyCode::Enter => {
@@ -1005,8 +973,6 @@ impl App {
                     self.recorder_status = RecorderStatus::Error;
                 }
             }
-            KeyCode::Char('j') => self.next_panel(),
-            KeyCode::Char('k') => self.previous_panel(),
             KeyCode::Down => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
                 (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
@@ -1252,7 +1218,7 @@ impl App {
 
         if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
             self.last_recorder_refresh_at = Some(Instant::now());
-            let _ = self.refresh();
+            let _ = self.refresh_provider_snapshot();
         }
     }
 
@@ -1635,13 +1601,16 @@ impl App {
                 self.status_message = format!("OddsMatcher refresh failed: {error}");
                 error
             })?;
-        self.oddsmatcher_rows = rows;
-        self.clamp_selected_oddsmatcher_row();
-        self.status_message = format!(
-            "Loaded {} live OddsMatcher row(s).",
-            self.oddsmatcher_rows.len()
-        );
+        let row_count = rows.len();
+        self.replace_oddsmatcher_rows(rows, format!("Loaded {row_count} live OddsMatcher row(s)."));
         Ok(())
+    }
+
+    fn toggle_observability_panel(&mut self) {
+        self.active_panel = match self.active_panel {
+            Panel::Trading => Panel::Observability,
+            Panel::Observability => Panel::Trading,
+        };
     }
 }
 
@@ -1709,7 +1678,7 @@ mod tests {
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
 
-    use super::App;
+    use super::{App, Panel, TradingSection};
 
     struct RefreshingProvider {
         refresh_count: Rc<RefCell<usize>>,
@@ -1885,6 +1854,49 @@ mod tests {
 
         assert_eq!(app.snapshot().status_line, "Initial dashboard");
         assert_eq!(*refresh_count.borrow(), 0);
+    }
+
+    #[test]
+    fn poll_recorder_keeps_provider_refresh_running_inside_oddsmatcher() {
+        let refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                refresh_count: refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.set_active_panel(Panel::Trading);
+        app.set_trading_section(TradingSection::OddsMatcher);
+        app.recorder_status = RecorderStatus::Running;
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
+        assert!(app.oddsmatcher_rows().is_empty());
+        assert_eq!(*refresh_count.borrow(), 1);
     }
 
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

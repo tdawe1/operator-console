@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, BankingSection, ObservabilitySection, Panel, TradingSection};
+use crate::app::{App, ObservabilitySection, Panel, TradingSection};
 use crate::domain::WorkerStatus;
 use crate::panels;
 use crate::recorder::RecorderStatus;
@@ -55,17 +55,6 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let layout = Layout::vertical([Constraint::Length(3), Constraint::Min(8)]).split(area);
 
     match app.active_panel() {
-        Panel::Dashboard => {
-            let header = Paragraph::new(Line::raw("")).block(
-                Block::default()
-                    .title("Dashboard")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(accent_blue()))
-                    .style(Style::default().bg(panel_background()).fg(text_color())),
-            );
-            frame.render_widget(header, layout[0]);
-            panels::dashboard::render(frame, layout[1], app);
-        }
         Panel::Trading => {
             render_subnav(
                 frame,
@@ -106,6 +95,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         app.open_position_table_state(),
                     )
                 }
+                TradingSection::OddsMatcher => panels::oddsmatcher::render(frame, layout[1], app),
                 TradingSection::Stats => {
                     panels::trading_stats::render(frame, layout[1], app.snapshot())
                 }
@@ -114,16 +104,6 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 }
                 TradingSection::Recorder => panels::recorder::render(frame, layout[1], app),
             }
-        }
-        Panel::Banking => {
-            render_subnav(
-                frame,
-                layout[0],
-                &BankingSection::ALL.map(BankingSection::label),
-                banking_index(app.active_banking_section()),
-                "Banking",
-            );
-            panels::banking::render(frame, layout[1], app.active_banking_section());
         }
         Panel::Observability => {
             render_subnav(
@@ -323,16 +303,15 @@ fn badge_line(label: &'static str, value: &str, accent: Color) -> Line<'static> 
 
 fn panel_subtitle(app: &App) -> &'static str {
     match app.active_panel() {
-        Panel::Dashboard => "Cross-domain triage and attention management.",
         Panel::Trading => match app.active_trading_section() {
             TradingSection::Accounts => "Venue state, exchange coverage, and selection context.",
             TradingSection::Positions => "Live positions, exit readiness, and watch thresholds.",
             TradingSection::Markets => "Markets and watch candidates from the current provider.",
+            TradingSection::OddsMatcher => "Live bookmaker/exchange opportunities from OddsMatcher.",
             TradingSection::Stats => "Trading account and performance rollups.",
             TradingSection::Calculator => "Native matched-betting calculator and scenario analysis.",
             TradingSection::Recorder => "Recorder controls and live capture configuration.",
         },
-        Panel::Banking => "Cash, reconciliation, and transfer workflows.",
         Panel::Observability => "Workers, watcher freshness, and operator diagnostics.",
     }
 }
@@ -353,9 +332,7 @@ fn panel_cycle_label(app: &App) -> String {
 
 fn active_context_label(app: &App) -> String {
     match app.active_panel() {
-        Panel::Dashboard => String::from("Dashboard"),
         Panel::Trading => format!("Trading / {}", app.active_trading_section().label()),
-        Panel::Banking => format!("Banking / {}", app.active_banking_section().label()),
         Panel::Observability => format!(
             "Observability / {}",
             app.active_observability_section().label()
@@ -416,19 +393,10 @@ fn trading_index(section: TradingSection) -> usize {
         TradingSection::Accounts => 0,
         TradingSection::Positions => 1,
         TradingSection::Markets => 2,
-        TradingSection::Stats => 3,
-        TradingSection::Calculator => 4,
-        TradingSection::Recorder => 5,
-    }
-}
-
-fn banking_index(section: BankingSection) -> usize {
-    match section {
-        BankingSection::Accounts => 0,
-        BankingSection::Transfers => 1,
-        BankingSection::Transactions => 2,
-        BankingSection::Reconciliation => 3,
-        BankingSection::Stats => 4,
+        TradingSection::OddsMatcher => 3,
+        TradingSection::Stats => 4,
+        TradingSection::Calculator => 5,
+        TradingSection::Recorder => 6,
     }
 }
 
