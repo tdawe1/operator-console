@@ -12,6 +12,7 @@ fn calculator_section_is_reachable_from_trading_navigation() {
     app.next_section();
     app.next_section();
     app.next_section();
+    app.next_section();
 
     assert_eq!(app.active_trading_section(), TradingSection::Calculator);
 }

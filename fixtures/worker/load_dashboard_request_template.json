@@ -1,14 +1,17 @@
 {
-  "LoadDashboard": {
-    "config": {
-      "positions_payload_path": "__POSITIONS_PAYLOAD_PATH__",
-      "run_dir": "__RUN_DIR__",
-      "account_payload_path": "__ACCOUNT_PAYLOAD_PATH__",
-      "open_bets_payload_path": "__OPEN_BETS_PAYLOAD_PATH__",
-      "agent_browser_session": "__AGENT_BROWSER_SESSION__",
-      "commission_rate": 0.0,
-      "target_profit": 1.0,
-      "stop_loss": 1.0
-    }
-  }
+	"LoadDashboard": {
+		"config": {
+			"positions_payload_path": "__POSITIONS_PAYLOAD_PATH__",
+			"run_dir": "__RUN_DIR__",
+			"account_payload_path": "__ACCOUNT_PAYLOAD_PATH__",
+			"open_bets_payload_path": "__OPEN_BETS_PAYLOAD_PATH__",
+			"companion_legs_path": "__COMPANION_LEGS_PATH__",
+			"agent_browser_session": "__AGENT_BROWSER_SESSION__",
+			"commission_rate": 0.0,
+			"target_profit": 1.0,
+			"stop_loss": 1.0,
+			"hard_margin_call_profit_floor": null,
+			"warn_only_default": true
+		}
+	}
 }

@@ -126,6 +126,9 @@ impl ExchangeProvider for BetRecorderExchangeProvider {
         match request {
             ProviderRequest::LoadDashboard | ProviderRequest::Refresh => self.load_snapshot(),
             ProviderRequest::SelectVenue(VenueId::Smarkets) => self.load_snapshot(),
+            ProviderRequest::CashOutTrackedBet { .. } => Err(eyre!(
+                "bet-recorder watch provider does not implement cash out actions"
+            )),
             ProviderRequest::SelectVenue(venue) => Err(eyre!(
                 "bet-recorder provider does not support {}",
                 venue.as_str()
@@ -190,9 +193,15 @@ pub(crate) fn map_watch_snapshot(watch: &WatchSnapshot) -> ExchangePanelSnapshot
             "Loaded {} Smarkets watch groups from bet-recorder.",
             watch.watch_count
         ),
+        runtime: None,
         account_stats: None,
         open_positions: Vec::new(),
+        historical_positions: Vec::new(),
         other_open_bets: Vec::new(),
+        decisions: Vec::new(),
         watch: Some(watch.clone()),
+        tracked_bets: Vec::new(),
+        exit_policy: Default::default(),
+        exit_recommendations: Vec::new(),
     }
 }

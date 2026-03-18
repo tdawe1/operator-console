@@ -26,5 +26,10 @@ fn provider_contract_returns_snapshot() {
 #[test]
 fn venue_id_display_labels_are_stable() {
     assert_eq!(VenueId::Smarkets.as_str(), "smarkets");
+    assert_eq!(VenueId::Bet365.as_str(), "bet365");
     assert_eq!(VenueId::Betfair.as_str(), "betfair");
+    assert_eq!(VenueId::Betfred.as_str(), "betfred");
+    assert_eq!(VenueId::Betdaq.as_str(), "betdaq");
+    assert_eq!(VenueId::Betway.as_str(), "betway");
+    assert_eq!(VenueId::Betuk.as_str(), "betuk");
 }

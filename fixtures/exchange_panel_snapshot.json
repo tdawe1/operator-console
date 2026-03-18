@@ -2,15 +2,15 @@
   "snapshot": {
     "worker": {
       "name": "exchange-browser-worker",
-      "status": "ready",
-      "detail": "Stub transport response loaded from fixture"
+      "status": "idle",
+      "detail": "Stub demo snapshot loaded from fixture"
     },
     "venues": [
       {
         "id": "smarkets",
         "label": "Smarkets",
-        "status": "connected",
-        "detail": "Browser profile ready",
+        "status": "planned",
+        "detail": "Stub/demo only; not a live session",
         "event_count": 3,
         "market_count": 18
       },
@@ -23,7 +23,7 @@
         "market_count": 0
       }
     ],
-    "selected_venue": "smarkets",
+    "selected_venue": null,
     "events": [
       {
         "id": "arsenal-v-everton",
@@ -51,6 +51,6 @@
       "side": "buy",
       "stake": 10.0
     },
-    "status_line": "Stub dashboard ready"
+    "status_line": "Stub demo data loaded. Open Trading > Recorder and press s for live data."
   }
 }

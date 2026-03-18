@@ -29,6 +29,10 @@ impl ExchangeProvider for StubExchangeProvider {
                 self.select_venue(venue)?;
                 Ok(self.snapshot.clone())
             }
+            ProviderRequest::CashOutTrackedBet { bet_id } => {
+                self.snapshot.status_line = format!("Cash out requested for {bet_id}.");
+                Ok(self.snapshot.clone())
+            }
         }
     }
 }

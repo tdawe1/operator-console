@@ -1,9 +1,12 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 
-use crate::domain::{ExchangePanelSnapshot, VenueSummary};
+use crate::domain::{ExchangePanelSnapshot, VenueStatus, VenueSummary};
 
 pub fn render(
     frame: &mut Frame<'_>,
@@ -11,296 +14,401 @@ pub fn render(
     snapshot: &ExchangePanelSnapshot,
     list_state: &mut ListState,
 ) {
-    let layout =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(area);
+    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(16)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(layout[1]);
+    let right = Layout::vertical([
+        Constraint::Length(10),
+        Constraint::Length(5),
+        Constraint::Min(8),
+    ])
+    .split(body[1]);
 
-    let items = snapshot.venues.iter().map(render_venue_item);
+    render_summary(frame, layout[0], snapshot);
+    render_venue_list(frame, body[0], snapshot, list_state);
+    render_selected_venue(frame, right[0], snapshot, list_state.selected());
+    render_health_gauges(frame, right[1], snapshot);
+    render_feed_preview(frame, right[2], snapshot);
+}
+
+fn render_summary(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
+    let connected = snapshot
+        .venues
+        .iter()
+        .filter(|venue| matches!(venue.status, VenueStatus::Connected | VenueStatus::Ready))
+        .count();
+    let selected = selected_venue(snapshot, None)
+        .map(|venue| venue.label.as_str())
+        .unwrap_or("none");
+    let runtime = snapshot.runtime.as_ref();
+
+    let body = Paragraph::new(vec![
+        Line::raw(snapshot.status_line.clone()),
+        Line::raw(format!(
+            "Connected venues: {connected}/{} | Open positions: {} | Other open bets: {} | Tracked bets: {}",
+            snapshot.venues.len(),
+            snapshot.open_positions.len(),
+            snapshot.other_open_bets.len(),
+            snapshot.tracked_bets.len(),
+        )),
+        Line::raw(format!(
+            "Selected venue: {selected} | Worker: {:?} | Recorder source: {}",
+            snapshot.worker.status,
+            runtime
+                .map(|summary| summary.source.as_str())
+                .unwrap_or("snapshot"),
+        )),
+        Line::raw(format!(
+            "Updated: {} | Decisions: {} | Watch rows: {}",
+            runtime
+                .map(|summary| summary.updated_at.as_str())
+                .unwrap_or("unknown"),
+            snapshot.decisions.len(),
+            snapshot
+                .watch
+                .as_ref()
+                .map(|watch| watch.watch_count)
+                .unwrap_or(0),
+        )),
+    ])
+    .block(section_block("Venue Board", accent_blue()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_venue_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    list_state: &mut ListState,
+) {
+    let items = if snapshot.venues.is_empty() {
+        vec![ListItem::new("No venues loaded.")]
+    } else {
+        snapshot
+            .venues
+            .iter()
+            .map(render_venue_item)
+            .collect::<Vec<_>>()
+    };
+
     let venue_list = List::new(items)
-        .block(Block::default().title("Venues").borders(Borders::ALL))
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(venue_list, layout[0], list_state);
-
-    render_details(frame, layout[1], snapshot, list_state.selected());
+        .block(section_block("Accounts", accent_cyan()))
+        .highlight_symbol(">> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )
+        .repeat_highlight_symbol(true);
+    frame.render_stateful_widget(venue_list, area, list_state);
 }
 
 fn render_venue_item(venue: &VenueSummary) -> ListItem<'static> {
-    ListItem::new(format!(
-        "{} [{}] events={} markets={}",
-        venue.label,
-        venue.id.as_str(),
-        venue.event_count,
-        venue.market_count,
-    ))
+    let status_color = venue_status_color(venue.status);
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled(
+                venue.label.clone(),
+                Style::default()
+                    .fg(text_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:?}", venue.status),
+                Style::default().fg(status_color),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(venue.id.as_str(), Style::default().fg(muted_text())),
+            Span::raw("  "),
+            Span::raw(format!(
+                "events {} | markets {}",
+                venue.event_count, venue.market_count
+            )),
+        ]),
+    ])
 }
 
-#[derive(Debug, Clone)]
-struct DetailSection {
-    title: &'static str,
-    rows: Vec<Line<'static>>,
-    compact: bool,
-}
-
-fn render_details(
+fn render_selected_venue(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
     selected_index: Option<usize>,
 ) {
-    let sections = selected_sections(snapshot, selected_index);
-    if sections.is_empty() {
+    let Some(venue) = selected_venue(snapshot, selected_index) else {
+        let body = Paragraph::new(vec![
+            Line::raw("No venue selected."),
+            Line::raw("Use Up/Down in Trading > Accounts."),
+        ])
+        .block(section_block("Selected Venue", accent_gold()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
         return;
-    }
-
-    let constraints = sections
-        .iter()
-        .map(|section| {
-            if section.compact {
-                Constraint::Length((section.rows.len() as u16).saturating_add(2))
-            } else {
-                Constraint::Min(5)
-            }
-        })
-        .collect::<Vec<_>>();
-    let layout = Layout::vertical(constraints).split(area);
-
-    for (rect, section) in layout.iter().zip(sections.into_iter()) {
-        let body = Paragraph::new(section.rows)
-            .block(Block::default().title(section.title).borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(body, *rect);
-    }
-}
-
-fn selected_sections(
-    snapshot: &ExchangePanelSnapshot,
-    selected_index: Option<usize>,
-) -> Vec<DetailSection> {
-    let venue = selected_index
-        .and_then(|index| snapshot.venues.get(index))
-        .or_else(|| {
-            snapshot
-                .selected_venue
-                .and_then(|selected| snapshot.venues.iter().find(|venue| venue.id == selected))
-        });
-
-    let Some(venue) = venue else {
-        return vec![DetailSection {
-            title: "Venue Details",
-            rows: vec![
-                Line::raw("No venue selected."),
-                Line::raw("Press j/k or arrow keys in the Exchanges panel."),
-            ],
-            compact: true,
-        }];
     };
 
     let latest_event = snapshot
         .events
         .first()
         .map(|event| format!("{} ({})", event.label, event.competition))
-        .unwrap_or_else(|| String::from("No event selected"));
+        .unwrap_or_else(|| String::from("No event snapshot"));
     let latest_market = snapshot
         .markets
         .first()
         .map(|market| format!("{} ({} contracts)", market.name, market.contract_count))
-        .unwrap_or_else(|| String::from("No market snapshot loaded"));
+        .unwrap_or_else(|| String::from("No market snapshot"));
+    let account = snapshot.account_stats.as_ref();
 
-    let mut sections = vec![DetailSection {
-        title: "Summary",
-        rows: vec![
-            Line::raw(format!("Venue: {}", venue.label)),
-            Line::raw(format!("Status: {:?}", venue.status)),
-            Line::raw(format!("Detail: {}", venue.detail)),
-            Line::raw(format!("Latest event: {}", latest_event)),
-            Line::raw(format!("Latest market: {}", latest_market)),
-            Line::raw(format!("Worker: {}", snapshot.worker.detail)),
-        ],
-        compact: true,
-    }];
-
-    if let Some(account_stats) = &snapshot.account_stats {
-        sections.push(DetailSection {
-            title: "Account",
-            rows: vec![
-                Line::raw(format!(
-                    "Balance: {:.2} {}",
-                    account_stats.available_balance, account_stats.currency
-                )),
-                Line::raw(format!(
-                    "Exposure: {:.2} | P/L: {:.2}",
-                    account_stats.exposure, account_stats.unrealized_pnl
-                )),
-            ],
-            compact: true,
-        });
-    }
-
-    if !snapshot.open_positions.is_empty() {
-        let mut rows = vec![Line::raw(format!(
-            "Count: {}",
-            snapshot.open_positions.len()
-        ))];
-        for row in snapshot.open_positions.iter().take(3) {
-            rows.push(Line::raw(format!("{} | {}", row.contract, row.market)));
-            rows.push(Line::raw(format!(
-                "stake {:.2} | pnl {:.2} | trade-out {}",
-                row.stake,
-                row.pnl_amount,
-                yes_no(row.can_trade_out)
-            )));
-        }
-        sections.push(DetailSection {
-            title: "Open Positions",
-            rows,
-            compact: false,
-        });
-    }
-
-    if !snapshot.other_open_bets.is_empty() {
-        let mut rows = vec![Line::raw(format!(
-            "Count: {}",
-            snapshot.other_open_bets.len()
-        ))];
-        for row in snapshot.other_open_bets.iter().take(3) {
-            rows.push(Line::raw(format!("{} | {}", row.label, row.market)));
-            rows.push(Line::raw(format!(
-                "{} @ {:.2} | stake {:.2} | {}",
-                row.side, row.odds, row.stake, row.status
-            )));
-        }
-        sections.push(DetailSection {
-            title: "Other Open Bets",
-            rows,
-            compact: false,
-        });
-    }
-
-    if let Some(watch) = &snapshot.watch {
-        let mut rows = vec![Line::raw(format!("Groups: {}", watch.watch_count))];
-        for row in watch.watches.iter().take(3) {
-            rows.push(Line::raw(format!("{} | {}", row.contract, row.market)));
-            rows.push(Line::raw(format!(
-                "profit {:.2} | stop {:.2}",
-                row.profit_take_back_odds, row.stop_loss_back_odds,
-            )));
-        }
-        sections.push(DetailSection {
-            title: "Watch Plan",
-            rows,
-            compact: false,
-        });
-    }
-
-    sections
+    let rows = vec![
+        key_value_row("Venue", venue.label.clone(), accent_blue()),
+        key_value_row("Status", format!("{:?}", venue.status), venue_status_color(venue.status)),
+        key_value_row(
+            "Balance",
+            account
+                .map(|stats| format!("{:.2} {}", stats.available_balance, stats.currency))
+                .unwrap_or_else(|| String::from("-")),
+            accent_green(),
+        ),
+        key_value_row(
+            "Exposure",
+            account
+                .map(|stats| format!("{:.2} | pnl {:+.2}", stats.exposure, stats.unrealized_pnl))
+                .unwrap_or_else(|| String::from("-")),
+            accent_pink(),
+        ),
+        key_value_row("Latest event", latest_event, text_color()),
+        key_value_row("Latest market", latest_market, text_color()),
+        key_value_row("Detail", venue.detail.clone(), muted_text()),
+        key_value_row("Worker", snapshot.worker.detail.clone(), muted_text()),
+    ];
+    let table = Table::new(rows, [Constraint::Length(13), Constraint::Min(10)])
+        .block(section_block("Selected Venue", accent_gold()))
+        .column_spacing(1);
+    frame.render_widget(table, area);
 }
 
-#[cfg(test)]
-fn section_texts(snapshot: &ExchangePanelSnapshot, selected_index: Option<usize>) -> Vec<String> {
-    selected_sections(snapshot, selected_index)
-        .into_iter()
-        .flat_map(|section| {
-            std::iter::once(section.title.to_string())
-                .chain(section.rows.into_iter().map(|line| line.to_string()))
-        })
-        .collect()
-}
+fn render_health_gauges(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
+    let sections = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
 
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
+    let exposure_ratio = snapshot
+        .account_stats
+        .as_ref()
+        .map(|stats| ratio(stats.exposure, stats.available_balance))
+        .unwrap_or(0.0);
+    let connected_ratio = if snapshot.venues.is_empty() {
+        0.0
     } else {
-        "no"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::section_texts;
-    use crate::domain::{
-        AccountStats, ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, VenueId,
-        VenueStatus, VenueSummary, WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
+        snapshot
+            .venues
+            .iter()
+            .filter(|venue| matches!(venue.status, VenueStatus::Connected | VenueStatus::Ready))
+            .count() as f64
+            / snapshot.venues.len() as f64
     };
 
-    #[test]
-    fn selected_details_include_watch_rows_when_present() {
-        let snapshot = ExchangePanelSnapshot {
-            worker: WorkerSummary {
-                name: String::from("bet-recorder"),
-                status: WorkerStatus::Ready,
-                detail: String::from("Loaded watch snapshot"),
-            },
-            venues: vec![VenueSummary {
-                id: VenueId::Smarkets,
-                label: String::from("Smarkets"),
-                status: VenueStatus::Ready,
-                detail: String::from("Watching positions"),
-                event_count: 2,
-                market_count: 2,
-            }],
-            selected_venue: Some(VenueId::Smarkets),
-            events: vec![],
-            markets: vec![],
-            preflight: None,
-            status_line: String::from("Loaded watch snapshot"),
-            account_stats: Some(AccountStats {
-                available_balance: 120.45,
-                exposure: 41.63,
-                unrealized_pnl: -0.49,
-                currency: String::from("GBP"),
-            }),
-            open_positions: vec![OpenPositionRow {
-                contract: String::from("Draw"),
-                market: String::from("Full-time result"),
-                price: 3.35,
-                stake: 9.91,
-                liability: 23.29,
-                current_value: 9.60,
-                pnl_amount: -0.31,
-                can_trade_out: true,
-            }],
-            other_open_bets: vec![OtherOpenBetRow {
-                label: String::from("Arsenal"),
-                market: String::from("Full-time result"),
-                side: String::from("back"),
-                odds: 2.12,
-                stake: 5.0,
-                status: String::from("Open"),
-            }],
-            watch: Some(WatchSnapshot {
-                position_count: 3,
-                watch_count: 2,
-                commission_rate: 0.0,
-                target_profit: 1.0,
-                stop_loss: 1.0,
-                watches: vec![WatchRow {
-                    contract: String::from("Draw"),
-                    market: String::from("Full-time result"),
-                    position_count: 1,
-                    can_trade_out: true,
-                    total_stake: 9.91,
-                    total_liability: 23.29,
-                    current_pnl_amount: -0.31,
-                    average_entry_lay_odds: 3.35,
-                    entry_implied_probability: 0.2985,
-                    profit_take_back_odds: 3.73,
-                    profit_take_implied_probability: 0.2684,
-                    stop_loss_back_odds: 3.04,
-                    stop_loss_implied_probability: 0.3286,
-                }],
-            }),
-        };
+    render_gauge(
+        frame,
+        sections[0],
+        "Balance Use",
+        exposure_ratio,
+        accent_pink(),
+        format!("{:.0}%", exposure_ratio * 100.0),
+    );
+    render_gauge(
+        frame,
+        sections[1],
+        "Connected Venues",
+        connected_ratio,
+        accent_green(),
+        format!(
+            "{}/{}",
+            snapshot
+                .venues
+                .iter()
+                .filter(|venue| matches!(venue.status, VenueStatus::Connected | VenueStatus::Ready))
+                .count(),
+            snapshot.venues.len()
+        ),
+    );
+}
 
-        let rendered = section_texts(&snapshot, Some(0)).join("\n");
+fn render_feed_preview(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
+    let mut rows = snapshot
+        .open_positions
+        .iter()
+        .take(4)
+        .map(|row| {
+            Row::new(vec![
+                Cell::from(String::from("exchange")),
+                Cell::from(if row.event.is_empty() {
+                    row.contract.clone()
+                } else {
+                    row.event.clone()
+                }),
+                Cell::from(row.market.clone()),
+                Cell::from(if row.market_status.is_empty() {
+                    if row.can_trade_out {
+                        String::from("trade-out")
+                    } else if row.is_in_play {
+                        String::from("in-play")
+                    } else {
+                        String::from("open")
+                    }
+                } else {
+                    row.market_status.clone()
+                }),
+            ])
+        })
+        .collect::<Vec<_>>();
 
-        assert!(rendered.contains("Summary"));
-        assert!(rendered.contains("Account"));
-        assert!(rendered.contains("Open Positions"));
-        assert!(rendered.contains("Other Open Bets"));
-        assert!(rendered.contains("Watch Plan"));
-        assert!(rendered.contains("Balance: 120.45 GBP"));
-        assert!(rendered.contains("Count: 1"));
-        assert!(rendered.contains("trade-out yes"));
-        assert!(rendered.contains("Arsenal | Full-time result"));
-        assert!(rendered.contains("profit 3.73 | stop 3.04"));
+    rows.extend(snapshot.other_open_bets.iter().take(4).map(|row| {
+        Row::new(vec![
+            Cell::from(String::from("sportsbook")),
+            Cell::from(row.label.clone()),
+            Cell::from(row.market.clone()),
+            Cell::from(row.status.clone()),
+        ])
+    }));
+
+    if rows.is_empty() {
+        let body = Paragraph::new(vec![
+            Line::raw("No live rows loaded."),
+            Line::raw("Start the recorder or refresh the active provider."),
+        ])
+        .block(section_block("Live Feed Preview", accent_green()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
     }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Percentage(32),
+            Constraint::Percentage(34),
+            Constraint::Min(10),
+        ],
+    )
+    .header(
+        Row::new(vec!["Type", "Item", "Market", "State"]).style(
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(section_block("Live Feed Preview", accent_green()))
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn selected_venue(
+    snapshot: &ExchangePanelSnapshot,
+    selected_index: Option<usize>,
+) -> Option<&VenueSummary> {
+    selected_index
+        .and_then(|index| snapshot.venues.get(index))
+        .or_else(|| {
+            snapshot
+                .selected_venue
+                .and_then(|selected| snapshot.venues.iter().find(|venue| venue.id == selected))
+        })
+}
+
+fn key_value_row(label: &'static str, value: String, color: Color) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(Span::styled(
+            label,
+            Style::default()
+                .fg(muted_text())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(value, Style::default().fg(color))),
+    ])
+}
+
+fn render_gauge(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    value: f64,
+    color: Color,
+    label: String,
+) {
+    let gauge = Gauge::default()
+        .block(section_block(title, color))
+        .gauge_style(Style::default().fg(color).bg(panel_background()))
+        .ratio(value.clamp(0.0, 1.0))
+        .label(Span::raw(label));
+    frame.render_widget(gauge, area);
+}
+
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        (numerator / denominator).clamp(0.0, 1.0)
+    }
+}
+
+fn section_block(title: &'static str, color: Color) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .style(Style::default().bg(panel_background()).fg(text_color()))
+        .border_style(Style::default().fg(border_color()))
+}
+
+fn venue_status_color(status: VenueStatus) -> Color {
+    match status {
+        VenueStatus::Connected | VenueStatus::Ready => accent_green(),
+        VenueStatus::Planned => accent_gold(),
+        VenueStatus::Error => accent_red(),
+    }
+}
+
+fn panel_background() -> Color {
+    Color::Rgb(16, 22, 30)
+}
+
+fn border_color() -> Color {
+    Color::Rgb(48, 64, 86)
+}
+
+fn text_color() -> Color {
+    Color::Rgb(234, 240, 246)
+}
+
+fn muted_text() -> Color {
+    Color::Rgb(148, 163, 184)
+}
+
+fn accent_blue() -> Color {
+    Color::Rgb(104, 179, 255)
+}
+
+fn accent_cyan() -> Color {
+    Color::Rgb(110, 231, 255)
+}
+
+fn accent_green() -> Color {
+    Color::Rgb(90, 214, 154)
+}
+
+fn accent_gold() -> Color {
+    Color::Rgb(245, 196, 89)
+}
+
+fn accent_pink() -> Color {
+    Color::Rgb(255, 122, 162)
+}
+
+fn accent_red() -> Color {
+    Color::Rgb(255, 107, 107)
 }

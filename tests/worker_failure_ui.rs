@@ -16,6 +16,9 @@ impl ExchangeProvider for FailingRefreshProvider {
             ProviderRequest::LoadDashboard => Ok(self.load_snapshot.clone()),
             ProviderRequest::Refresh => Err(eyre!("worker session closed")),
             ProviderRequest::SelectVenue(_) => Err(eyre!("selection not used in this test")),
+            ProviderRequest::CashOutTrackedBet { .. } => {
+                Err(eyre!("cash out not used in this test"))
+            }
         }
     }
 }
@@ -62,9 +65,15 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
         markets: Vec::new(),
         preflight: None,
         status_line: String::from("Initial dashboard"),
+        runtime: None,
         account_stats: None,
         open_positions: Vec::new(),
+        historical_positions: Vec::new(),
         other_open_bets: Vec::new(),
+        decisions: Vec::new(),
         watch: None,
+        tracked_bets: Vec::new(),
+        exit_policy: Default::default(),
+        exit_recommendations: Vec::new(),
     }
 }

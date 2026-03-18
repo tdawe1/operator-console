@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         }
     };
 
+    let should_autostart = matches!(launch_mode, LaunchMode::Stub);
     let provider: Box<dyn operator_console::provider::ExchangeProvider> = match launch_mode {
         LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
         LaunchMode::BetRecorder {
@@ -43,15 +44,21 @@ fn main() -> Result<()> {
                 run_dir,
                 account_payload_path,
                 open_bets_payload_path,
+                companion_legs_path: None,
                 agent_browser_session,
                 commission_rate,
                 target_profit,
                 stop_loss,
+                hard_margin_call_profit_floor: None,
+                warn_only_default: true,
             },
         )),
     };
 
     let mut app = App::from_provider(provider)?;
+    if should_autostart {
+        app.autostart_recorder_if_enabled()?;
+    }
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
     ratatui::restore();
@@ -65,7 +72,8 @@ fn help_text() -> &'static str {
 const DEFAULT_BET_RECORDER_ROOT: &str = "/home/thomas/projects/sabi/bet-recorder";
 const DEFAULT_BET_RECORDER_PYTHON: &str =
     "/home/thomas/projects/sabi/bet-recorder/.venv/bin/python";
-const DEFAULT_BET_RECORDER_COMMAND: &str = "/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder";
+const DEFAULT_BET_RECORDER_COMMAND: &str =
+    "/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder";
 
 enum LaunchMode {
     Stub,

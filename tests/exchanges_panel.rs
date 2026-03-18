@@ -1,9 +1,10 @@
-use operator_console::app::{App, Panel};
+use operator_console::app::{App, Panel, TradingSection};
 
 #[test]
 fn exchanges_panel_tracks_selected_row() {
     let mut app = App::default();
-    app.set_active_panel(Panel::Exchanges);
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Accounts);
 
     assert_eq!(app.selected_exchange_row(), None);
 

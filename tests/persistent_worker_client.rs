@@ -51,10 +51,13 @@ def main() -> None:
                     "run_dir": None,
                     "account_payload_path": None,
                     "open_bets_payload_path": None,
+                    "companion_legs_path": None,
                     "agent_browser_session": None,
                     "commission_rate": 0.0,
                     "target_profit": 1.0,
                     "stop_loss": 1.0,
+                    "hard_margin_call_profit_floor": None,
+                    "warn_only_default": True,
                 }}
             }}
         }}:
@@ -101,10 +104,13 @@ if __name__ == "__main__":
                 run_dir: None,
                 account_payload_path: None,
                 open_bets_payload_path: None,
+                companion_legs_path: None,
                 agent_browser_session: None,
                 commission_rate: 0.0,
                 target_profit: 1.0,
                 stop_loss: 1.0,
+                hard_margin_call_profit_floor: None,
+                warn_only_default: true,
             },
         })
         .expect("first worker response");
@@ -158,10 +164,13 @@ LOAD_DASHBOARD = {{
                 "run_dir": None,
                 "account_payload_path": None,
                 "open_bets_payload_path": None,
+                "companion_legs_path": None,
                 "agent_browser_session": None,
                 "commission_rate": 0.0,
                 "target_profit": 1.0,
                 "stop_loss": 1.0,
+                "hard_margin_call_profit_floor": None,
+                "warn_only_default": True,
         }}
     }}
 }}
@@ -245,10 +254,13 @@ if __name__ == "__main__":
         run_dir: None,
         account_payload_path: None,
         open_bets_payload_path: None,
+        companion_legs_path: None,
         agent_browser_session: None,
         commission_rate: 0.0,
         target_profit: 1.0,
         stop_loss: 1.0,
+        hard_margin_call_profit_floor: None,
+        warn_only_default: true,
     };
 
     let mut client = BetRecorderWorkerClient::new(
@@ -283,10 +295,13 @@ if __name__ == "__main__":
                 "run_dir": null,
                 "account_payload_path": null,
                 "open_bets_payload_path": null,
+                "companion_legs_path": null,
                 "agent_browser_session": null,
                 "commission_rate": 0.0,
                 "target_profit": 1.0,
                 "stop_loss": 1.0,
+                "hard_margin_call_profit_floor": null,
+                "warn_only_default": true,
             }
         }
     });
@@ -297,6 +312,148 @@ if __name__ == "__main__":
             (2, expected_bootstrap),
             (2, serde_json::json!("Refresh")),
         ]
+    );
+}
+
+#[test]
+fn worker_client_keeps_session_alive_after_request_error_response() {
+    let temp_dir = tempdir().expect("temp dir");
+    let src_dir = temp_dir.path().join("src").join("bet_recorder");
+    fs::create_dir_all(&src_dir).expect("package dir");
+    fs::write(src_dir.join("__init__.py"), "").expect("init");
+    fs::write(
+        src_dir.join("__main__.py"),
+        "from bet_recorder.cli import main\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .expect("main");
+
+    let spawn_count_path = temp_dir.path().join("spawn-count.txt");
+    fs::write(&spawn_count_path, "0").expect("spawn count seed");
+    let spawn_count_literal = format!("{:?}", spawn_count_path.to_string_lossy().to_string());
+
+    fs::write(
+        src_dir.join("cli.py"),
+        format!(
+            r#"
+from __future__ import annotations
+import json
+import pathlib
+import sys
+
+SPAWN_COUNT_PATH = pathlib.Path({spawn_count_literal})
+
+LOAD_DASHBOARD = {{
+    "LoadDashboard": {{
+        "config": {{
+            "positions_payload_path": "/tmp/ignored.json",
+            "run_dir": None,
+            "account_payload_path": None,
+            "open_bets_payload_path": None,
+            "companion_legs_path": None,
+            "agent_browser_session": None,
+            "commission_rate": 0.0,
+            "target_profit": 1.0,
+            "stop_loss": 1.0,
+            "hard_margin_call_profit_floor": None,
+            "warn_only_default": True,
+        }}
+    }}
+}}
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] != "exchange-worker-session":
+        raise SystemExit("unexpected command")
+
+    current = int(SPAWN_COUNT_PATH.read_text())
+    SPAWN_COUNT_PATH.write_text(str(current + 1))
+
+    bootstrapped = False
+    for line in sys.stdin:
+        request = json.loads(line)
+        if request == LOAD_DASHBOARD and not bootstrapped:
+            bootstrapped = True
+            sys.stdout.write(json.dumps({{
+                "snapshot": {{
+                    "worker": {{
+                        "name": "stub-worker",
+                        "status": "error",
+                        "detail": "missing snapshot"
+                    }},
+                    "venues": [],
+                    "selected_venue": None,
+                    "events": [],
+                    "markets": [],
+                    "preflight": None,
+                    "status_line": "missing snapshot",
+                    "watch": None
+                }},
+                "request_error": "No positions_snapshot event found in run bundle"
+            }}) + "\n")
+            sys.stdout.flush()
+            continue
+
+        if request == "Refresh" and bootstrapped:
+            sys.stdout.write(json.dumps({{
+                "snapshot": {{
+                    "worker": {{
+                        "name": "stub-worker",
+                        "status": "ready",
+                        "detail": "response 2"
+                    }},
+                    "venues": [],
+                    "selected_venue": None,
+                    "events": [],
+                    "markets": [],
+                    "preflight": None,
+                    "status_line": "response 2",
+                    "watch": None
+                }}
+            }}) + "\n")
+            sys.stdout.flush()
+            continue
+
+        raise SystemExit(f"unexpected request: {{request}}")
+
+if __name__ == "__main__":
+    main()
+"#
+        ),
+    )
+    .expect("cli");
+
+    let mut client = BetRecorderWorkerClient::new(
+        PathBuf::from("/usr/bin/python"),
+        temp_dir.path().to_path_buf(),
+    );
+
+    let first_error = client
+        .send(WorkerRequest::LoadDashboard {
+            config: WorkerConfig {
+                positions_payload_path: Some(PathBuf::from("/tmp/ignored.json")),
+                run_dir: None,
+                account_payload_path: None,
+                open_bets_payload_path: None,
+                companion_legs_path: None,
+                agent_browser_session: None,
+                commission_rate: 0.0,
+                target_profit: 1.0,
+                stop_loss: 1.0,
+                hard_margin_call_profit_floor: None,
+                warn_only_default: true,
+            },
+        })
+        .expect_err("request error should surface without killing the session");
+    assert!(first_error
+        .to_string()
+        .contains("No positions_snapshot event found in run bundle"));
+
+    let refresh = client
+        .send(WorkerRequest::Refresh)
+        .expect("refresh should reuse the same session");
+    assert_eq!(refresh.snapshot.status_line, "response 2");
+    assert_eq!(
+        fs::read_to_string(spawn_count_path).expect("spawn count"),
+        "1"
     );
 }
 

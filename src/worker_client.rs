@@ -4,11 +4,25 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 use color_eyre::eyre::{eyre, Context, Result};
 
-use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::domain::ExchangePanelSnapshot;
 use crate::provider::{ExchangeProvider, ProviderRequest};
 pub use crate::transport::{
     WorkerConfig, WorkerRequestEnvelope as WorkerRequest, WorkerResponseEnvelope as WorkerResponse,
 };
+
+enum WorkerSessionError {
+    Request(String),
+    Session(color_eyre::Report),
+}
+
+impl WorkerSessionError {
+    fn into_report(self) -> color_eyre::Report {
+        match self {
+            Self::Request(detail) => eyre!(detail),
+            Self::Session(report) => report,
+        }
+    }
+}
 
 pub trait WorkerClient {
     fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse>;
@@ -45,6 +59,9 @@ impl<C: WorkerClient> ExchangeProvider for WorkerClientExchangeProvider<C> {
             },
             ProviderRequest::Refresh => WorkerRequest::Refresh,
             ProviderRequest::SelectVenue(venue) => WorkerRequest::SelectVenue { venue },
+            ProviderRequest::CashOutTrackedBet { bet_id } => {
+                WorkerRequest::CashOutTrackedBet { bet_id }
+            }
         };
 
         Ok(self.client.send(worker_request)?.snapshot)
@@ -124,26 +141,19 @@ impl BetRecorderWorkerClient {
 
 impl WorkerClient for BetRecorderWorkerClient {
     fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse> {
-        if let WorkerRequest::SelectVenue { venue } = &request {
-            if *venue != VenueId::Smarkets {
-                return Err(eyre!(
-                    "bet-recorder worker does not support {}",
-                    venue.as_str()
-                ));
-            }
-        }
-
         if let WorkerRequest::LoadDashboard { config } = &request {
             self.bootstrap_config = Some(config.clone());
         }
 
         match self.send_once(&request) {
             Ok(response) => Ok(response),
-            Err(error) => {
+            Err(WorkerSessionError::Request(detail)) => Err(eyre!(detail)),
+            Err(WorkerSessionError::Session(error)) => {
                 self.session = None;
                 if self.can_recover(&request) {
-                    self.recover_and_retry(&request)
-                        .wrap_err_with(|| format!("worker request failed before recovery: {error}"))
+                    self.recover_and_retry(&request).wrap_err_with(|| {
+                        format!("worker request failed before recovery: {}", error)
+                    })
                 } else {
                     Err(error)
                 }
@@ -153,41 +163,54 @@ impl WorkerClient for BetRecorderWorkerClient {
 }
 
 impl BetRecorderWorkerClient {
-    fn send_once(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
-        let request_payload =
-            serde_json::to_vec(request).wrap_err("failed to serialize worker request")?;
+    fn send_once(
+        &mut self,
+        request: &WorkerRequest,
+    ) -> std::result::Result<WorkerResponse, WorkerSessionError> {
+        let request_payload = serde_json::to_vec(request)
+            .wrap_err("failed to serialize worker request")
+            .map_err(WorkerSessionError::Session)?;
 
-        let session = self.session()?;
+        let session = self.session().map_err(WorkerSessionError::Session)?;
         session
             .stdin
             .write_all(&request_payload)
-            .wrap_err("failed to write worker request to stdin")?;
+            .wrap_err("failed to write worker request to stdin")
+            .map_err(WorkerSessionError::Session)?;
         session
             .stdin
             .write_all(b"\n")
-            .wrap_err("failed to frame worker request")?;
+            .wrap_err("failed to frame worker request")
+            .map_err(WorkerSessionError::Session)?;
         session
             .stdin
             .flush()
-            .wrap_err("failed to flush worker request")?;
+            .wrap_err("failed to flush worker request")
+            .map_err(WorkerSessionError::Session)?;
 
         let mut response_line = String::new();
         let byte_count = session
             .stdout
             .read_line(&mut response_line)
-            .wrap_err("failed to read worker response")?;
+            .wrap_err("failed to read worker response")
+            .map_err(WorkerSessionError::Session)?;
 
         if byte_count == 0 {
             let stderr = session.read_stderr();
             self.session = None;
-            return Err(eyre!(
+            return Err(WorkerSessionError::Session(eyre!(
                 "bet-recorder worker session ended before responding: {}",
                 stderr.trim()
-            ));
+            )));
         }
 
-        serde_json::from_str::<WorkerResponse>(response_line.trim_end())
+        let response = serde_json::from_str::<WorkerResponse>(response_line.trim_end())
             .wrap_err("failed to decode worker response")
+            .map_err(WorkerSessionError::Session)?;
+        if let Some(detail) = response.request_error.clone() {
+            return Err(WorkerSessionError::Request(detail));
+        }
+        Ok(response)
     }
 
     fn can_recover(&self, request: &WorkerRequest) -> bool {
@@ -196,7 +219,9 @@ impl BetRecorderWorkerClient {
 
     fn recover_and_retry(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
         if matches!(request, WorkerRequest::LoadDashboard { .. }) {
-            return self.send_once(request);
+            return self
+                .send_once(request)
+                .map_err(WorkerSessionError::into_report);
         }
 
         let bootstrap_config = self
@@ -209,8 +234,10 @@ impl BetRecorderWorkerClient {
 
         let _bootstrap_response = self
             .send_once(&bootstrap_request)
+            .map_err(WorkerSessionError::into_report)
             .wrap_err("failed to replay worker bootstrap after reconnect")?;
         self.send_once(request)
+            .map_err(WorkerSessionError::into_report)
     }
 }
 

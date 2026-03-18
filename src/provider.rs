@@ -10,6 +10,7 @@ pub enum ProviderRequest {
     LoadDashboard,
     SelectVenue(VenueId),
     Refresh,
+    CashOutTrackedBet { bet_id: String },
 }
 
 pub trait ExchangeProvider {

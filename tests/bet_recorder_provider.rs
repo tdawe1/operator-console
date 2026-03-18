@@ -22,10 +22,13 @@ fn provider_loads_watch_snapshot_from_bet_recorder_cli() {
             run_dir: None,
             account_payload_path: None,
             open_bets_payload_path: None,
+            companion_legs_path: None,
             agent_browser_session: None,
             commission_rate: 0.0,
             target_profit: 1.0,
             stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
         })
         .expect("provider should return watch snapshot");
 

@@ -1,13 +1,20 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use operator_console::domain::VenueId;
+use color_eyre::Result;
+
+use operator_console::domain::{ExchangePanelSnapshot, ExitPolicySummary, VenueId};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::transport::WorkerConfig;
-use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
+use operator_console::worker_client::{
+    BetRecorderWorkerClient, WorkerClient, WorkerClientExchangeProvider, WorkerRequest,
+    WorkerResponse,
+};
 
 fn project_root() -> PathBuf {
     PathBuf::from("/home/thomas/projects/sabi/bet-recorder")
@@ -28,10 +35,13 @@ fn worker_backed_provider_maps_bet_recorder_snapshot() {
             run_dir: None,
             account_payload_path: None,
             open_bets_payload_path: None,
+            companion_legs_path: None,
             agent_browser_session: None,
             commission_rate: 0.0,
             target_profit: 1.0,
             stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
         },
     );
 
@@ -80,10 +90,13 @@ fn worker_backed_provider_loads_latest_positions_snapshot_from_run_dir() {
             run_dir: Some(run_dir),
             account_payload_path: None,
             open_bets_payload_path: None,
+            companion_legs_path: None,
             agent_browser_session: None,
             commission_rate: 0.0,
             target_profit: 1.0,
             stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
         },
     );
 
@@ -116,4 +129,58 @@ fn temp_run_dir(prefix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
     fs::create_dir_all(&path).expect("mkdir");
     path
+}
+
+struct RecordingWorkerClient {
+    last_request: Rc<RefCell<Option<WorkerRequest>>>,
+}
+
+impl WorkerClient for RecordingWorkerClient {
+    fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse> {
+        *self.last_request.borrow_mut() = Some(request);
+        Ok(WorkerResponse {
+            snapshot: ExchangePanelSnapshot {
+                exit_policy: ExitPolicySummary::default(),
+                ..ExchangePanelSnapshot::default()
+            },
+            request_error: None,
+        })
+    }
+}
+
+#[test]
+fn worker_backed_provider_maps_cash_out_request() {
+    let last_request = Rc::new(RefCell::new(None));
+    let client = RecordingWorkerClient {
+        last_request: last_request.clone(),
+    };
+    let mut provider = WorkerClientExchangeProvider::new(
+        client,
+        WorkerConfig {
+            positions_payload_path: None,
+            run_dir: None,
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: None,
+            agent_browser_session: None,
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
+        },
+    );
+
+    provider
+        .handle(ProviderRequest::CashOutTrackedBet {
+            bet_id: String::from("bet-001"),
+        })
+        .expect("cash out request should serialize");
+
+    assert_eq!(
+        *last_request.borrow(),
+        Some(WorkerRequest::CashOutTrackedBet {
+            bet_id: String::from("bet-001"),
+        })
+    );
 }
