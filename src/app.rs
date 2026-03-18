@@ -1,16 +1,20 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use reqwest::blocking::Client;
 use ratatui::backend::Backend;
 use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
 
 use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
 use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::oddsmatcher::{
+    self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
+};
 use crate::provider::{ExchangeProvider, ProviderRequest};
 use crate::recorder::{
     default_config_path, load_recorder_config_or_default, save_recorder_config,
@@ -53,16 +57,18 @@ pub enum TradingSection {
     Accounts,
     Positions,
     Markets,
+    OddsMatcher,
     Stats,
     Calculator,
     Recorder,
 }
 
 impl TradingSection {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Accounts,
         Self::Positions,
         Self::Markets,
+        Self::OddsMatcher,
         Self::Stats,
         Self::Calculator,
         Self::Recorder,
@@ -73,6 +79,7 @@ impl TradingSection {
             Self::Accounts => "Accounts",
             Self::Positions => "Positions",
             Self::Markets => "Markets",
+            Self::OddsMatcher => "OddsMatcher",
             Self::Stats => "Stats",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
@@ -252,6 +259,12 @@ impl Default for CalculatorState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OddsMatcherFocus {
+    Filters,
+    Results,
+}
+
 pub struct App {
     provider: Box<dyn ExchangeProvider>,
     make_stub_provider: Box<StubFactory>,
@@ -263,6 +276,14 @@ pub struct App {
     recorder_editor: RecorderEditorState,
     recorder_status: RecorderStatus,
     calculator: CalculatorState,
+    oddsmatcher_client: Client,
+    oddsmatcher_query_path: PathBuf,
+    oddsmatcher_query_note: String,
+    oddsmatcher_query: GetBestMatchesVariables,
+    oddsmatcher_editor: OddsMatcherEditorState,
+    oddsmatcher_focus: OddsMatcherFocus,
+    oddsmatcher_rows: Vec<OddsMatcherRow>,
+    oddsmatcher_table_state: TableState,
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
     trading_section: TradingSection,
@@ -352,6 +373,14 @@ impl App {
     ) -> Result<Self> {
         let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
         let status_message = snapshot.status_line.clone();
+        let oddsmatcher_query_path = oddsmatcher::default_query_path();
+        let (oddsmatcher_query, oddsmatcher_query_note) =
+            oddsmatcher::load_query_or_default(&oddsmatcher_query_path).unwrap_or_else(|error| {
+                (
+                    GetBestMatchesVariables::default(),
+                    format!("OddsMatcher config load failed; using defaults: {error}"),
+                )
+            });
         let mut open_position_table_state = TableState::default();
         if !snapshot.open_positions.is_empty() {
             open_position_table_state.select(Some(0));
@@ -368,6 +397,14 @@ impl App {
             recorder_editor: RecorderEditorState::default(),
             recorder_status: RecorderStatus::Disabled,
             calculator: CalculatorState::default(),
+            oddsmatcher_client: Client::new(),
+            oddsmatcher_query_path,
+            oddsmatcher_query_note,
+            oddsmatcher_query,
+            oddsmatcher_editor: OddsMatcherEditorState::default(),
+            oddsmatcher_focus: OddsMatcherFocus::Results,
+            oddsmatcher_rows: Vec::new(),
+            oddsmatcher_table_state: TableState::default(),
             snapshot,
             active_panel: Panel::Dashboard,
             trading_section: TradingSection::Accounts,
@@ -435,6 +472,62 @@ impl App {
 
     pub fn open_position_table_state(&mut self) -> &mut TableState {
         &mut self.open_position_table_state
+    }
+
+    pub fn oddsmatcher_rows(&self) -> &[OddsMatcherRow] {
+        &self.oddsmatcher_rows
+    }
+
+    pub fn oddsmatcher_query(&self) -> &GetBestMatchesVariables {
+        &self.oddsmatcher_query
+    }
+
+    pub fn oddsmatcher_query_note(&self) -> &str {
+        &self.oddsmatcher_query_note
+    }
+
+    pub fn oddsmatcher_selected_field(&self) -> OddsMatcherField {
+        self.oddsmatcher_editor.selected_field()
+    }
+
+    pub fn oddsmatcher_focus(&self) -> OddsMatcherFocus {
+        self.oddsmatcher_focus
+    }
+
+    pub fn oddsmatcher_is_editing(&self) -> bool {
+        self.oddsmatcher_editor.editing
+    }
+
+    pub fn oddsmatcher_edit_buffer(&self) -> Option<&str> {
+        self.oddsmatcher_editor
+            .editing
+            .then_some(self.oddsmatcher_editor.buffer.as_str())
+    }
+
+    pub fn oddsmatcher_field_rows(&self) -> Vec<(OddsMatcherField, String, bool)> {
+        OddsMatcherField::ALL
+            .into_iter()
+            .map(|field| {
+                let value = if self.oddsmatcher_editor.editing
+                    && self.oddsmatcher_editor.selected_field() == field
+                {
+                    self.oddsmatcher_editor.buffer.clone()
+                } else {
+                    field.display_value(&self.oddsmatcher_query)
+                };
+                (field, value, self.oddsmatcher_editor.selected_field() == field)
+            })
+            .collect()
+    }
+
+    pub fn selected_oddsmatcher_row(&self) -> Option<&OddsMatcherRow> {
+        self.oddsmatcher_table_state
+            .selected()
+            .and_then(|index| self.oddsmatcher_rows.get(index))
+    }
+
+    pub fn oddsmatcher_table_state(&mut self) -> &mut TableState {
+        &mut self.oddsmatcher_table_state
     }
 
     pub fn recorder_config(&self) -> &RecorderConfig {
@@ -519,6 +612,10 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::OddsMatcher
+        {
+            return self.refresh_oddsmatcher();
+        }
         match self.provider.handle(ProviderRequest::Refresh) {
             Ok(snapshot) => {
                 self.replace_snapshot(snapshot);
@@ -596,6 +693,27 @@ impl App {
         self.apply_recorder_change("Reset recorder config to defaults.")
     }
 
+    pub fn reload_oddsmatcher_query(&mut self) -> Result<()> {
+        let (query, note) = oddsmatcher::load_query_or_default(&self.oddsmatcher_query_path)?;
+        self.oddsmatcher_query = query;
+        self.oddsmatcher_query_note = note;
+        self.oddsmatcher_editor = OddsMatcherEditorState::default();
+        self.oddsmatcher_rows.clear();
+        self.oddsmatcher_table_state.select(None);
+        self.status_message = String::from("Reloaded OddsMatcher config from disk.");
+        Ok(())
+    }
+
+    pub fn reset_oddsmatcher_query(&mut self) -> Result<()> {
+        self.oddsmatcher_query = GetBestMatchesVariables::default();
+        self.oddsmatcher_editor = OddsMatcherEditorState::default();
+        self.oddsmatcher_rows.clear();
+        self.oddsmatcher_table_state.select(None);
+        self.persist_oddsmatcher_query()?;
+        self.status_message = String::from("Reset OddsMatcher config to defaults.");
+        Ok(())
+    }
+
     pub fn next_panel(&mut self) {
         self.active_panel = match self.active_panel {
             Panel::Dashboard => Panel::Trading,
@@ -668,6 +786,30 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key_code: KeyCode) {
+        if self.is_oddsmatcher_editing_context() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.cancel_oddsmatcher_edit();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.apply_oddsmatcher_edit() {
+                        self.status_message = format!("OddsMatcher filter error: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.oddsmatcher_backspace();
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    self.oddsmatcher_push_char(character);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         if self.is_calculator_editing_context() {
             match key_code {
                 KeyCode::Esc => {
@@ -718,6 +860,20 @@ impl App {
             }
         }
 
+        if self.is_oddsmatcher_context() {
+            match key_code {
+                KeyCode::Left => {
+                    self.focus_oddsmatcher_filters();
+                    return;
+                }
+                KeyCode::Right => {
+                    self.focus_oddsmatcher_results();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key_code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Esc => self.running = false,
@@ -726,7 +882,9 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.next_section(),
             KeyCode::Left | KeyCode::Char('h') => self.previous_section(),
             KeyCode::Enter => {
-                if self.is_recorder_context() {
+                if self.is_oddsmatcher_filters_context() {
+                    self.begin_oddsmatcher_edit();
+                } else if self.is_recorder_context() {
                     self.begin_recorder_edit();
                 } else if self.is_calculator_context() {
                     self.begin_calculator_edit();
@@ -760,21 +918,33 @@ impl App {
                 }
             }
             KeyCode::Char('[') => {
-                if self.is_recorder_context() {
+                if self.is_oddsmatcher_filters_context() {
+                    if let Err(error) = self.cycle_oddsmatcher_suggestion(false) {
+                        self.status_message = format!("OddsMatcher suggestion failed: {error}");
+                    }
+                } else if self.is_recorder_context() {
                     if let Err(error) = self.cycle_recorder_suggestion(false) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
                     }
                 }
             }
             KeyCode::Char(']') => {
-                if self.is_recorder_context() {
+                if self.is_oddsmatcher_filters_context() {
+                    if let Err(error) = self.cycle_oddsmatcher_suggestion(true) {
+                        self.status_message = format!("OddsMatcher suggestion failed: {error}");
+                    }
+                } else if self.is_recorder_context() {
                     if let Err(error) = self.cycle_recorder_suggestion(true) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
                     }
                 }
             }
             KeyCode::Char('u') => {
-                if self.is_recorder_context() {
+                if self.is_oddsmatcher_context() {
+                    if let Err(error) = self.reload_oddsmatcher_query() {
+                        self.status_message = format!("OddsMatcher reload failed: {error}");
+                    }
+                } else if self.is_recorder_context() {
                     if let Err(error) = self.reload_recorder_config() {
                         self.status_message = format!("Recorder reload failed: {error}");
                     }
@@ -784,7 +954,11 @@ impl App {
                 }
             }
             KeyCode::Char('D') => {
-                if self.is_recorder_context() {
+                if self.is_oddsmatcher_context() {
+                    if let Err(error) = self.reset_oddsmatcher_query() {
+                        self.status_message = format!("OddsMatcher reset failed: {error}");
+                    }
+                } else if self.is_recorder_context() {
                     if let Err(error) = self.reset_recorder_config() {
                         self.status_message = format!("Recorder reset failed: {error}");
                     }
@@ -812,6 +986,13 @@ impl App {
                 (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
                     self.select_next_open_position_row()
                 }
+                (Panel::Trading, TradingSection::OddsMatcher) => {
+                    if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
+                        self.oddsmatcher_editor.select_next_field();
+                    } else {
+                        self.select_next_oddsmatcher_row();
+                    }
+                }
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_next_field()
                 }
@@ -824,6 +1005,13 @@ impl App {
                 (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
                 (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
                     self.select_previous_open_position_row()
+                }
+                (Panel::Trading, TradingSection::OddsMatcher) => {
+                    if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
+                        self.oddsmatcher_editor.select_previous_field();
+                    } else {
+                        self.select_previous_oddsmatcher_row();
+                    }
                 }
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_previous_field()
@@ -843,6 +1031,18 @@ impl App {
 
     fn is_recorder_context(&self) -> bool {
         self.active_panel == Panel::Trading && self.trading_section == TradingSection::Recorder
+    }
+
+    fn is_oddsmatcher_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::OddsMatcher
+    }
+
+    fn is_oddsmatcher_filters_context(&self) -> bool {
+        self.is_oddsmatcher_context() && self.oddsmatcher_focus == OddsMatcherFocus::Filters
+    }
+
+    fn is_oddsmatcher_editing_context(&self) -> bool {
+        self.is_oddsmatcher_filters_context() && self.oddsmatcher_editor.editing
     }
 
     fn is_recorder_editing_context(&self) -> bool {
@@ -875,6 +1075,18 @@ impl App {
         match self.open_position_table_state.selected() {
             Some(index) if index < self.snapshot.open_positions.len() => {}
             _ => self.open_position_table_state.select(Some(0)),
+        }
+    }
+
+    fn clamp_selected_oddsmatcher_row(&mut self) {
+        if self.oddsmatcher_rows.is_empty() {
+            self.oddsmatcher_table_state.select(None);
+            return;
+        }
+
+        match self.oddsmatcher_table_state.selected() {
+            Some(index) if index < self.oddsmatcher_rows.len() => {}
+            _ => self.oddsmatcher_table_state.select(Some(0)),
         }
     }
 
@@ -938,6 +1150,36 @@ impl App {
         };
 
         self.open_position_table_state.select(Some(previous_index));
+    }
+
+    pub fn select_next_oddsmatcher_row(&mut self) {
+        if self.oddsmatcher_rows.is_empty() {
+            self.oddsmatcher_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.oddsmatcher_table_state.selected() {
+            Some(index) if index + 1 < self.oddsmatcher_rows.len() => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.oddsmatcher_table_state.select(Some(next_index));
+    }
+
+    pub fn select_previous_oddsmatcher_row(&mut self) {
+        if self.oddsmatcher_rows.is_empty() {
+            self.oddsmatcher_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.oddsmatcher_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.oddsmatcher_table_state.select(Some(previous_index));
     }
 
     fn sync_selected_venue(&mut self) {
@@ -1014,6 +1256,7 @@ impl App {
         self.status_message = self.snapshot.status_line.clone();
         self.clamp_selected_exchange_row();
         self.clamp_selected_open_position_row();
+        self.clamp_selected_oddsmatcher_row();
     }
 
     fn load_recorder_dashboard_with_retry(&mut self) -> Result<ExchangePanelSnapshot> {
@@ -1237,6 +1480,115 @@ impl App {
             "Calculator mode set to {}.",
             self.calculator.input.mode.label()
         );
+    }
+
+    fn focus_oddsmatcher_filters(&mut self) {
+        self.oddsmatcher_focus = OddsMatcherFocus::Filters;
+        self.status_message = String::from("OddsMatcher focus set to filters.");
+    }
+
+    fn focus_oddsmatcher_results(&mut self) {
+        self.oddsmatcher_focus = OddsMatcherFocus::Results;
+        self.status_message = String::from("OddsMatcher focus set to results.");
+    }
+
+    fn begin_oddsmatcher_edit(&mut self) {
+        let field = self.oddsmatcher_editor.selected_field();
+        self.oddsmatcher_editor.buffer = field.display_value(&self.oddsmatcher_query);
+        self.oddsmatcher_editor.editing = true;
+        self.oddsmatcher_editor.replace_on_input = true;
+        self.status_message = format!("Editing OddsMatcher {}.", field.label());
+    }
+
+    fn apply_oddsmatcher_edit(&mut self) -> Result<()> {
+        let field = self.oddsmatcher_editor.selected_field();
+        let value = self.oddsmatcher_editor.buffer.clone();
+        field.apply_value(&mut self.oddsmatcher_query, &value)?;
+        self.oddsmatcher_editor.editing = false;
+        self.oddsmatcher_editor.buffer.clear();
+        self.oddsmatcher_editor.replace_on_input = false;
+        self.oddsmatcher_rows.clear();
+        self.oddsmatcher_table_state.select(None);
+        self.persist_oddsmatcher_query()?;
+        self.status_message = format!(
+            "Updated OddsMatcher {} and saved config. Press r to refresh.",
+            field.label()
+        );
+        Ok(())
+    }
+
+    fn cancel_oddsmatcher_edit(&mut self) {
+        self.oddsmatcher_editor.editing = false;
+        self.oddsmatcher_editor.buffer.clear();
+        self.oddsmatcher_editor.replace_on_input = false;
+        self.status_message = String::from("Cancelled OddsMatcher edit.");
+    }
+
+    fn oddsmatcher_push_char(&mut self, character: char) {
+        if self.oddsmatcher_editor.replace_on_input {
+            self.oddsmatcher_editor.buffer.clear();
+            self.oddsmatcher_editor.replace_on_input = false;
+        }
+        self.oddsmatcher_editor.buffer.push(character);
+    }
+
+    fn oddsmatcher_backspace(&mut self) {
+        if self.oddsmatcher_editor.replace_on_input {
+            self.oddsmatcher_editor.buffer.clear();
+            self.oddsmatcher_editor.replace_on_input = false;
+            return;
+        }
+        self.oddsmatcher_editor.buffer.pop();
+    }
+
+    fn cycle_oddsmatcher_suggestion(&mut self, forward: bool) -> Result<()> {
+        let field = self.oddsmatcher_editor.selected_field();
+        let suggestions = field.suggestions();
+        if suggestions.is_empty() {
+            return Ok(());
+        }
+
+        let current_value = field.display_value(&self.oddsmatcher_query);
+        let current_index = suggestions.iter().position(|value| value == &current_value);
+        let next_index = match (current_index, forward) {
+            (Some(index), true) => (index + 1) % suggestions.len(),
+            (Some(index), false) => {
+                if index == 0 {
+                    suggestions.len() - 1
+                } else {
+                    index - 1
+                }
+            }
+            (None, _) => 0,
+        };
+
+        field.apply_value(&mut self.oddsmatcher_query, &suggestions[next_index])?;
+        self.oddsmatcher_rows.clear();
+        self.oddsmatcher_table_state.select(None);
+        self.persist_oddsmatcher_query()?;
+        self.status_message = format!("Applied OddsMatcher suggestion for {}.", field.label());
+        Ok(())
+    }
+
+    fn persist_oddsmatcher_query(&mut self) -> Result<()> {
+        self.oddsmatcher_query_note =
+            oddsmatcher::save_query(&self.oddsmatcher_query_path, &self.oddsmatcher_query)?;
+        Ok(())
+    }
+
+    fn refresh_oddsmatcher(&mut self) -> Result<()> {
+        let rows = oddsmatcher::fetch_best_matches(&self.oddsmatcher_client, &self.oddsmatcher_query)
+            .map_err(|error| {
+                self.status_message = format!("OddsMatcher refresh failed: {error}");
+                error
+            })?;
+        self.oddsmatcher_rows = rows;
+        self.clamp_selected_oddsmatcher_row();
+        self.status_message = format!(
+            "Loaded {} live OddsMatcher row(s).",
+            self.oddsmatcher_rows.len()
+        );
+        Ok(())
     }
 }
 
