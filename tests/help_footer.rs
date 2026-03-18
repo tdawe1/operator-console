@@ -25,12 +25,14 @@ fn help_text_mentions_core_operator_keys() {
     assert!(help.contains("q"));
     assert!(help.contains("o"));
     assert!(help.contains("r"));
+    assert!(help.contains("v"));
     assert!(help.contains("s"));
     assert!(help.contains("x"));
     assert!(help.contains("enter"));
     assert!(help.contains("esc"));
     assert!(help.contains("u"));
     assert!(help.contains("D"));
+    assert!(help.contains("j/k"));
     assert!(help.contains("[/] cycle suggestions"));
 }
 
@@ -86,7 +88,7 @@ fn startup_footer_guidance_stays_visible_at_standard_terminal_size() {
 
     assert!(rendered.contains("press s for live data."));
     assert!(rendered.contains("o observability"));
-    assert!(rendered.contains("[/] cycle suggestions"));
+    assert!(rendered.contains("v live view"));
     assert!(rendered.contains("s start recorder"));
 }
 
@@ -114,6 +116,7 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         account_stats: None,
         open_positions: Vec::new(),
         historical_positions: Vec::new(),
+        ledger_pnl_summary: Default::default(),
         other_open_bets: Vec::new(),
         decisions: Vec::new(),
         watch: None,

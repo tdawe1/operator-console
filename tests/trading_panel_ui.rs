@@ -2,8 +2,8 @@ use color_eyre::Result;
 use operator_console::app::{App, TradingSection};
 use operator_console::domain::{
     AccountStats, DecisionSummary, ExchangePanelSnapshot, ExitRecommendation, OpenPositionRow,
-    OtherOpenBetRow, RuntimeSummary, TrackedBetRow, TrackedLeg, VenueId, VenueStatus,
-    VenueSummary, WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
+    OtherOpenBetRow, RuntimeSummary, TrackedBetRow, TrackedLeg, VenueId, VenueStatus, VenueSummary,
+    WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
 };
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use ratatui::backend::TestBackend;
@@ -34,6 +34,7 @@ fn stats_panel_renders_operating_ratios_and_mix_tables() {
     let rendered = render_section(TradingSection::Stats);
 
     assert!(rendered.contains("Trading Stats"));
+    assert!(rendered.contains("Running P/L"));
     assert!(rendered.contains("Exposure vs Balance"));
     assert!(rendered.contains("Decision Mix"));
     assert!(rendered.contains("Tracked Mix"));
@@ -47,6 +48,49 @@ fn recorder_panel_renders_capture_pipeline_and_runbook() {
     assert!(rendered.contains("Recorder Config"));
     assert!(rendered.contains("Field Detail"));
     assert!(rendered.contains("Recorder Runbook"));
+}
+
+#[test]
+fn positions_live_view_overlay_renders_cashout_and_matrix() {
+    let mut snapshot = sample_snapshot();
+    snapshot.other_open_bets = vec![OtherOpenBetRow {
+        venue: String::from("bet365"),
+        event: String::from("Arsenal v Everton"),
+        label: String::from("Arsenal"),
+        market: String::from("Match Odds"),
+        side: String::from("back"),
+        odds: 2.375,
+        stake: 10.0,
+        status: String::from("cash_out"),
+        current_cashout_value: Some(16.16),
+        supports_cash_out: true,
+    }];
+    let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
+    app.set_trading_section(TradingSection::Positions);
+    app.toggle_live_view_overlay();
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| operator_console::ui::render(frame, &mut app))
+        .expect("draw ui");
+
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    let mut lines = Vec::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        lines.push(line);
+    }
+    let rendered = lines.join("\n");
+
+    assert!(rendered.contains("Live View"));
+    assert!(rendered.contains("Book Cash"));
+    assert!(rendered.contains("Decision Matrix"));
+    assert!(rendered.contains("16.16"));
 }
 
 fn render_section(section: TradingSection) -> String {
@@ -133,6 +177,8 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             available_balance: 500.0,
             exposure: 120.0,
             unrealized_pnl: 14.25,
+            cumulative_pnl: Some(253.69),
+            cumulative_pnl_label: String::from("P&L since Jan 2026"),
             currency: String::from("GBP"),
         }),
         open_positions: vec![OpenPositionRow {
@@ -163,13 +209,18 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             can_trade_out: true,
         }],
         historical_positions: Vec::new(),
+        ledger_pnl_summary: Default::default(),
         other_open_bets: vec![OtherOpenBetRow {
+            venue: String::from("bet365"),
+            event: String::from("Brumbies v Chiefs"),
             label: String::from("Brumbies"),
             market: String::from("To Win"),
             side: String::from("back"),
             odds: 3.10,
             stake: 10.0,
             status: String::from("cash_out"),
+            current_cashout_value: Some(16.16),
+            supports_cash_out: true,
         }],
         decisions: vec![
             DecisionSummary {

@@ -34,7 +34,11 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw(app.calculator_selected_field().label()),
             Span::raw("   "),
             metric("Editing", accent_pink()),
-            Span::raw(if app.calculator_is_editing() { "yes" } else { "no" }),
+            Span::raw(if app.calculator_is_editing() {
+                "yes"
+            } else {
+                "no"
+            }),
         ]),
         Line::from(vec![
             metric("Qualifying", accent_green()),
@@ -83,22 +87,25 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_inputs(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let rows = app.calculator_field_rows().into_iter().map(|(field, value, selected)| {
-        let style = if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent_cyan())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(text_color())
-        };
-        Row::new(vec![
-            Cell::from(field.label().to_string()),
-            Cell::from(value),
-            Cell::from(if selected { "<<" } else { "" }),
-        ])
-        .style(style)
-    });
+    let rows = app
+        .calculator_field_rows()
+        .into_iter()
+        .map(|(field, value, selected)| {
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent_cyan())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text_color())
+            };
+            Row::new(vec![
+                Cell::from(field.label().to_string()),
+                Cell::from(value),
+                Cell::from(if selected { "<<" } else { "" }),
+            ])
+            .style(style)
+        });
     let table = Table::new(
         rows,
         [
@@ -128,8 +135,18 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, output: Option<&Output>) {
             accent_green(),
             output.qualifying_profit,
         ),
-        result_line("Underlay", &output.underlay, accent_gold(), output.qualifying_profit),
-        result_line("Overlay", &output.overlay, accent_pink(), output.qualifying_profit),
+        result_line(
+            "Underlay",
+            &output.underlay,
+            accent_gold(),
+            output.qualifying_profit,
+        ),
+        result_line(
+            "Overlay",
+            &output.overlay,
+            accent_pink(),
+            output.qualifying_profit,
+        ),
     ];
 
     let body = Paragraph::new(rows)

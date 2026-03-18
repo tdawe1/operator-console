@@ -109,6 +109,10 @@ pub struct AccountStats {
     pub available_balance: f64,
     pub exposure: f64,
     pub unrealized_pnl: f64,
+    #[serde(default)]
+    pub cumulative_pnl: Option<f64>,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub cumulative_pnl_label: String,
     #[serde(
         default = "default_currency",
         deserialize_with = "null_string_or_default_currency"
@@ -155,12 +159,20 @@ pub struct OpenPositionRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OtherOpenBetRow {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub venue: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event: String,
     pub label: String,
     pub market: String,
     pub side: String,
     pub odds: f64,
     pub stake: f64,
     pub status: String,
+    #[serde(default)]
+    pub current_cashout_value: Option<f64>,
+    #[serde(default)]
+    pub supports_cash_out: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -288,6 +300,37 @@ pub struct ExitRecommendation {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LedgerPnlPoint {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub occurred_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub entry_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub platform: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub platform_kind: String,
+    pub delta: f64,
+    pub total: f64,
+    pub promo_total: f64,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub funding_kind: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LedgerPnlSummary {
+    pub realised_total: f64,
+    pub exchange_total: f64,
+    pub sportsbook_total: f64,
+    pub promo_total: f64,
+    pub settled_count: usize,
+    pub standard_count: usize,
+    pub promo_count: usize,
+    pub unknown_count: usize,
+    #[serde(default)]
+    pub points: Vec<LedgerPnlPoint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExchangePanelSnapshot {
     pub worker: WorkerSummary,
@@ -301,6 +344,7 @@ pub struct ExchangePanelSnapshot {
     pub account_stats: Option<AccountStats>,
     pub open_positions: Vec<OpenPositionRow>,
     pub historical_positions: Vec<OpenPositionRow>,
+    pub ledger_pnl_summary: LedgerPnlSummary,
     pub other_open_bets: Vec<OtherOpenBetRow>,
     pub decisions: Vec<DecisionSummary>,
     pub watch: Option<WatchSnapshot>,

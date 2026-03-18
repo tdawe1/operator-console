@@ -364,7 +364,7 @@ fn render_stateful_table(
                 .fg(Color::Rgb(255, 255, 255))
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(">> ");
+        .highlight_symbol("● ");
     frame.render_stateful_widget(table, area, table_state);
 }
 

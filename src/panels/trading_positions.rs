@@ -3,26 +3,40 @@ use std::collections::BTreeSet;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Row, Table,
+    TableState, Wrap,
+};
 use ratatui::Frame;
 
-use crate::domain::ExchangePanelSnapshot;
+use crate::app::PositionsFocus;
+use crate::domain::{
+    ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, TrackedBetRow, TrackedLeg,
+};
 
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
-    table_state: &mut TableState,
+    active_table_state: &mut TableState,
+    historical_table_state: &mut TableState,
+    positions_focus: PositionsFocus,
+    show_live_view_overlay: bool,
     status_message: &str,
     help_text: &str,
 ) {
-    let selected_position = selected_position(snapshot, table_state);
-    let layout = Layout::vertical([Constraint::Length(11), Constraint::Min(18)]).split(area);
-    let body = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+    let active_views = active_position_views(snapshot);
+    let exit_recommendations = derived_exit_recommendations(snapshot);
+    let selected_active = selected_active_position(&active_views, active_table_state);
+    let selected_historical = selected_historical_position(snapshot, historical_table_state);
+    let layout = Layout::vertical([Constraint::Length(10), Constraint::Min(18)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
         .split(layout[1]);
+    let (active_height, historical_height) =
+        position_section_heights(snapshot, body[0].height.max(14));
     let left = Layout::vertical([
-        Constraint::Length(active_positions_section_height(snapshot, body[0].height)),
-        Constraint::Min(10),
+        Constraint::Length(active_height),
+        Constraint::Length(historical_height),
     ])
     .split(body[0]);
     let right = Layout::vertical([
@@ -34,56 +48,74 @@ pub fn render(
     ])
     .split(body[1]);
 
-    render_summary(frame, layout[0], snapshot, selected_position);
+    render_summary(
+        frame,
+        layout[0],
+        snapshot,
+        selected_active,
+        selected_historical,
+        positions_focus,
+    );
+    let active_title = positions_table_title(
+        "󰞇 Active Positions",
+        active_views.len(),
+        positions_focus == PositionsFocus::Active,
+    );
     render_stateful_table(
         frame,
         left[0],
-        &format!("Active Positions ({})", snapshot.open_positions.len()),
+        &active_title,
         vec![
+            Constraint::Percentage(18),
             Constraint::Percentage(22),
-            Constraint::Percentage(27),
+            Constraint::Length(10),
             Constraint::Length(5),
-            Constraint::Length(12),
+            Constraint::Length(13),
+            Constraint::Length(13),
             Constraint::Length(3),
             Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Min(14),
         ],
-        position_rows(snapshot),
+        active_position_rows(&active_views),
         empty_row(
             "No active positions are loaded. Start the recorder or refresh the provider.",
-            7,
+            9,
         ),
-        table_state,
+        active_table_state,
     );
+    let historical_title = positions_table_title(
+        "󰋪 Historical Positions",
+        snapshot.historical_positions.len(),
+        positions_focus == PositionsFocus::Historical,
+    );
+    let history_empty = if snapshot.historical_positions.is_empty() {
+        "No historical positions are loaded. Import ledger history to populate this section."
+    } else {
+        "Historical selection is out of range."
+    };
     render_table(
         frame,
         left[1],
-        &format!(
-            "Historical Positions ({})",
-            snapshot.historical_positions.len()
-        ),
+        &historical_title,
         vec![
+            Constraint::Percentage(18),
             Constraint::Percentage(22),
-            Constraint::Percentage(27),
+            Constraint::Length(10),
             Constraint::Length(5),
-            Constraint::Length(12),
+            Constraint::Length(5),
+            Constraint::Length(8),
             Constraint::Length(3),
             Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Min(12),
         ],
         historical_position_rows(snapshot),
-        empty_row(
-            "No historical positions are loaded. Import ledger history to populate this section.",
-            7,
-        ),
+        empty_row(history_empty, 9),
+        Some(historical_table_state),
     );
     render_table(
         frame,
         right[0],
-        &format!(
-            "Exit Recommendations ({})",
-            snapshot.exit_recommendations.len()
-        ),
+        &format!("󰔟 Exit Recommendations ({})", exit_recommendations.len()),
         vec![
             Constraint::Length(10),
             Constraint::Length(12),
@@ -91,14 +123,15 @@ pub fn render(
             Constraint::Length(9),
             Constraint::Length(10),
         ],
-        exit_rows(snapshot),
+        exit_rows(&exit_recommendations),
         empty_row("No exit recommendations are loaded.", 5),
+        None,
     );
     render_table(
         frame,
         right[1],
         &format!(
-            "Watch Plan ({})",
+            "󰄦 Watch Plan ({})",
             snapshot
                 .watch
                 .as_ref()
@@ -115,25 +148,28 @@ pub fn render(
         ],
         watch_rows(snapshot),
         empty_row("No grouped watch plan is loaded.", 6),
+        None,
     );
     render_table(
         frame,
         right[2],
-        &format!("Tracked Bets ({})", snapshot.tracked_bets.len()),
+        &format!("󰋼 Tracked Bets ({})", snapshot.tracked_bets.len()),
         vec![
             Constraint::Length(10),
-            Constraint::Percentage(28),
-            Constraint::Percentage(22),
+            Constraint::Percentage(24),
+            Constraint::Percentage(20),
+            Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Min(12),
         ],
         tracked_rows(snapshot),
-        empty_row("No tracked bets are loaded.", 5),
+        empty_row("No tracked bets are loaded.", 6),
+        None,
     );
     render_table(
         frame,
         right[3],
-        &format!("Other Open Bets ({})", snapshot.other_open_bets.len()),
+        &format!("󰇚 Other Open Bets ({})", snapshot.other_open_bets.len()),
         vec![
             Constraint::Percentage(32),
             Constraint::Percentage(26),
@@ -143,22 +179,271 @@ pub fn render(
         ],
         other_open_bet_rows(snapshot),
         empty_row("No other open bets are loaded.", 5),
+        None,
     );
-    render_operator_log(frame, right[4], status_message, help_text);
+    render_operator_log(frame, right[4], status_message, help_text, positions_focus);
+
+    if show_live_view_overlay {
+        render_live_view_overlay(frame, area, selected_active);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActivePositionView<'a> {
+    open_position: Option<&'a OpenPositionRow>,
+    sportsbook_bet: Option<&'a OtherOpenBetRow>,
+    tracked_bet: Option<&'a TrackedBetRow>,
+    commission_rate: f64,
+    target_profit: f64,
+    stop_loss: f64,
+    hard_margin_call_profit_floor: Option<f64>,
+    warn_only_default: bool,
+}
+
+#[derive(Clone)]
+struct DerivedExitRecommendation {
+    bet_id: String,
+    action: String,
+    reason: String,
+    worst_case_pnl: f64,
+    cash_out_venue: Option<String>,
+}
+
+pub(crate) fn active_position_row_count(snapshot: &ExchangePanelSnapshot) -> usize {
+    active_position_views(snapshot).len()
+}
+
+pub(crate) fn next_actionable_cash_out_bet_id(snapshot: &ExchangePanelSnapshot) -> Option<String> {
+    derived_exit_recommendations(snapshot)
+        .into_iter()
+        .find(|recommendation| recommendation.action == "cash_out")
+        .map(|recommendation| recommendation.bet_id)
+}
+
+fn active_position_views(snapshot: &ExchangePanelSnapshot) -> Vec<ActivePositionView<'_>> {
+    let commission_rate = snapshot
+        .watch
+        .as_ref()
+        .map(|watch| watch.commission_rate)
+        .unwrap_or(0.0);
+    let target_profit = snapshot.exit_policy.target_profit;
+    let stop_loss = snapshot.exit_policy.stop_loss;
+    let hard_margin_call_profit_floor = snapshot.exit_policy.hard_margin_call_profit_floor;
+    let warn_only_default = snapshot.exit_policy.warn_only_default;
+    let mut used_sportsbook = BTreeSet::new();
+    let mut used_tracked = BTreeSet::new();
+    let mut rows = Vec::new();
+
+    for open_position in &snapshot.open_positions {
+        let tracked_bet = snapshot
+            .tracked_bets
+            .iter()
+            .find(|tracked_bet| tracked_bet_matches_open_position(tracked_bet, open_position));
+        if let Some(tracked_bet) = tracked_bet {
+            used_tracked.insert(tracked_bet.bet_id.clone());
+        }
+
+        let sportsbook_bet = snapshot.other_open_bets.iter().find(|sportsbook_bet| {
+            sportsbook_bet_matches_open_position(sportsbook_bet, open_position)
+        });
+        if let Some(sportsbook_bet) = sportsbook_bet {
+            used_sportsbook.insert(sportsbook_bet_identity(sportsbook_bet));
+        }
+
+        rows.push(ActivePositionView {
+            open_position: Some(open_position),
+            sportsbook_bet,
+            tracked_bet,
+            commission_rate,
+            target_profit,
+            stop_loss,
+            hard_margin_call_profit_floor,
+            warn_only_default,
+        });
+    }
+
+    for tracked_bet in snapshot
+        .tracked_bets
+        .iter()
+        .filter(|tracked_bet| !tracked_bet_is_closed(tracked_bet))
+    {
+        if used_tracked.contains(&tracked_bet.bet_id) {
+            continue;
+        }
+        let sportsbook_bet = snapshot
+            .other_open_bets
+            .iter()
+            .find(|sportsbook_bet| sportsbook_bet_matches_tracked_bet(sportsbook_bet, tracked_bet));
+        if let Some(sportsbook_bet) = sportsbook_bet {
+            used_sportsbook.insert(sportsbook_bet_identity(sportsbook_bet));
+        }
+        rows.push(ActivePositionView {
+            open_position: None,
+            sportsbook_bet,
+            tracked_bet: Some(tracked_bet),
+            commission_rate,
+            target_profit,
+            stop_loss,
+            hard_margin_call_profit_floor,
+            warn_only_default,
+        });
+    }
+
+    for sportsbook_bet in &snapshot.other_open_bets {
+        if used_sportsbook.contains(&sportsbook_bet_identity(sportsbook_bet)) {
+            continue;
+        }
+        rows.push(ActivePositionView {
+            open_position: None,
+            sportsbook_bet: Some(sportsbook_bet),
+            tracked_bet: None,
+            commission_rate,
+            target_profit,
+            stop_loss,
+            hard_margin_call_profit_floor,
+            warn_only_default,
+        });
+    }
+
+    rows
+}
+
+fn selected_active_position<'a>(
+    active_views: &'a [ActivePositionView<'a>],
+    active_table_state: &TableState,
+) -> Option<ActivePositionView<'a>> {
+    active_table_state
+        .selected()
+        .and_then(|index| active_views.get(index).copied())
+        .or_else(|| active_views.first().copied())
+}
+
+fn selected_historical_position<'a>(
+    snapshot: &'a ExchangePanelSnapshot,
+    historical_table_state: &TableState,
+) -> Option<&'a OpenPositionRow> {
+    historical_table_state
+        .selected()
+        .and_then(|index| snapshot.historical_positions.get(index))
+        .or_else(|| snapshot.historical_positions.first())
+}
+
+fn derived_exit_recommendations(
+    snapshot: &ExchangePanelSnapshot,
+) -> Vec<DerivedExitRecommendation> {
+    active_position_views(snapshot)
+        .into_iter()
+        .filter_map(derived_exit_recommendation)
+        .collect()
+}
+
+fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedExitRecommendation> {
+    let tracked_bet = view.tracked_bet?;
+    let worst_case_pnl = active_current_worst_case(view)
+        .or_else(|| active_hold_outcomes(view).map(|(win, lose)| win.min(lose)))
+        .unwrap_or(0.0);
+
+    let (action, reason, cash_out_venue) = if active_exchange_leg(view).is_none() {
+        ("hold", "missing_smarkets_leg", None)
+    } else if active_current_back_odds(view).is_none()
+        || !view
+            .open_position
+            .map(|open_position| open_position.can_trade_out)
+            .unwrap_or(false)
+    {
+        (
+            "hold",
+            "cash_out_unavailable",
+            Some(String::from("smarkets")),
+        )
+    } else if let Some(hard_floor) = view.hard_margin_call_profit_floor {
+        if worst_case_pnl >= hard_floor {
+            (
+                "cash_out",
+                "hard_margin_call",
+                Some(String::from("smarkets")),
+            )
+        } else {
+            if worst_case_pnl >= view.target_profit {
+                (
+                    if view.warn_only_default {
+                        "warn"
+                    } else {
+                        "cash_out"
+                    },
+                    "target_profit",
+                    Some(String::from("smarkets")),
+                )
+            } else if worst_case_pnl <= -view.stop_loss {
+                (
+                    if view.warn_only_default {
+                        "warn"
+                    } else {
+                        "cash_out"
+                    },
+                    "stop_loss",
+                    Some(String::from("smarkets")),
+                )
+            } else {
+                ("hold", "within_thresholds", Some(String::from("smarkets")))
+            }
+        }
+    } else if worst_case_pnl >= view.target_profit {
+        (
+            if view.warn_only_default {
+                "warn"
+            } else {
+                "cash_out"
+            },
+            "target_profit",
+            Some(String::from("smarkets")),
+        )
+    } else if worst_case_pnl <= -view.stop_loss {
+        (
+            if view.warn_only_default {
+                "warn"
+            } else {
+                "cash_out"
+            },
+            "stop_loss",
+            Some(String::from("smarkets")),
+        )
+    } else {
+        ("hold", "within_thresholds", Some(String::from("smarkets")))
+    };
+
+    Some(DerivedExitRecommendation {
+        bet_id: tracked_bet.bet_id.clone(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        worst_case_pnl,
+        cash_out_venue,
+    })
 }
 
 fn render_summary(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
-    selected_position: Option<&crate::domain::OpenPositionRow>,
+    selected_active: Option<ActivePositionView<'_>>,
+    selected_historical: Option<&OpenPositionRow>,
+    positions_focus: PositionsFocus,
 ) {
-    let summary =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+    let summary = Layout::horizontal([
+        Constraint::Percentage(23),
+        Constraint::Percentage(33),
+        Constraint::Percentage(22),
+        Constraint::Percentage(22),
+    ])
+    .split(area);
     let runtime = snapshot.runtime.as_ref();
+    let exit_recommendations = derived_exit_recommendations(snapshot);
+    let (standard_funding_count, promo_funding_count, unknown_funding_count) =
+        tracked_bet_funding_counts(snapshot);
+    let (realised_pnl, live_pnl, net_pnl, promo_pnl) = positions_pnl_summary(snapshot);
     let overview_rows = vec![
         (
-            "Refresh",
+            "󰅐 Refresh",
             runtime
                 .map(|summary| {
                     summary
@@ -171,22 +456,22 @@ fn render_summary(
             accent_green(),
         ),
         (
-            "Worker",
+            "󰒋 Worker",
             format!("{:?}", snapshot.worker.status),
             accent_cyan(),
         ),
         (
-            "Source",
+            "󰆼 Source",
             runtime
                 .map(|summary| summary.source.clone())
                 .unwrap_or_else(|| String::from("snapshot")),
             accent_gold(),
         ),
         (
-            "Counts",
+            "󰐹 Counts",
             format!(
                 "pos {} | hist {} | open {} | tracked {}",
-                snapshot.open_positions.len(),
+                active_position_row_count(snapshot),
                 snapshot.historical_positions.len(),
                 snapshot.other_open_bets.len(),
                 snapshot.tracked_bets.len(),
@@ -194,7 +479,7 @@ fn render_summary(
             accent_blue(),
         ),
         (
-            "State",
+            "󰥔 State",
             format!(
                 "live {} | susp {} | watch {} | rec {}",
                 in_play_count(snapshot),
@@ -204,12 +489,30 @@ fn render_summary(
                     .as_ref()
                     .map(|watch| watch.watch_count)
                     .unwrap_or(0),
-                snapshot.exit_recommendations.len(),
+                exit_recommendations.len(),
             ),
             accent_pink(),
         ),
         (
-            "Status",
+            "󰤑 Funding",
+            if snapshot.tracked_bets.is_empty() {
+                String::from("no tracked funding")
+            } else {
+                format!(
+                    "std {} | promo {} | unk {}",
+                    standard_funding_count, promo_funding_count, unknown_funding_count
+                )
+            },
+            if promo_funding_count > 0 {
+                accent_gold()
+            } else if unknown_funding_count > 0 {
+                muted_text()
+            } else {
+                accent_green()
+            },
+        ),
+        (
+            "󱂬 Status",
             if runtime.map(|summary| summary.stale).unwrap_or(false) {
                 format!("STALE | {}", snapshot.status_line)
             } else {
@@ -225,24 +528,31 @@ fn render_summary(
     render_key_value_table(
         frame,
         summary[0],
-        "Snapshot",
+        "󰐹 Snapshot",
         overview_rows,
-        Constraint::Length(8),
+        Constraint::Length(12),
     );
 
-    let selected_rows = if let Some(row) = selected_position {
+    let selected_rows = if positions_focus == PositionsFocus::Active {
+        selected_active
+            .map(selected_active_rows)
+            .unwrap_or_else(empty_selected_rows)
+    } else if let Some(row) = selected_historical {
         vec![
-            ("Event", event_label(row), accent_blue()),
-            ("Position", position_label(row), accent_gold()),
-            ("Score", score_label(row), accent_green()),
-            ("Phase", phase_label(row), accent_cyan()),
+            ("󰕮 Pane", positions_focus.label().to_string(), accent_cyan()),
+            ("󰍹 Event", event_label(row), accent_blue()),
+            ("󰃭 Date", event_date_label(row), accent_green()),
+            ("󰥔 Time", event_time_label(row), accent_cyan()),
+            ("󰆼 Position", position_label(row), accent_gold()),
+            ("󰄬 Score", score_label(row), accent_green()),
+            ("󰅐 Phase", phase_label(row), accent_cyan()),
             (
-                "Trade",
+                "󰄬 Trade",
                 format!("{} ({})", trade_label(row), trade_code(row)),
                 trade_color(row),
             ),
             (
-                "Order",
+                "󰌑 Order",
                 if row.status.is_empty() {
                     String::from("-")
                 } else {
@@ -251,7 +561,7 @@ fn render_summary(
                 accent_green(),
             ),
             (
-                "Exposure",
+                "󰖌 Exposure",
                 format!(
                     "stake {:.2} | liab {:.2} | value {:.2}",
                     row.stake, row.liability, row.current_value,
@@ -259,7 +569,7 @@ fn render_summary(
                 accent_pink(),
             ),
             (
-                "Market",
+                "󰇈 Market",
                 format!(
                     "buy {} | sell {} | {}",
                     format_optional_back_odds(primary_market_buy_odds(row)),
@@ -269,7 +579,7 @@ fn render_summary(
                 accent_blue(),
             ),
             (
-                "Marked",
+                "󱂬 Marked",
                 format!(
                     "value {:.2} | pnl {:+.2}",
                     row.current_value, row.pnl_amount,
@@ -279,27 +589,108 @@ fn render_summary(
         ]
     } else {
         vec![
-            ("Event", String::from("-"), muted_text()),
+            ("󰕮 Pane", positions_focus.label().to_string(), accent_cyan()),
+            ("󰍹 Event", String::from("-"), muted_text()),
+            ("󰃭 Date", String::from("-"), muted_text()),
+            ("󰥔 Time", String::from("-"), muted_text()),
             (
-                "Position",
+                "󰆼 Position",
                 String::from("No active position selected"),
                 muted_text(),
             ),
-            ("Score", String::from("-"), muted_text()),
-            ("Phase", String::from("-"), muted_text()),
-            ("Trade", String::from("-"), muted_text()),
-            ("Order", String::from("-"), muted_text()),
-            ("Exposure", String::from("-"), muted_text()),
-            ("Market", String::from("-"), muted_text()),
-            ("Marked", String::from("-"), muted_text()),
+            ("󰄬 Score", String::from("-"), muted_text()),
+            ("󰅐 Phase", String::from("-"), muted_text()),
+            ("󰄬 Trade", String::from("-"), muted_text()),
+            ("󰌑 Order", String::from("-"), muted_text()),
+            ("󰖌 Exposure", String::from("-"), muted_text()),
+            ("󰇈 Market", String::from("-"), muted_text()),
+            ("󱂬 Marked", String::from("-"), muted_text()),
         ]
     };
     render_key_value_table(
         frame,
         summary[1],
-        "Selected Position",
+        "󰄬 Selected Row",
         selected_rows,
-        Constraint::Length(9),
+        Constraint::Length(13),
+    );
+
+    let control_rows = vec![
+        (
+            "󰮳 Navigate",
+            format!("↑/↓ or j/k • Tab pane ({})", positions_focus.label()),
+            accent_gold(),
+        ),
+        (
+            "󰔟 Action",
+            String::from("c cash out first actionable bet"),
+            accent_green(),
+        ),
+        (
+            "󰑓 Refresh",
+            String::from("r reload provider snapshot"),
+            accent_cyan(),
+        ),
+        (
+            "󰊠 Scope",
+            format!(
+                "{} active • {} historical",
+                active_position_row_count(snapshot),
+                snapshot.historical_positions.len()
+            ),
+            accent_blue(),
+        ),
+        (
+            "󰋼 Flow",
+            format!(
+                "{} tracked • {} recs • {} watch",
+                snapshot.tracked_bets.len(),
+                exit_recommendations.len(),
+                snapshot
+                    .watch
+                    .as_ref()
+                    .map(|watch| watch.watch_count)
+                    .unwrap_or(0)
+            ),
+            accent_pink(),
+        ),
+    ];
+    render_key_value_table(
+        frame,
+        summary[2],
+        "󰘳 Controls",
+        control_rows,
+        Constraint::Length(12),
+    );
+
+    let pnl_rows = vec![
+        (
+            "󰜎 Realised",
+            format!("{realised_pnl:+.2}"),
+            pnl_color(realised_pnl),
+        ),
+        ("󱂬 Live", format!("{live_pnl:+.2}"), pnl_color(live_pnl)),
+        ("󰮍 Net", format!("{net_pnl:+.2}"), pnl_color(net_pnl)),
+        (
+            "󰤑 Promo",
+            if promo_funding_count > 0 {
+                format!("{promo_pnl:+.2}")
+            } else {
+                String::from("-")
+            },
+            if promo_funding_count > 0 {
+                pnl_color(promo_pnl)
+            } else {
+                muted_text()
+            },
+        ),
+    ];
+    render_key_value_table(
+        frame,
+        summary[3],
+        "󰁔 Running P/L",
+        pnl_rows,
+        Constraint::Length(10),
     );
 }
 
@@ -329,13 +720,14 @@ fn render_key_value_table(
 
 #[cfg(test)]
 fn summary_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
+    let exit_recommendations = derived_exit_recommendations(snapshot);
     vec![
         Line::raw(format!(
             "Positions: {} | Other bets: {} | Tracked bets: {} | Recommendations: {}",
-            snapshot.open_positions.len(),
+            active_position_row_count(snapshot),
             snapshot.other_open_bets.len(),
             snapshot.tracked_bets.len(),
-            snapshot.exit_recommendations.len(),
+            exit_recommendations.len(),
         )),
         Line::raw(format!(
             "Selected venue: {}",
@@ -367,39 +759,35 @@ fn summary_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 fn open_position_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
-    if snapshot.open_positions.is_empty() && snapshot.historical_positions.is_empty() {
+    let active_views = active_position_views(snapshot);
+    if active_views.is_empty() && snapshot.historical_positions.is_empty() {
         return vec![Line::raw("No open positions are loaded.")];
     }
 
     let mut rows = Vec::new();
-    if !snapshot.open_positions.is_empty() {
+    if !active_views.is_empty() {
         rows.push(Line::raw(format!(
             "Active Positions ({})",
-            snapshot.open_positions.len()
+            active_views.len()
         )));
     }
-    for row in snapshot.open_positions.iter().take(6) {
+    for view in active_views.iter().take(6) {
         rows.push(Line::raw(format!(
             "{} | {}",
-            event_label(row),
-            position_label(row)
+            active_event_label(*view),
+            active_position_label(*view)
         )));
         rows.push(Line::raw(format!(
-            "score {} | phase {} | trade {}",
-            score_label(row),
-            phase_label(row),
-            trade_label(row),
+            "hold {} | lock {} | action {}",
+            active_hold_label(*view),
+            active_lock_label(*view),
+            active_action_label(*view),
         )));
         rows.push(Line::raw(format!(
-            "status {} | pnl {:+.2} | buy {} | {}",
-            if row.status.is_empty() {
-                String::from("-")
-            } else {
-                row.status.clone()
-            },
-            row.pnl_amount,
-            format_optional_back_odds(primary_market_buy_odds(row)),
-            format_optional_probability(primary_market_implied_probability(row)),
+            "status {} | live {} | {}",
+            active_status_label(*view),
+            active_live_odds_label(*view),
+            active_trigger_label(*view),
         )));
     }
     if !snapshot.historical_positions.is_empty() {
@@ -435,20 +823,21 @@ fn open_position_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     rows
 }
 
-fn position_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    snapshot
-        .open_positions
+fn active_position_rows(active_views: &[ActivePositionView<'_>]) -> Vec<Row<'static>> {
+    active_views
         .iter()
-        .take(8)
-        .map(|row| {
+        .copied()
+        .map(|view| {
             Row::new(vec![
-                Cell::from(event_table_label(row)),
-                Cell::from(position_table_label(row)),
-                Cell::from(score_label(row)),
-                Cell::from(phase_label(row)),
-                trade_cell(row),
-                pnl_cell(row.pnl_amount),
-                Cell::from(market_price_label(row)),
+                Cell::from(truncate_text(&active_event_label(view), 28)),
+                Cell::from(truncate_text(&active_position_label(view), 34)),
+                Cell::from(active_date_label(view)),
+                Cell::from(active_time_label(view)),
+                Cell::from(active_hold_label(view)),
+                Cell::from(active_lock_label(view)),
+                active_action_cell(view),
+                Cell::from(active_probability_label(view)),
+                Cell::from(active_trigger_label(view)),
             ])
         })
         .collect()
@@ -458,11 +847,12 @@ fn historical_position_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static
     snapshot
         .historical_positions
         .iter()
-        .take(8)
         .map(|row| {
             Row::new(vec![
                 Cell::from(event_table_label(row)),
                 Cell::from(position_table_label(row)),
+                Cell::from(event_date_label(row)),
+                Cell::from(event_time_label(row)),
                 Cell::from(score_label(row)),
                 Cell::from(phase_label(row)),
                 trade_cell(row),
@@ -477,7 +867,6 @@ fn other_open_bet_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     snapshot
         .other_open_bets
         .iter()
-        .take(6)
         .map(|row| {
             Row::new(vec![
                 Cell::from(row.label.clone()),
@@ -492,6 +881,131 @@ fn other_open_bet_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
 
 #[cfg(test)]
 fn watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
+    let active_views = active_position_views(snapshot);
+    if active_views.is_empty() {
+        return legacy_watch_lines(snapshot);
+    }
+    if !has_paired_active_position(&active_views) {
+        return legacy_watch_lines(snapshot);
+    }
+
+    let mut rows = vec![
+        Line::raw(format!(
+            "Target profit {:.2} | Stop loss {:.2}",
+            snapshot
+                .watch
+                .as_ref()
+                .map(|watch| watch.target_profit)
+                .unwrap_or(0.0),
+            snapshot
+                .watch
+                .as_ref()
+                .map(|watch| watch.stop_loss)
+                .unwrap_or(0.0)
+        )),
+        Line::raw(format!(
+            "Commission rate {:.2}",
+            snapshot
+                .watch
+                .as_ref()
+                .map(|watch| watch.commission_rate)
+                .unwrap_or(0.0)
+        )),
+        Line::raw(String::new()),
+    ];
+
+    for view in active_views.iter().take(6).copied() {
+        rows.push(Line::raw(format!(
+            "{} | {}",
+            active_selection_label(view),
+            active_market_name(view)
+        )));
+        rows.push(Line::raw(format!(
+            "live {} | profit {} | stop {}",
+            active_live_odds_label(view),
+            active_profit_target_odds(view)
+                .map(|value| format!("{:.2}", value))
+                .unwrap_or_else(|| String::from("-")),
+            active_stop_loss_odds(view)
+                .map(|value| format!("{:.2}", value))
+                .unwrap_or_else(|| String::from("-")),
+        )));
+        rows.push(Line::raw(format!(
+            "prob entry {} | live {} | profit {} | stop {}",
+            active_entry_probability_label(view),
+            active_probability_label(view),
+            active_profit_target_odds(view)
+                .map(implied_probability)
+                .map(format_probability)
+                .unwrap_or_else(|| String::from("-")),
+            active_stop_loss_odds(view)
+                .map(implied_probability)
+                .map(format_probability)
+                .unwrap_or_else(|| String::from("-")),
+        )));
+        rows.push(Line::raw(format!(
+            "hold {} | lock {} | action {}",
+            active_hold_label(view),
+            active_lock_label(view),
+            active_action_label(view),
+        )));
+        rows.push(Line::raw(format!(
+            "gaps profit {} stop {}",
+            active_profit_target_odds(view)
+                .zip(active_current_back_odds(view))
+                .map(|(target, live)| format!("{:+.2}", target - live))
+                .unwrap_or_else(|| String::from("-")),
+            active_stop_loss_odds(view)
+                .zip(active_current_back_odds(view))
+                .map(|(stop, live)| format!("{:+.2}", stop - live))
+                .unwrap_or_else(|| String::from("-")),
+        )));
+    }
+    rows
+}
+
+fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
+    let active_views = active_position_views(snapshot);
+    if active_views.is_empty() {
+        return legacy_watch_rows(snapshot);
+    }
+    if !has_paired_active_position(&active_views) {
+        return legacy_watch_rows(snapshot);
+    }
+
+    active_views
+        .into_iter()
+        .map(|view| {
+            Row::new(vec![
+                Cell::from(active_selection_label(view)),
+                Cell::from(active_leg_summary(view)),
+                Cell::from(active_live_odds_label(view)),
+                Cell::from(
+                    active_profit_target_odds(view)
+                        .map(|value| format!("{:.2}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                ),
+                Cell::from(
+                    active_stop_loss_odds(view)
+                        .map(|value| format!("{:.2}", value))
+                        .unwrap_or_else(|| String::from("-")),
+                ),
+                pnl_cell(
+                    active_current_worst_case(view).unwrap_or_else(|| active_marked_pnl(view)),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn has_paired_active_position(active_views: &[ActivePositionView<'_>]) -> bool {
+    active_views
+        .iter()
+        .any(|view| view.sportsbook_bet.is_some() || view.tracked_bet.is_some())
+}
+
+#[cfg(test)]
+fn legacy_watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     let Some(watch) = &snapshot.watch else {
         return vec![Line::raw("No grouped watch plan is loaded.")];
     };
@@ -508,9 +1022,9 @@ fn watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     for row in watch.watches.iter().take(6) {
         rows.push(Line::raw(format!("{} | {}", row.contract, row.market)));
         rows.push(Line::raw(format!(
-            "live {} | profit {:.2} | stop {:.2}",
+            "live {} | profit {} | stop {}",
             row.current_back_odds
-                .map(|value| format!("{value:.2}"))
+                .map(|value| format!("{:.2}", value))
                 .unwrap_or_else(|| String::from("-")),
             row.profit_take_back_odds,
             row.stop_loss_back_odds,
@@ -544,7 +1058,7 @@ fn watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     rows
 }
 
-fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
+fn legacy_watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     let Some(watch) = &snapshot.watch else {
         return Vec::new();
     };
@@ -552,14 +1066,13 @@ fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     watch
         .watches
         .iter()
-        .take(6)
         .map(|row| {
             Row::new(vec![
                 Cell::from(row.contract.clone()),
                 Cell::from(row.market.clone()),
                 Cell::from(
                     row.current_back_odds
-                        .map(|value| format!("{value:.2}"))
+                        .map(|value| format!("{:.2}", value))
                         .unwrap_or_else(|| String::from("-")),
                 ),
                 Cell::from(format!("{:.2}", row.profit_take_back_odds)),
@@ -616,7 +1129,6 @@ fn tracked_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     snapshot
         .tracked_bets
         .iter()
-        .take(6)
         .map(|tracked_bet| {
             Row::new(vec![
                 Cell::from(tracked_bet.bet_id.clone()),
@@ -627,6 +1139,7 @@ fn tracked_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
                 ),
                 Cell::from(tracked_bet.market.clone()),
                 Cell::from(tracked_bet.status.clone()),
+                Cell::from(tracked_bet_funding_label(tracked_bet)),
                 Cell::from(
                     tracked_bet
                         .expected_ev
@@ -639,9 +1152,632 @@ fn tracked_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
         .collect()
 }
 
+fn active_event_label(view: ActivePositionView<'_>) -> String {
+    if let Some(open_position) = view.open_position {
+        if !open_position.event.is_empty() {
+            return open_position.event.clone();
+        }
+    }
+    if let Some(tracked_bet) = view.tracked_bet {
+        if !tracked_bet.event.is_empty() {
+            return tracked_bet.event.clone();
+        }
+    }
+    view.sportsbook_bet
+        .map(|sportsbook_bet| sportsbook_bet.event.clone())
+        .filter(|event| !event.is_empty())
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_position_label(view: ActivePositionView<'_>) -> String {
+    format!(
+        "{} · {}",
+        active_selection_label(view),
+        active_leg_summary(view)
+    )
+}
+
+fn active_selection_label(view: ActivePositionView<'_>) -> String {
+    if let Some(tracked_bet) = view.tracked_bet {
+        if !tracked_bet.selection.is_empty() {
+            return tracked_bet.selection.clone();
+        }
+    }
+    if let Some(open_position) = view.open_position {
+        if !open_position.contract.is_empty() {
+            return open_position.contract.clone();
+        }
+    }
+    view.sportsbook_bet
+        .map(|sportsbook_bet| sportsbook_bet.label.clone())
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_market_name(view: ActivePositionView<'_>) -> String {
+    if let Some(open_position) = view.open_position {
+        if !open_position.market.is_empty() {
+            return open_position.market.clone();
+        }
+    }
+    if let Some(sportsbook_bet) = view.sportsbook_bet {
+        if !sportsbook_bet.market.is_empty() {
+            return sportsbook_bet.market.clone();
+        }
+    }
+    if let Some(tracked_bet) = view.tracked_bet {
+        if !tracked_bet.market.is_empty() {
+            return tracked_bet.market.clone();
+        }
+    }
+    String::from("-")
+}
+
+fn active_leg_summary(view: ActivePositionView<'_>) -> String {
+    let sportsbook = active_sportsbook_leg(view)
+        .map(|(venue, _, odds, stake)| format!("{venue} {stake:.2}@{odds:.2}"))
+        .unwrap_or_else(|| String::from("book -"));
+    let exchange = active_live_exchange_leg(view)
+        .map(|(venue, entry_odds, stake, _)| format!("{venue} {stake:.2}@{entry_odds:.2}"))
+        .or_else(|| {
+            active_tracked_exchange_leg(view).map(|(venue, _, _, _)| format!("{venue} closed"))
+        })
+        .unwrap_or_else(|| String::from("lay -"));
+    format!("{sportsbook} ↔ {exchange}")
+}
+
+fn active_date_label(view: ActivePositionView<'_>) -> String {
+    if let Some(open_position) = view.open_position {
+        let date = event_date_label(open_position);
+        if date != "-" {
+            return date;
+        }
+    }
+    if let Some(tracked_bet) = view.tracked_bet {
+        if let Some((date, _)) = parse_isoish_datetime(&tracked_bet.placed_at) {
+            return date;
+        }
+    }
+    String::from("-")
+}
+
+fn active_time_label(view: ActivePositionView<'_>) -> String {
+    if let Some(open_position) = view.open_position {
+        let time = event_time_label(open_position);
+        if time != "-" {
+            return time;
+        }
+    }
+    if let Some(tracked_bet) = view.tracked_bet {
+        if let Some((_, time)) = parse_isoish_datetime(&tracked_bet.placed_at) {
+            return time;
+        }
+    }
+    String::from("-")
+}
+
+fn active_hold_label(view: ActivePositionView<'_>) -> String {
+    match active_hold_outcomes(view) {
+        Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
+        None => format!("{:+.2}", active_marked_pnl(view)),
+    }
+}
+
+fn active_lock_label(view: ActivePositionView<'_>) -> String {
+    match active_total_cashout_outcomes(view) {
+        Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
+        None => String::from("-"),
+    }
+}
+
+fn active_probability_label(view: ActivePositionView<'_>) -> String {
+    format_optional_probability(active_current_probability(view))
+}
+
+fn active_live_odds_label(view: ActivePositionView<'_>) -> String {
+    active_current_back_odds(view)
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_trigger_label(view: ActivePositionView<'_>) -> String {
+    let live = active_live_odds_label(view);
+    let profit = active_profit_target_odds(view)
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| String::from("-"));
+    let stop = active_stop_loss_odds(view)
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| String::from("-"));
+    format!("live {live} | tgt {profit} | stop {stop}")
+}
+
+fn active_status_label(view: ActivePositionView<'_>) -> String {
+    let sportsbook = view
+        .sportsbook_bet
+        .map(|sportsbook_bet| sportsbook_bet.status.as_str())
+        .unwrap_or("-");
+    let exchange = if let Some(open_position) = view.open_position {
+        if open_position.status.is_empty() {
+            "-"
+        } else {
+            open_position.status.as_str()
+        }
+    } else if active_tracked_exchange_leg(view).is_some() {
+        "closed"
+    } else {
+        "-"
+    };
+    format!("book {sportsbook} | lay {exchange}")
+}
+
+fn active_bookie_cashout_label(view: ActivePositionView<'_>) -> String {
+    view.sportsbook_bet
+        .and_then(|sportsbook_bet| sportsbook_bet.current_cashout_value)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_action_label(view: ActivePositionView<'_>) -> String {
+    if let (Some(current), Some(target)) = (
+        active_current_back_odds(view),
+        active_profit_target_odds(view),
+    ) {
+        if current >= target {
+            return String::from("target");
+        }
+    }
+    if let (Some(current), Some(stop)) =
+        (active_current_back_odds(view), active_stop_loss_odds(view))
+    {
+        if current <= stop {
+            return String::from("stop");
+        }
+    }
+    if view.open_position.is_some() && (view.sportsbook_bet.is_some() || view.tracked_bet.is_some())
+    {
+        String::from("watch")
+    } else {
+        String::from("hold")
+    }
+}
+
+fn active_action_cell(view: ActivePositionView<'_>) -> Cell<'static> {
+    let label = active_action_label(view);
+    let color = if label == "target" {
+        accent_green()
+    } else if label == "stop" {
+        accent_red()
+    } else if label == "watch" {
+        accent_gold()
+    } else {
+        muted_text()
+    };
+    Cell::from(truncate_text(&label, 3)).style(Style::default().fg(color))
+}
+
+fn active_marked_pnl(view: ActivePositionView<'_>) -> f64 {
+    view.open_position
+        .map(|open_position| open_position.pnl_amount)
+        .unwrap_or(0.0)
+}
+
+fn active_current_worst_case(view: ActivePositionView<'_>) -> Option<f64> {
+    active_total_cashout_outcomes(view).map(|(win, lose)| win.min(lose))
+}
+
+fn active_current_back_odds(view: ActivePositionView<'_>) -> Option<f64> {
+    view.open_position
+        .and_then(|open_position| open_position.current_back_odds)
+}
+
+fn active_current_probability(view: ActivePositionView<'_>) -> Option<f64> {
+    view.open_position
+        .and_then(|open_position| open_position.current_implied_probability)
+        .or_else(|| active_current_back_odds(view).map(implied_probability))
+}
+
+fn active_entry_probability_label(view: ActivePositionView<'_>) -> String {
+    active_live_exchange_leg(view)
+        .map(|(_, entry_odds, _, _)| implied_probability(entry_odds))
+        .map(format_probability)
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_profit_target_odds(view: ActivePositionView<'_>) -> Option<f64> {
+    active_exit_odds_for_total_target(view, view.target_profit)
+}
+
+fn active_stop_loss_odds(view: ActivePositionView<'_>) -> Option<f64> {
+    active_exit_odds_for_total_target(view, -view.stop_loss)
+}
+
+fn active_exit_odds_for_total_target(
+    view: ActivePositionView<'_>,
+    overall_target: f64,
+) -> Option<f64> {
+    let (_, entry_odds, stake, commission_rate) = active_live_exchange_leg(view)?;
+    let (other_win, other_lose) = active_non_exchange_outcomes(view)?;
+    let other_worst_case = other_win.min(other_lose);
+    exit_odds_for_target_profit(
+        entry_odds,
+        stake,
+        commission_rate,
+        overall_target - other_worst_case,
+    )
+}
+
+fn active_hold_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    let (other_wins, other_loses) = active_non_exchange_outcomes(view).unwrap_or((0.0, 0.0));
+    let Some((_, entry_odds, stake, commission_rate)) = active_live_exchange_leg(view) else {
+        if view.sportsbook_bet.is_some() || view.tracked_bet.is_some() {
+            return Some((other_wins, other_loses));
+        }
+        return None;
+    };
+    let exchange_wins = settled_leg_pnl("lay", entry_odds, stake, commission_rate, true);
+    let exchange_loses = settled_leg_pnl("lay", entry_odds, stake, commission_rate, false);
+    Some((exchange_wins + other_wins, exchange_loses + other_loses))
+}
+
+fn active_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    let (_, entry_odds, stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_current_back_odds(view)?;
+    let locked_profit =
+        lay_trade_out_locked_profit(entry_odds, stake, current_back_odds, commission_rate);
+    let (other_wins, other_loses) = active_non_exchange_outcomes(view)?;
+    Some((locked_profit + other_wins, locked_profit + other_loses))
+}
+
+fn active_bookie_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    let sportsbook_bet = view.sportsbook_bet?;
+    let current_cashout_value = sportsbook_bet.current_cashout_value?;
+    let book_locked_profit = current_cashout_value - sportsbook_bet.stake;
+    let exchange_outcomes =
+        if let Some((_, entry_odds, stake, commission_rate)) = active_live_exchange_leg(view) {
+            (
+                settled_leg_pnl("lay", entry_odds, stake, commission_rate, true),
+                settled_leg_pnl("lay", entry_odds, stake, commission_rate, false),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+    Some((
+        exchange_outcomes.0 + book_locked_profit,
+        exchange_outcomes.1 + book_locked_profit,
+    ))
+}
+
+fn active_total_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    active_cashout_outcomes(view).or_else(|| active_bookie_cashout_outcomes(view))
+}
+
+fn active_non_exchange_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    if let Some(tracked_bet) = view.tracked_bet {
+        let mut win = 0.0;
+        let mut lose = 0.0;
+        let mut found = false;
+        for leg in &tracked_bet.legs {
+            if normalize_key(&leg.venue) == "smarkets" {
+                continue;
+            }
+            found = true;
+            win += settled_leg_from_tracked_leg(leg, true);
+            lose += settled_leg_from_tracked_leg(leg, false);
+        }
+        if found {
+            return Some((win, lose));
+        }
+    }
+
+    let sportsbook_bet = view.sportsbook_bet?;
+    Some((
+        settled_leg_pnl("back", sportsbook_bet.odds, sportsbook_bet.stake, 0.0, true),
+        settled_leg_pnl(
+            "back",
+            sportsbook_bet.odds,
+            sportsbook_bet.stake,
+            0.0,
+            false,
+        ),
+    ))
+}
+
+fn active_live_exchange_leg(view: ActivePositionView<'_>) -> Option<(&'static str, f64, f64, f64)> {
+    let open_position = view.open_position?;
+    if let Some((venue, entry_odds, stake, commission_rate)) = active_tracked_exchange_leg(view) {
+        return Some((venue, entry_odds, stake, commission_rate));
+    }
+    Some((
+        "smarkets",
+        open_position.price,
+        open_position.stake,
+        view.commission_rate,
+    ))
+}
+
+fn active_tracked_exchange_leg(
+    view: ActivePositionView<'_>,
+) -> Option<(&'static str, f64, f64, f64)> {
+    let tracked_bet = view.tracked_bet?;
+    tracked_bet
+        .legs
+        .iter()
+        .find(|leg| normalize_key(&leg.venue) == "smarkets" && normalize_key(&leg.side) == "lay")
+        .map(|leg| {
+            (
+                "smarkets",
+                leg.odds,
+                leg.stake,
+                leg.commission_rate.unwrap_or(view.commission_rate),
+            )
+        })
+}
+
+fn active_exchange_leg(view: ActivePositionView<'_>) -> Option<(&'static str, f64, f64, f64)> {
+    active_live_exchange_leg(view).or_else(|| active_tracked_exchange_leg(view))
+}
+
+fn active_sportsbook_leg(view: ActivePositionView<'_>) -> Option<(String, String, f64, f64)> {
+    if let Some(tracked_bet) = view.tracked_bet {
+        if let Some(leg) = tracked_bet.legs.iter().find(|leg| {
+            normalize_key(&leg.venue) != "smarkets" && normalize_key(&leg.side) == "back"
+        }) {
+            return Some((leg.venue.clone(), leg.outcome.clone(), leg.odds, leg.stake));
+        }
+    }
+
+    view.sportsbook_bet.map(|sportsbook_bet| {
+        (
+            sportsbook_bet.venue.clone(),
+            sportsbook_bet.label.clone(),
+            sportsbook_bet.odds,
+            sportsbook_bet.stake,
+        )
+    })
+}
+
+fn tracked_bet_matches_open_position(
+    tracked_bet: &TrackedBetRow,
+    open_position: &OpenPositionRow,
+) -> bool {
+    text_matches(&tracked_bet.selection, &open_position.contract)
+        && market_matches(&tracked_bet.market, &open_position.market)
+        && event_matches(&tracked_bet.event, &open_position.event)
+}
+
+fn sportsbook_bet_matches_open_position(
+    sportsbook_bet: &OtherOpenBetRow,
+    open_position: &OpenPositionRow,
+) -> bool {
+    text_matches(&sportsbook_bet.label, &open_position.contract)
+        && market_matches(&sportsbook_bet.market, &open_position.market)
+        && event_matches(&sportsbook_bet.event, &open_position.event)
+}
+
+fn sportsbook_bet_matches_tracked_bet(
+    sportsbook_bet: &OtherOpenBetRow,
+    tracked_bet: &TrackedBetRow,
+) -> bool {
+    text_matches(&sportsbook_bet.label, &tracked_bet.selection)
+        && market_matches(&sportsbook_bet.market, &tracked_bet.market)
+        && event_matches(&sportsbook_bet.event, &tracked_bet.event)
+}
+
+fn sportsbook_bet_identity(sportsbook_bet: &OtherOpenBetRow) -> String {
+    format!(
+        "{}|{}|{}|{}|{:.2}|{:.2}",
+        sportsbook_bet.venue,
+        sportsbook_bet.event,
+        sportsbook_bet.label,
+        sportsbook_bet.market,
+        sportsbook_bet.odds,
+        sportsbook_bet.stake
+    )
+}
+
+fn tracked_bet_is_closed(tracked_bet: &TrackedBetRow) -> bool {
+    if !tracked_bet.settled_at.is_empty() {
+        return true;
+    }
+    matches!(
+        normalize_key(&tracked_bet.status).as_str(),
+        "settled" | "closed" | "cashedout" | "void" | "lost" | "won"
+    )
+}
+
+fn settled_leg_from_tracked_leg(leg: &TrackedLeg, selection_wins: bool) -> f64 {
+    settled_leg_pnl(
+        &leg.side,
+        leg.odds,
+        leg.stake,
+        leg.commission_rate.unwrap_or(0.0),
+        selection_wins,
+    )
+}
+
+fn settled_leg_pnl(
+    side: &str,
+    odds: f64,
+    stake: f64,
+    commission_rate: f64,
+    selection_wins: bool,
+) -> f64 {
+    match normalize_key(side).as_str() {
+        "back" => {
+            if selection_wins {
+                stake * (odds - 1.0)
+            } else {
+                -stake
+            }
+        }
+        "lay" => {
+            if selection_wins {
+                -(stake * (odds - 1.0))
+            } else {
+                stake * (1.0 - normalize_commission_rate(commission_rate))
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn lay_trade_out_locked_profit(
+    entry_lay_odds: f64,
+    lay_stake: f64,
+    current_back_odds: f64,
+    commission_rate: f64,
+) -> f64 {
+    let effective_commission = normalize_commission_rate(commission_rate);
+    let hedge_back_stake =
+        (lay_stake * (entry_lay_odds - effective_commission)) / current_back_odds;
+    (lay_stake * (1.0 - effective_commission)) - hedge_back_stake
+}
+
+fn exit_odds_for_target_profit(
+    entry_lay_odds: f64,
+    lay_stake: f64,
+    commission_rate: f64,
+    target_profit: f64,
+) -> Option<f64> {
+    let effective_commission = normalize_commission_rate(commission_rate);
+    let denominator = (lay_stake * (1.0 - effective_commission)) - target_profit;
+    if denominator <= 0.0 {
+        None
+    } else {
+        Some((lay_stake * (entry_lay_odds - effective_commission)) / denominator)
+    }
+}
+
+fn normalize_commission_rate(value: f64) -> f64 {
+    if value > 1.0 {
+        value / 100.0
+    } else {
+        value
+    }
+}
+
+fn normalize_key(value: &str) -> String {
+    value
+        .to_lowercase()
+        .replace("vs", "v")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn text_matches(left: &str, right: &str) -> bool {
+    let left = normalize_key(left);
+    let right = normalize_key(right);
+    !left.is_empty()
+        && !right.is_empty()
+        && (left == right || left.contains(&right) || right.contains(&left))
+}
+
+fn market_matches(left: &str, right: &str) -> bool {
+    let left = normalize_market(left);
+    let right = normalize_market(right);
+    !left.is_empty() && !right.is_empty() && left == right
+}
+
+fn normalize_market(value: &str) -> String {
+    let normalized = normalize_key(value);
+    if matches!(
+        normalized.as_str(),
+        "full time result" | "match odds" | "to win" | "winner"
+    ) {
+        return String::from("match odds");
+    }
+    normalized
+}
+
+fn event_matches(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    let left = normalize_key(left);
+    let right = normalize_key(right);
+    left == right
+}
+
+fn selected_active_rows(view: ActivePositionView<'_>) -> Vec<(&'static str, String, Color)> {
+    let recommendation = derived_exit_recommendation(view)
+        .map(|recommendation| format!("{} ({})", recommendation.action, recommendation.reason))
+        .unwrap_or_else(|| active_action_label(view));
+    let exposure = if let Some(open_position) = view.open_position {
+        format!(
+            "book {:.2} | lay {:.2} | liab {:.2}",
+            view.sportsbook_bet.map(|bet| bet.stake).unwrap_or(0.0),
+            open_position.stake,
+            open_position.liability,
+        )
+    } else {
+        format!(
+            "book {:.2}",
+            view.sportsbook_bet.map(|bet| bet.stake).unwrap_or(0.0)
+        )
+    };
+
+    vec![
+        ("󰕮 Pane", String::from("Active"), accent_cyan()),
+        ("󰍹 Event", active_event_label(view), accent_blue()),
+        ("󰃭 Date", active_date_label(view), accent_green()),
+        ("󰥔 Time", active_time_label(view), accent_cyan()),
+        ("󰆼 Position", active_position_label(view), accent_gold()),
+        ("󰇈 Market", active_market_name(view), accent_blue()),
+        (
+            "󰈀 Entry Prob",
+            active_entry_probability_label(view),
+            accent_cyan(),
+        ),
+        (
+            "󰐃 Book Cash",
+            active_bookie_cashout_label(view),
+            accent_green(),
+        ),
+        ("󱂬 Hold", active_hold_label(view), accent_green()),
+        ("󰔟 Lock", active_lock_label(view), accent_green()),
+        ("󰄬 Trigger", active_trigger_label(view), accent_cyan()),
+        ("󰖌 Exposure", exposure, accent_pink()),
+        ("󰌑 Status", active_status_label(view), accent_green()),
+        ("󰘳 Action", recommendation, accent_gold()),
+    ]
+}
+
+fn empty_selected_rows() -> Vec<(&'static str, String, Color)> {
+    vec![
+        ("󰕮 Pane", String::from("Active"), accent_cyan()),
+        ("󰍹 Event", String::from("-"), muted_text()),
+        ("󰃭 Date", String::from("-"), muted_text()),
+        ("󰥔 Time", String::from("-"), muted_text()),
+        (
+            "󰆼 Position",
+            String::from("No active position selected"),
+            muted_text(),
+        ),
+        ("󰇈 Market", String::from("-"), muted_text()),
+        ("󰈀 Entry Prob", String::from("-"), muted_text()),
+        ("󰐃 Book Cash", String::from("-"), muted_text()),
+        ("󱂬 Hold", String::from("-"), muted_text()),
+        ("󰔟 Lock", String::from("-"), muted_text()),
+        ("󰄬 Trigger", String::from("-"), muted_text()),
+        ("󰖌 Exposure", String::from("-"), muted_text()),
+        ("󰌑 Status", String::from("-"), muted_text()),
+        ("󰘳 Action", String::from("-"), muted_text()),
+    ]
+}
+
 #[cfg(test)]
 fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
-    if snapshot.exit_recommendations.is_empty() {
+    let recommendations = derived_exit_recommendations(snapshot);
+    if recommendations.is_empty() {
         return vec![Line::raw("No exit recommendations are loaded.")];
     }
 
@@ -652,7 +1788,7 @@ fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'stat
         snapshot
             .exit_policy
             .hard_margin_call_profit_floor
-            .map(|value| format!("{value:.2}"))
+            .map(|value| format!("{:.2}", value))
             .unwrap_or_else(|| String::from("-")),
         snapshot.exit_policy.warn_only_default,
     ))];
@@ -660,7 +1796,7 @@ fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'stat
         "Press c in Trading > Positions to request the first actionable cash out.",
     ));
 
-    for recommendation in snapshot.exit_recommendations.iter().take(6) {
+    for recommendation in recommendations.iter().take(6) {
         rows.push(Line::raw(format!(
             "{} | {} | worst {:.2}",
             recommendation.bet_id, recommendation.action, recommendation.worst_case_pnl
@@ -677,11 +1813,9 @@ fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'stat
     rows
 }
 
-fn exit_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    snapshot
-        .exit_recommendations
+fn exit_rows(recommendations: &[DerivedExitRecommendation]) -> Vec<Row<'static>> {
+    recommendations
         .iter()
-        .take(6)
         .map(|recommendation| {
             Row::new(vec![
                 Cell::from(recommendation.bet_id.clone()),
@@ -722,8 +1856,6 @@ fn tracked_bet_source_summary(tracked_bet: &crate::domain::TrackedBetRow) -> Str
     }
 }
 
-#[cfg(test)]
-#[cfg(test)]
 fn implied_probability(odds: f64) -> f64 {
     1.0 / odds
 }
@@ -777,7 +1909,7 @@ fn format_probability(probability: f64) -> String {
 #[cfg(test)]
 fn format_optional_value(value: Option<f64>) -> String {
     value
-        .map(|value| format!("{value:.2}"))
+        .map(|value| format!("{:.2}", value))
         .unwrap_or_else(|| String::from("-"))
 }
 
@@ -788,6 +1920,7 @@ fn render_table(
     widths: Vec<Constraint>,
     rows: Vec<Row<'static>>,
     empty: Row<'static>,
+    table_state: Option<&mut TableState>,
 ) {
     let rows = if rows.is_empty() { vec![empty] } else { rows };
     let table = Table::new(rows, widths)
@@ -803,24 +1936,313 @@ fn render_table(
         )
         .block(section_block(title, accent_blue()))
         .column_spacing(1);
-    frame.render_widget(table, area);
+    if let Some(table_state) = table_state {
+        frame.render_stateful_widget(
+            table
+                .row_highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(28, 39, 52))
+                        .fg(Color::Rgb(255, 255, 255))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("● "),
+            area,
+            table_state,
+        );
+    } else {
+        frame.render_widget(table, area);
+    }
 }
 
-fn render_operator_log(frame: &mut Frame<'_>, area: Rect, status_message: &str, help_text: &str) {
-    let lines = std::iter::once(Line::raw(status_message.to_string()))
-        .chain(help_text.lines().map(|line| Line::raw(line.to_string())))
-        .collect::<Vec<_>>();
+fn render_operator_log(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status_message: &str,
+    help_text: &str,
+    positions_focus: PositionsFocus,
+) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("󱂬 ", Style::default().fg(accent_blue())),
+            Span::raw(status_message.to_string()),
+        ]),
+        Line::raw(format!(
+            "󰕮 pane {} • history is scrollable once selected",
+            positions_focus.label()
+        )),
+    ]
+    .into_iter()
+    .chain(
+        help_text
+            .lines()
+            .take(2)
+            .map(|line| Line::raw(line.to_string())),
+    )
+    .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
-        .block(section_block("Operator Log", accent_blue()))
+        .block(section_block("󰌌 Operator Feed", accent_blue()))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
-fn active_positions_section_height(snapshot: &ExchangePanelSnapshot, available_height: u16) -> u16 {
-    let visible_rows = snapshot.open_positions.len().clamp(1, 8) as u16;
-    let desired_height = visible_rows + 4;
-    let max_allowed = available_height.saturating_sub(10);
-    desired_height.clamp(6, max_allowed.max(6))
+fn render_live_view_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected_active: Option<ActivePositionView<'_>>,
+) {
+    let popup = popup_area(area, 84, 78);
+    frame.render_widget(Clear, popup);
+    let block = section_block("󰕮 Live View", accent_cyan());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let Some(view) = selected_active else {
+        let empty = Paragraph::new("No active position is selected.")
+            .block(section_block("󰄬 Selected Position", accent_blue()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(empty, inner);
+        return;
+    };
+
+    let layout = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(14),
+        Constraint::Min(10),
+    ])
+    .split(inner);
+    let middle = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(layout[1]);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                active_event_label(view),
+                Style::default()
+                    .fg(accent_blue())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(active_market_name(view), Style::default().fg(accent_gold())),
+        ]),
+        Line::from(vec![
+            Span::styled("Hold ", Style::default().fg(muted_text())),
+            Span::styled(active_hold_label(view), Style::default().fg(accent_green())),
+            Span::raw("   "),
+            Span::styled("Lock ", Style::default().fg(muted_text())),
+            Span::styled(active_lock_label(view), Style::default().fg(accent_green())),
+            Span::raw("   "),
+            Span::styled("Book cash ", Style::default().fg(muted_text())),
+            Span::styled(
+                active_bookie_cashout_label(view),
+                Style::default().fg(accent_cyan()),
+            ),
+            Span::raw("   "),
+            Span::styled("Action ", Style::default().fg(muted_text())),
+            Span::styled(
+                active_action_label(view),
+                Style::default().fg(accent_gold()),
+            ),
+        ]),
+    ])
+    .block(section_block("󰘵 Market State", accent_blue()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(header, layout[0]);
+
+    render_live_odds_chart(frame, middle[0], view);
+    render_key_value_table(
+        frame,
+        middle[1],
+        "󰄬 Position Detail",
+        vec![
+            ("󰆼 Position", active_position_label(view), accent_gold()),
+            ("󰇈 Market", active_market_name(view), accent_blue()),
+            (
+                "󰈀 Entry Prob",
+                active_entry_probability_label(view),
+                accent_cyan(),
+            ),
+            ("󰥔 Live Prob", active_probability_label(view), accent_cyan()),
+            (
+                "󰐃 Book Cash",
+                active_bookie_cashout_label(view),
+                accent_green(),
+            ),
+            ("󰑭 Lay Live", active_live_odds_label(view), accent_green()),
+            ("󰌑 Status", active_status_label(view), accent_green()),
+            ("󰄬 Trigger", active_trigger_label(view), accent_gold()),
+        ],
+        Constraint::Length(12),
+    );
+
+    render_live_decision_matrix(frame, layout[2], view);
+}
+
+fn render_live_odds_chart(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
+    let points = live_odds_points(view);
+    let (min_y, max_y) = chart_bounds(&points);
+    let datasets = vec![Dataset::default()
+        .name("odds")
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(accent_cyan()))
+        .data(&points)];
+    let chart = Chart::new(datasets)
+        .block(section_block("󰑭 Odds Ladder", accent_blue()))
+        .x_axis(Axis::default().bounds([0.0, 3.0]).labels(vec![
+            Line::raw("Entry"),
+            Line::raw("Live"),
+            Line::raw("Target"),
+            Line::raw("Stop"),
+        ]))
+        .y_axis(Axis::default().bounds([min_y, max_y]).labels(vec![
+            Line::raw(format!("{min_y:.2}")),
+            Line::raw(format!("{max_y:.2}")),
+        ]));
+    frame.render_widget(chart, area);
+}
+
+fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
+    let hold = active_hold_outcomes(view);
+    let lock = active_total_cashout_outcomes(view);
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("Selection wins"),
+            Cell::from(
+                hold.map(|(win, _)| format!("{win:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                lock.map(|(win, _)| format!("{win:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                hold.zip(lock)
+                    .map(|((hold_win, _), (lock_win, _))| format!("{:+.2}", lock_win - hold_win))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+        ]),
+        Row::new(vec![
+            Cell::from("Selection loses"),
+            Cell::from(
+                hold.map(|(_, lose)| format!("{lose:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                lock.map(|(_, lose)| format!("{lose:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                hold.zip(lock)
+                    .map(|((_, hold_lose), (_, lock_lose))| {
+                        format!("{:+.2}", lock_lose - hold_lose)
+                    })
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+        ]),
+        Row::new(vec![
+            Cell::from("Worst case"),
+            Cell::from(
+                hold.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                lock.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+            Cell::from(
+                hold.zip(lock)
+                    .map(|((hold_win, hold_lose), (lock_win, lock_lose))| {
+                        format!("{:+.2}", lock_win.min(lock_lose) - hold_win.min(hold_lose))
+                    })
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+        ]),
+    ];
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(28),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+        ],
+    )
+    .header(
+        Row::new(vec!["Scenario", "Hold", "Lock", "Delta"])
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .bottom_margin(1),
+    )
+    .block(section_block("󰄵 Decision Matrix", accent_blue()))
+    .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn live_odds_points(view: ActivePositionView<'_>) -> Vec<(f64, f64)> {
+    let entry = active_exchange_leg(view)
+        .map(|(_, odds, _, _)| odds)
+        .unwrap_or(0.0);
+    let live = active_current_back_odds(view).unwrap_or(entry);
+    let target = active_profit_target_odds(view).unwrap_or(live);
+    let stop = active_stop_loss_odds(view).unwrap_or(live);
+    vec![(0.0, entry), (1.0, live), (2.0, target), (3.0, stop)]
+}
+
+fn chart_bounds(points: &[(f64, f64)]) -> (f64, f64) {
+    let mut min_y = points
+        .iter()
+        .map(|(_, y)| *y)
+        .filter(|value| *value > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let mut max_y = points
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !min_y.is_finite() || !max_y.is_finite() || (max_y - min_y).abs() < f64::EPSILON {
+        min_y = 0.0;
+        max_y = 1.0;
+    } else {
+        let padding = ((max_y - min_y) * 0.12).max(0.1);
+        min_y = (min_y - padding).max(0.0);
+        max_y += padding;
+    }
+    (min_y, max_y)
+}
+
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical =
+        Layout::vertical([Constraint::Percentage(percent_y)]).flex(ratatui::layout::Flex::Center);
+    let horizontal =
+        Layout::horizontal([Constraint::Percentage(percent_x)]).flex(ratatui::layout::Flex::Center);
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
+}
+
+fn position_section_heights(snapshot: &ExchangePanelSnapshot, available_height: u16) -> (u16, u16) {
+    let minimum = 7;
+    if available_height <= minimum * 2 {
+        let active_height = available_height.saturating_div(2).max(6);
+        return (
+            active_height,
+            available_height.saturating_sub(active_height),
+        );
+    }
+
+    let active_rows = active_position_row_count(snapshot).max(1) as u16;
+    let historical_rows = snapshot.historical_positions.len().max(1) as u16;
+    let total_rows = active_rows + historical_rows;
+    let distributable = available_height.saturating_sub(minimum * 2);
+    let active_extra =
+        ((distributable as u32 * active_rows as u32) / total_rows.max(1) as u32) as u16;
+    let mut active_height = minimum + active_extra;
+    let max_active_height = available_height.saturating_sub(minimum);
+    active_height = active_height.clamp(minimum, max_active_height.max(minimum));
+    let historical_height = available_height.saturating_sub(active_height);
+    (active_height, historical_height.max(minimum))
 }
 
 fn render_stateful_table(
@@ -852,28 +2274,32 @@ fn render_stateful_table(
                 .fg(Color::Rgb(255, 255, 255))
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(">> ");
+        .highlight_symbol("● ");
     frame.render_stateful_widget(table, area, table_state);
 }
 
 fn table_header(title: &str) -> Vec<&'static str> {
     match title {
-        heading if heading.starts_with("Active Positions") => {
-            vec!["Event", "Position", "Score", "Phase", "T", "PnL", "Market"]
+        heading if heading.contains("Active Positions") => {
+            vec![
+                "Event", "Position", "Date", "Time", "Hold", "Lock", "A", "Prob", "Trigger",
+            ]
         }
-        heading if heading.starts_with("Historical Positions") => {
-            vec!["Event", "Position", "Score", "Phase", "T", "PnL", "Market"]
+        heading if heading.contains("Historical Positions") => {
+            vec![
+                "Event", "Position", "Date", "Time", "Score", "Phase", "T", "PnL", "Market",
+            ]
         }
-        heading if heading.starts_with("Exit Recommendations") => {
+        heading if heading.contains("Exit Recommendations") => {
             vec!["Bet", "Action", "Reason", "Worst", "Venue"]
         }
-        heading if heading.starts_with("Watch Plan") => {
-            vec!["Contract", "Market", "Live", "Profit", "Stop", "PnL"]
+        heading if heading.contains("Watch Plan") => {
+            vec!["Contract", "Legs", "Live", "Profit", "Stop", "Worst"]
         }
-        heading if heading.starts_with("Tracked Bets") => {
-            vec!["Bet", "Selection", "Market", "Status", "Venues"]
+        heading if heading.contains("Tracked Bets") => {
+            vec!["Bet", "Selection", "Market", "Status", "Fund", "Venues"]
         }
-        heading if heading.starts_with("Other Open Bets") => {
+        heading if heading.contains("Other Open Bets") => {
             vec!["Label", "Market", "Side", "Stake", "Status"]
         }
         _ => vec!["Data"],
@@ -939,7 +2365,7 @@ fn primary_market_implied_probability(row: &crate::domain::OpenPositionRow) -> O
 
 fn format_optional_back_odds(value: Option<f64>) -> String {
     value
-        .map(|odds| format!("{odds:.2}"))
+        .map(|odds| format!("{:.2}", odds))
         .unwrap_or_else(|| String::from("-"))
 }
 
@@ -953,12 +2379,114 @@ fn position_label(row: &crate::domain::OpenPositionRow) -> String {
     format!("{} · {}", row.contract, row.market)
 }
 
+fn event_date_label(row: &crate::domain::OpenPositionRow) -> String {
+    if let Some((date, _)) = iso_date_time(row) {
+        return date;
+    }
+    if let Some((date, _)) = url_date_time(row) {
+        return date;
+    }
+    String::from("-")
+}
+
+fn event_time_label(row: &crate::domain::OpenPositionRow) -> String {
+    if let Some((_, time)) = iso_date_time(row) {
+        return time;
+    }
+    if let Some((_, time)) = url_date_time(row) {
+        return time;
+    }
+    if let Some(time) = event_status_clock(row) {
+        return time;
+    }
+    if looks_like_time(&row.live_clock) {
+        return row.live_clock.clone();
+    }
+    String::from("-")
+}
+
 fn event_table_label(row: &crate::domain::OpenPositionRow) -> String {
     truncate_text(&event_label(row), 28)
 }
 
 fn position_table_label(row: &crate::domain::OpenPositionRow) -> String {
     truncate_text(&position_label(row), 34)
+}
+
+fn iso_date_time(row: &crate::domain::OpenPositionRow) -> Option<(String, String)> {
+    [
+        row.event_status.split('|').next().unwrap_or(""),
+        row.live_clock.as_str(),
+    ]
+    .into_iter()
+    .find_map(parse_isoish_datetime)
+}
+
+fn url_date_time(row: &crate::domain::OpenPositionRow) -> Option<(String, String)> {
+    let segments = row
+        .event_url
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    for window in segments.windows(4) {
+        let [year, month, day, time] = window else {
+            continue;
+        };
+        if year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|c| c.is_ascii_digit())
+            && month.chars().all(|c| c.is_ascii_digit())
+            && day.chars().all(|c| c.is_ascii_digit())
+            && time.len() >= 5
+        {
+            let bytes = time.as_bytes();
+            if bytes.get(2) == Some(&b'-')
+                && bytes[0..2].iter().all(|c| c.is_ascii_digit())
+                && bytes[3..5].iter().all(|c| c.is_ascii_digit())
+            {
+                return Some((
+                    format!("{year}-{month}-{day}"),
+                    format!("{}:{}", &time[0..2], &time[3..5]),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn parse_isoish_datetime(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.len() < 16 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+    {
+        return None;
+    }
+    let date = trimmed.get(0..10)?.to_string();
+    let time = trimmed.get(11..16)?.to_string();
+    Some((date, time))
+}
+
+fn event_status_clock(row: &crate::domain::OpenPositionRow) -> Option<String> {
+    row.event_status
+        .split('|')
+        .nth(1)
+        .map(str::trim)
+        .filter(|value| looks_like_time(value))
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_time(value: &str) -> bool {
+    value.len() == 5
+        && value.as_bytes().get(2) == Some(&b':')
+        && value.as_bytes()[0..2].iter().all(|c| c.is_ascii_digit())
+        && value.as_bytes()[3..5].iter().all(|c| c.is_ascii_digit())
 }
 
 fn phase_label(row: &crate::domain::OpenPositionRow) -> String {
@@ -1038,6 +2566,97 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn tracked_bet_funding_counts(snapshot: &ExchangePanelSnapshot) -> (usize, usize, usize) {
+    if snapshot.tracked_bets.is_empty() && snapshot.ledger_pnl_summary.settled_count > 0 {
+        return (
+            snapshot.ledger_pnl_summary.standard_count,
+            snapshot.ledger_pnl_summary.promo_count,
+            snapshot.ledger_pnl_summary.unknown_count,
+        );
+    }
+
+    let mut standard = 0;
+    let mut promo = 0;
+    let mut unknown = 0;
+    for tracked_bet in &snapshot.tracked_bets {
+        match tracked_bet_funding_label(tracked_bet) {
+            "Promo" => promo += 1,
+            "Std" => standard += 1,
+            _ => unknown += 1,
+        }
+    }
+    (standard, promo, unknown)
+}
+
+fn positions_pnl_summary(snapshot: &ExchangePanelSnapshot) -> (f64, f64, f64, f64) {
+    let live_pnl = snapshot
+        .open_positions
+        .iter()
+        .map(|row| row.pnl_amount)
+        .sum::<f64>();
+    let realised_pnl = if snapshot.ledger_pnl_summary.settled_count > 0 {
+        snapshot.ledger_pnl_summary.realised_total
+    } else if snapshot.tracked_bets.is_empty() {
+        snapshot
+            .historical_positions
+            .iter()
+            .map(|row| row.pnl_amount)
+            .sum::<f64>()
+    } else {
+        snapshot
+            .tracked_bets
+            .iter()
+            .filter_map(|tracked_bet| tracked_bet.realised_pnl_gbp)
+            .sum::<f64>()
+    };
+    let promo_pnl =
+        if snapshot.tracked_bets.is_empty() && snapshot.ledger_pnl_summary.settled_count > 0 {
+            snapshot.ledger_pnl_summary.promo_total
+        } else {
+            snapshot
+                .tracked_bets
+                .iter()
+                .filter(|tracked_bet| tracked_bet_funding_label(tracked_bet) == "Promo")
+                .filter_map(|tracked_bet| tracked_bet.realised_pnl_gbp)
+                .sum::<f64>()
+        };
+    (realised_pnl, live_pnl, realised_pnl + live_pnl, promo_pnl)
+}
+
+fn tracked_bet_funding_label(tracked_bet: &crate::domain::TrackedBetRow) -> &'static str {
+    let notes = tracked_bet.notes.to_lowercase();
+    let bet_type = tracked_bet.bet_type.to_lowercase();
+    let status = tracked_bet.status.to_lowercase();
+    let haystack = format!("{notes} {bet_type} {status}");
+
+    if [
+        "free bet",
+        "freebet",
+        "snr",
+        "stake returned",
+        "risk free",
+        "refund",
+        "bonus",
+        "promo",
+        "promotion",
+        "boost",
+    ]
+    .iter()
+    .any(|keyword| haystack.contains(keyword))
+    {
+        return "Promo";
+    }
+
+    if ["qualifying", "cash", "normal"]
+        .iter()
+        .any(|keyword| haystack.contains(keyword))
+    {
+        return "Std";
+    }
+
+    "Unknown"
+}
+
 fn in_play_count(snapshot: &ExchangePanelSnapshot) -> usize {
     snapshot
         .open_positions
@@ -1052,17 +2671,6 @@ fn suspended_count(snapshot: &ExchangePanelSnapshot) -> usize {
         .iter()
         .filter(|row| effective_market_status(row) == "suspended")
         .count()
-}
-
-fn selected_position<'a>(
-    snapshot: &'a ExchangePanelSnapshot,
-    table_state: &TableState,
-) -> Option<&'a crate::domain::OpenPositionRow> {
-    table_state
-        .selected()
-        .and_then(|index| snapshot.open_positions.get(index))
-        .or_else(|| snapshot.open_positions.first())
-        .or_else(|| snapshot.historical_positions.first())
 }
 
 fn pnl_color(value: f64) -> Color {
@@ -1082,12 +2690,18 @@ fn section_block(title: &str, accent: Color) -> Block<'_> {
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
         .style(
             Style::default()
                 .bg(Color::Rgb(16, 22, 30))
                 .fg(Color::Rgb(234, 240, 246)),
         )
         .border_style(Style::default().fg(Color::Rgb(74, 88, 104)))
+}
+
+fn positions_table_title(label: &str, count: usize, focused: bool) -> String {
+    let marker = if focused { "●" } else { "◦" };
+    format!("{marker} {label} ({count})")
 }
 
 fn muted_text() -> Color {
@@ -1127,8 +2741,9 @@ mod tests {
     };
 
     use super::{
-        exit_recommendation_lines, open_position_lines, summary_lines, tracked_bet_lines,
-        watch_lines,
+        exit_recommendation_lines, historical_position_rows, open_position_lines,
+        positions_pnl_summary, summary_lines, tracked_bet_funding_counts,
+        tracked_bet_funding_label, tracked_bet_lines, watch_lines,
     };
 
     #[test]
@@ -1156,6 +2771,7 @@ mod tests {
             account_stats: None,
             open_positions: Vec::new(),
             historical_positions: Vec::new(),
+            ledger_pnl_summary: Default::default(),
             other_open_bets: Vec::new(),
             decisions: Vec::new(),
             watch: Some(WatchSnapshot {
@@ -1195,6 +2811,93 @@ mod tests {
     }
 
     #[test]
+    fn positions_pnl_summary_prefers_tracked_realised_when_available() {
+        let mut snapshot = sample_snapshot();
+        snapshot.open_positions = vec![OpenPositionRow {
+            pnl_amount: -1.6,
+            ..sample_open_row()
+        }];
+        snapshot.historical_positions = vec![
+            OpenPositionRow {
+                pnl_amount: 4.0,
+                live_clock: String::from("2026-03-01T10:00:00"),
+                ..sample_open_row()
+            },
+            OpenPositionRow {
+                pnl_amount: -0.5,
+                live_clock: String::from("2026-03-02T10:00:00"),
+                ..sample_open_row()
+            },
+        ];
+        snapshot.tracked_bets[0].realised_pnl_gbp = Some(3.4);
+        snapshot.tracked_bets[0].notes = String::from("Free Bet SNR");
+
+        let (realised, live, net, promo) = positions_pnl_summary(&snapshot);
+
+        assert_eq!(realised, 3.4);
+        assert_eq!(live, -1.6);
+        assert!((net - 1.8).abs() < 1e-9);
+        assert_eq!(promo, 3.4);
+    }
+
+    #[test]
+    fn positions_pnl_summary_falls_back_to_historical_when_tracked_bets_are_missing() {
+        let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets.clear();
+        snapshot.open_positions = vec![OpenPositionRow {
+            pnl_amount: -1.6,
+            ..sample_open_row()
+        }];
+        snapshot.historical_positions = vec![
+            OpenPositionRow {
+                pnl_amount: 4.0,
+                live_clock: String::from("2026-03-01T10:00:00"),
+                ..sample_open_row()
+            },
+            OpenPositionRow {
+                pnl_amount: -0.5,
+                live_clock: String::from("2026-03-02T10:00:00"),
+                ..sample_open_row()
+            },
+        ];
+
+        let (realised, live, net, promo) = positions_pnl_summary(&snapshot);
+
+        assert_eq!(realised, 3.5);
+        assert_eq!(live, -1.6);
+        assert!((net - 1.9).abs() < 1e-9);
+        assert_eq!(promo, 0.0);
+    }
+
+    #[test]
+    fn positions_pnl_summary_prefers_ledger_totals_when_available() {
+        let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets.clear();
+        snapshot.open_positions = vec![OpenPositionRow {
+            pnl_amount: -1.6,
+            ..sample_open_row()
+        }];
+        snapshot.historical_positions = vec![OpenPositionRow {
+            pnl_amount: 4.0,
+            live_clock: String::from("2026-03-01T10:00:00"),
+            ..sample_open_row()
+        }];
+        snapshot.ledger_pnl_summary.realised_total = 12.5;
+        snapshot.ledger_pnl_summary.promo_total = 4.5;
+        snapshot.ledger_pnl_summary.settled_count = 3;
+        snapshot.ledger_pnl_summary.standard_count = 2;
+        snapshot.ledger_pnl_summary.promo_count = 1;
+
+        let (realised, live, net, promo) = positions_pnl_summary(&snapshot);
+
+        assert_eq!(realised, 12.5);
+        assert_eq!(live, -1.6);
+        assert!((net - 10.9).abs() < 1e-9);
+        assert_eq!(promo, 4.5);
+        assert_eq!(tracked_bet_funding_counts(&snapshot), (2, 1, 0));
+    }
+
+    #[test]
     fn tracked_bet_lines_show_canonical_bet_rows() {
         let snapshot = sample_snapshot();
 
@@ -1210,8 +2913,20 @@ mod tests {
     }
 
     #[test]
+    fn tracked_bet_funding_detects_promotional_notes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets[0].notes = String::from("Free Bet SNR");
+
+        assert_eq!(
+            tracked_bet_funding_label(&snapshot.tracked_bets[0]),
+            "Promo"
+        );
+    }
+
+    #[test]
     fn open_position_lines_show_score_and_market_probabilities() {
         let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets.clear();
         snapshot.open_positions = vec![OpenPositionRow {
             event: String::from("West Ham vs Man City"),
             event_status: String::from("27'|Premier League"),
@@ -1248,9 +2963,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("score 0-0 | phase 27' | trade Tradable"));
-        assert!(rendered.contains("buy 1.91"));
-        assert!(rendered.contains("52.36%"));
+        assert!(rendered.contains("West Ham vs Man City | Man City · book - ↔ smarkets 10.00@2.40"));
+        assert!(rendered.contains("hold -14.00/+10.00 | lock - | action hold"));
+        assert!(rendered
+            .contains("status book - | lay Order filled | live 1.91 | live 1.91 | tgt - | stop -"));
     }
 
     #[test]
@@ -1297,7 +3013,115 @@ mod tests {
     }
 
     #[test]
-    fn active_positions_section_height_shrinks_when_few_rows_are_visible() {
+    fn historical_position_rows_do_not_cap_the_history_list() {
+        let mut snapshot = sample_snapshot();
+        snapshot.historical_positions = (0..12)
+            .map(|index| OpenPositionRow {
+                event: format!("Event {index}"),
+                event_status: String::from("Settled"),
+                event_url: String::new(),
+                contract: format!("Selection {index}"),
+                market: String::from("Full-time result"),
+                status: String::from("settled"),
+                market_status: String::from("settled"),
+                is_in_play: false,
+                price: 2.0,
+                stake: 5.0,
+                liability: 5.0,
+                current_value: 0.0,
+                pnl_amount: index as f64,
+                current_back_odds: Some(2.0),
+                current_implied_probability: Some(0.5),
+                current_implied_percentage: Some(50.0),
+                current_buy_odds: Some(2.0),
+                current_buy_implied_probability: Some(0.5),
+                current_sell_odds: None,
+                current_sell_implied_probability: None,
+                current_score: String::new(),
+                current_score_home: None,
+                current_score_away: None,
+                live_clock: format!("2026-03-18T12:{index:02}:00Z"),
+                can_trade_out: false,
+            })
+            .collect();
+
+        let rows = historical_position_rows(&snapshot);
+
+        assert_eq!(rows.len(), 12);
+    }
+
+    #[test]
+    fn event_date_and_time_can_be_derived_from_smarkets_url() {
+        let row = OpenPositionRow {
+            event: String::from("West Ham vs Man City"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::from(
+                "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/west-ham-vs-manchester-city/44919693/",
+            ),
+            contract: String::from("Man City"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 2.40,
+            stake: 10.0,
+            liability: 14.0,
+            current_value: 8.4,
+            pnl_amount: -1.6,
+            current_back_odds: Some(1.91),
+            current_implied_probability: Some(1.0 / 1.91),
+            current_implied_percentage: Some(100.0 / 1.91),
+            current_buy_odds: Some(1.91),
+            current_buy_implied_probability: Some(1.0 / 1.91),
+            current_sell_odds: Some(1.94),
+            current_sell_implied_probability: Some(1.0 / 1.94),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
+        };
+
+        assert_eq!(super::event_date_label(&row), "2026-03-14");
+        assert_eq!(super::event_time_label(&row), "20:00");
+    }
+
+    #[test]
+    fn event_date_and_time_can_be_derived_from_iso_timestamp() {
+        let row = OpenPositionRow {
+            event: String::from("Aston Villa v Chelsea"),
+            event_status: String::from("2026-03-03T14:08:00|Football"),
+            event_url: String::new(),
+            contract: String::from("Reece James (Chelsea)"),
+            market: String::from("Player To Receive A Card"),
+            status: String::from("settled"),
+            market_status: String::from("settled"),
+            is_in_play: false,
+            price: 4.5,
+            stake: 2.0,
+            liability: 2.0,
+            current_value: 0.0,
+            pnl_amount: -2.0,
+            current_back_odds: Some(4.5),
+            current_implied_probability: Some(1.0 / 4.5),
+            current_implied_percentage: Some(100.0 / 4.5),
+            current_buy_odds: Some(4.5),
+            current_buy_implied_probability: Some(1.0 / 4.5),
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::from("2026-03-03T14:08:00"),
+            can_trade_out: false,
+        };
+
+        assert_eq!(super::event_date_label(&row), "2026-03-03");
+        assert_eq!(super::event_time_label(&row), "14:08");
+    }
+
+    #[test]
+    fn position_section_heights_scale_with_relative_row_volume() {
         let mut snapshot = sample_snapshot();
         snapshot.open_positions = vec![OpenPositionRow {
             event: String::from("West Ham vs Man City"),
@@ -1326,19 +3150,53 @@ mod tests {
             live_clock: String::from("27'"),
             can_trade_out: true,
         }];
+        snapshot.historical_positions = vec![snapshot.open_positions[0].clone(); 8];
 
-        let compact_height = super::active_positions_section_height(&snapshot, 40);
+        let (compact_active_height, compact_history_height) =
+            super::position_section_heights(&snapshot, 40);
         snapshot.open_positions = vec![snapshot.open_positions[0].clone(); 8];
-        let expanded_height = super::active_positions_section_height(&snapshot, 40);
+        snapshot.historical_positions = vec![snapshot.open_positions[0].clone(); 1];
+        let (expanded_active_height, expanded_history_height) =
+            super::position_section_heights(&snapshot, 40);
 
-        assert!(compact_height < expanded_height);
-        assert_eq!(compact_height, 6);
-        assert_eq!(expanded_height, 12);
+        assert!(compact_active_height < expanded_active_height);
+        assert!(compact_history_height > expanded_history_height);
+        assert_eq!(compact_active_height + compact_history_height, 40);
+        assert_eq!(expanded_active_height + expanded_history_height, 40);
     }
 
     #[test]
     fn exit_recommendation_lines_show_policy_and_recommendation() {
-        let snapshot = sample_snapshot();
+        let mut snapshot = sample_snapshot();
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal v Everton"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::from(
+                "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/arsenal-vs-everton/44919693/",
+            ),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: 6.64,
+            pnl_amount: 3.27,
+            current_back_odds: Some(5.0),
+            current_implied_probability: Some(0.2),
+            current_implied_percentage: Some(20.0),
+            current_buy_odds: Some(5.0),
+            current_buy_implied_probability: Some(0.2),
+            current_sell_odds: Some(5.1),
+            current_sell_implied_probability: Some(1.0 / 5.1),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
+        }];
 
         let rendered = exit_recommendation_lines(&snapshot)
             .into_iter()
@@ -1354,6 +3212,7 @@ mod tests {
     #[test]
     fn watch_lines_show_probabilities_and_market_ev() {
         let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets.clear();
         snapshot.watch = Some(WatchSnapshot {
             watch_count: 1,
             position_count: 1,
@@ -1388,6 +3247,51 @@ mod tests {
         assert!(rendered.contains("market EV"));
     }
 
+    #[test]
+    fn watch_lines_use_combined_position_outcomes_when_both_legs_exist() {
+        let mut snapshot = sample_snapshot();
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal v Everton"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::from(
+                "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/arsenal-vs-everton/44919693/",
+            ),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: 6.64,
+            pnl_amount: 3.27,
+            current_back_odds: Some(5.0),
+            current_implied_probability: Some(0.2),
+            current_implied_percentage: Some(20.0),
+            current_buy_odds: Some(5.0),
+            current_buy_implied_probability: Some(0.2),
+            current_sell_odds: Some(5.1),
+            current_sell_implied_probability: Some(1.0 / 5.1),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
+        }];
+
+        let rendered = watch_lines(&snapshot)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Draw | Full-time result"));
+        assert!(rendered.contains("live 5.00 | profit 11.41 | stop 2.57"));
+        assert!(rendered.contains("prob entry 29.85% | live 20.00% | profit 8.77% | stop 38.89%"));
+        assert!(rendered.contains("hold -21.05/+7.91 | lock +5.51/+1.27 | action watch"));
+    }
+
     fn sample_snapshot() -> ExchangePanelSnapshot {
         ExchangePanelSnapshot {
             worker: WorkerSummary {
@@ -1412,6 +3316,7 @@ mod tests {
             account_stats: None,
             open_positions: Vec::new(),
             historical_positions: Vec::new(),
+            ledger_pnl_summary: Default::default(),
             other_open_bets: Vec::new(),
             decisions: Vec::new(),
             watch: Some(WatchSnapshot {
@@ -1506,6 +3411,36 @@ mod tests {
                 worst_case_pnl: 1.27,
                 cash_out_venue: Some(String::from("smarkets")),
             }],
+        }
+    }
+
+    fn sample_open_row() -> OpenPositionRow {
+        OpenPositionRow {
+            event: String::from("West Ham vs Man City"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::new(),
+            contract: String::from("Man City"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 2.40,
+            stake: 10.0,
+            liability: 14.0,
+            current_value: 8.4,
+            pnl_amount: -1.6,
+            current_back_odds: Some(1.91),
+            current_implied_probability: Some(1.0 / 1.91),
+            current_implied_percentage: Some(100.0 / 1.91),
+            current_buy_odds: Some(1.91),
+            current_buy_implied_probability: Some(1.0 / 1.91),
+            current_sell_odds: Some(1.94),
+            current_sell_implied_probability: Some(1.0 / 1.94),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
         }
     }
 }

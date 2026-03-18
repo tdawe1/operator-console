@@ -1,7 +1,7 @@
 pub mod calculator;
 pub mod exchanges;
-pub mod oddsmatcher;
 pub mod observability;
+pub mod oddsmatcher;
 pub mod recorder;
 pub mod trading_markets;
 pub mod trading_positions;

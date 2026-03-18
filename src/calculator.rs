@@ -263,7 +263,11 @@ fn validate(input: &Input) -> Result<(), String> {
             "Risk-free retention must be between 0 and 100.",
         ));
     }
-    if input.part_lays.iter().any(|part_lay| part_lay.stake < 0.0 || part_lay.odds < 0.0) {
+    if input
+        .part_lays
+        .iter()
+        .any(|part_lay| part_lay.stake < 0.0 || part_lay.odds < 0.0)
+    {
         return Err(String::from("Part-lay values cannot be negative."));
     }
     Ok(())

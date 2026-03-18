@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Gauge, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 
@@ -14,7 +14,7 @@ pub fn render(
     snapshot: &ExchangePanelSnapshot,
     list_state: &mut ListState,
 ) {
-    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(16)]).split(area);
+    let layout = Layout::vertical([Constraint::Length(7), Constraint::Min(16)]).split(area);
     let body = Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(layout[1]);
     let right = Layout::vertical([
@@ -41,39 +41,83 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSna
         .map(|venue| venue.label.as_str())
         .unwrap_or("none");
     let runtime = snapshot.runtime.as_ref();
-
-    let body = Paragraph::new(vec![
-        Line::raw(snapshot.status_line.clone()),
-        Line::raw(format!(
-            "Connected venues: {connected}/{} | Open positions: {} | Other open bets: {} | Tracked bets: {}",
-            snapshot.venues.len(),
-            snapshot.open_positions.len(),
-            snapshot.other_open_bets.len(),
-            snapshot.tracked_bets.len(),
-        )),
-        Line::raw(format!(
-            "Selected venue: {selected} | Worker: {:?} | Recorder source: {}",
-            snapshot.worker.status,
-            runtime
-                .map(|summary| summary.source.as_str())
-                .unwrap_or("snapshot"),
-        )),
-        Line::raw(format!(
-            "Updated: {} | Decisions: {} | Watch rows: {}",
-            runtime
-                .map(|summary| summary.updated_at.as_str())
-                .unwrap_or("unknown"),
-            snapshot.decisions.len(),
-            snapshot
-                .watch
-                .as_ref()
-                .map(|watch| watch.watch_count)
-                .unwrap_or(0),
-        )),
+    let cards = Layout::horizontal([
+        Constraint::Percentage(24),
+        Constraint::Percentage(24),
+        Constraint::Percentage(24),
+        Constraint::Percentage(28),
     ])
-    .block(section_block("Venue Board", accent_blue()))
+    .split(area);
+
+    let connected_card = Paragraph::new(vec![
+        Line::styled("󰄨 connected", Style::default().fg(muted_text())),
+        Line::styled(
+            format!("{connected}/{}", snapshot.venues.len()),
+            Style::default()
+                .fg(accent_green())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .block(section_block("󰀶 Venue Board", accent_blue()));
+    frame.render_widget(connected_card, cards[0]);
+
+    let exposure = snapshot
+        .account_stats
+        .as_ref()
+        .map(|stats| format!("{:.2} {}", stats.exposure, stats.currency))
+        .unwrap_or_else(|| String::from("-"));
+    let exposure_card = Paragraph::new(vec![
+        Line::styled("󰞇 exposure", Style::default().fg(muted_text())),
+        Line::styled(
+            exposure,
+            Style::default()
+                .fg(accent_pink())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .block(section_block("󰖌 Risk", accent_pink()));
+    frame.render_widget(exposure_card, cards[1]);
+
+    let feed_card = Paragraph::new(vec![
+        Line::styled("󰇚 live rows", Style::default().fg(muted_text())),
+        Line::styled(
+            format!(
+                "{} exchange • {} sportsbook",
+                snapshot.open_positions.len(),
+                snapshot.other_open_bets.len()
+            ),
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .block(section_block("󰈀 Feed", accent_cyan()));
+    frame.render_widget(feed_card, cards[2]);
+
+    let runtime_card = Paragraph::new(vec![
+        Line::raw(snapshot.status_line.as_str()),
+        Line::from(vec![
+            Span::styled("󰀵 ", Style::default().fg(muted_text())),
+            Span::raw(selected),
+            Span::raw("   "),
+            Span::styled("󰒋 ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{:?}", snapshot.worker.status),
+                Style::default().fg(venue_status_color_from_worker(snapshot.worker.status)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("󰅐 ", Style::default().fg(muted_text())),
+            Span::raw(
+                runtime
+                    .map(|summary| summary.updated_at.as_str())
+                    .unwrap_or("unknown"),
+            ),
+        ]),
+    ])
+    .block(section_block("󱎆 Runtime", accent_green()))
     .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
+    frame.render_widget(runtime_card, cards[3]);
 }
 
 fn render_venue_list(
@@ -93,8 +137,8 @@ fn render_venue_list(
     };
 
     let venue_list = List::new(items)
-        .block(section_block("Accounts", accent_cyan()))
-        .highlight_symbol(">> ")
+        .block(section_block("󰀶 Accounts", accent_cyan()))
+        .highlight_symbol("● ")
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -107,8 +151,15 @@ fn render_venue_list(
 
 fn render_venue_item(venue: &VenueSummary) -> ListItem<'static> {
     let status_color = venue_status_color(venue.status);
+    let status_icon = match venue.status {
+        VenueStatus::Connected | VenueStatus::Ready => "󰄬",
+        VenueStatus::Planned => "󰔷",
+        VenueStatus::Error => "󰅚",
+    };
     ListItem::new(vec![
         Line::from(vec![
+            Span::styled(status_icon, Style::default().fg(status_color)),
+            Span::raw(" "),
             Span::styled(
                 venue.label.clone(),
                 Style::default()
@@ -162,36 +213,47 @@ fn render_selected_venue(
     let account = snapshot.account_stats.as_ref();
 
     let rows = vec![
-        key_value_row("Venue", venue.label.clone(), accent_blue()),
-        key_value_row("Status", format!("{:?}", venue.status), venue_status_color(venue.status)),
+        key_value_row("󰀵 Venue", venue.label.clone(), accent_blue()),
         key_value_row(
-            "Balance",
+            "󰄬 Status",
+            format!("{:?}", venue.status),
+            venue_status_color(venue.status),
+        ),
+        key_value_row(
+            "󰟈 Balance",
             account
                 .map(|stats| format!("{:.2} {}", stats.available_balance, stats.currency))
                 .unwrap_or_else(|| String::from("-")),
             accent_green(),
         ),
         key_value_row(
-            "Exposure",
+            "󰖌 Exposure",
             account
-                .map(|stats| format!("{:.2} | pnl {:+.2}", stats.exposure, stats.unrealized_pnl))
+                .map(|stats| format!("{:.2}", stats.exposure))
                 .unwrap_or_else(|| String::from("-")),
             accent_pink(),
         ),
-        key_value_row("Latest event", latest_event, text_color()),
-        key_value_row("Latest market", latest_market, text_color()),
-        key_value_row("Detail", venue.detail.clone(), muted_text()),
-        key_value_row("Worker", snapshot.worker.detail.clone(), muted_text()),
+        key_value_row(
+            "󰢬 Unrealized",
+            account
+                .map(|stats| format!("{:+.2}", stats.unrealized_pnl))
+                .unwrap_or_else(|| String::from("-")),
+            pnl_color(account.map(|stats| stats.unrealized_pnl).unwrap_or(0.0)),
+        ),
+        key_value_row("󰍹 Latest event", latest_event, text_color()),
+        key_value_row("󰇈 Latest market", latest_market, text_color()),
+        key_value_row("󱂬 Detail", venue.detail.clone(), muted_text()),
+        key_value_row("󰒋 Worker", snapshot.worker.detail.clone(), muted_text()),
     ];
     let table = Table::new(rows, [Constraint::Length(13), Constraint::Min(10)])
-        .block(section_block("Selected Venue", accent_gold()))
+        .block(section_block("󰀵 Selected Venue", accent_gold()))
         .column_spacing(1);
     frame.render_widget(table, area);
 }
 
 fn render_health_gauges(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
-    let sections = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    let sections =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
 
     let exposure_ratio = snapshot
         .account_stats
@@ -300,7 +362,7 @@ fn render_feed_preview(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePan
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(section_block("Live Feed Preview", accent_green()))
+    .block(section_block("󰈀 Live Feed Preview", accent_green()))
     .column_spacing(1);
     frame.render_widget(table, area);
 }
@@ -346,6 +408,25 @@ fn render_gauge(
     frame.render_widget(gauge, area);
 }
 
+fn pnl_color(value: f64) -> Color {
+    if value > 0.0 {
+        accent_green()
+    } else if value < 0.0 {
+        accent_red()
+    } else {
+        muted_text()
+    }
+}
+
+fn venue_status_color_from_worker(status: crate::domain::WorkerStatus) -> Color {
+    match status {
+        crate::domain::WorkerStatus::Ready => accent_green(),
+        crate::domain::WorkerStatus::Busy => accent_gold(),
+        crate::domain::WorkerStatus::Idle => muted_text(),
+        crate::domain::WorkerStatus::Error => accent_red(),
+    }
+}
+
 fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator <= 0.0 {
         0.0
@@ -361,6 +442,7 @@ fn section_block(title: &'static str, color: Color) -> Block<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }

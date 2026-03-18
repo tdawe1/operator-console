@@ -2,16 +2,54 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Padding, Paragraph, Row, Table,
+    Wrap,
+};
 use ratatui::Frame;
 
-use crate::domain::{ExchangePanelSnapshot, VenueStatus};
+use crate::domain::{ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, VenueStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FundingKind {
+    Standard,
+    Promo,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct RunningPnlPoint {
+    sequence: usize,
+    at: String,
+    total: f64,
+    promo: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RunningPnlSummary {
+    points: Vec<RunningPnlPoint>,
+    realised_total: f64,
+    marked_total: f64,
+    standard_count: usize,
+    promo_count: usize,
+    unknown_count: usize,
+    source: &'static str,
+}
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
     let total_open_stake: f64 = snapshot.open_positions.iter().map(|row| row.stake).sum();
-    let total_liability: f64 = snapshot.open_positions.iter().map(|row| row.liability).sum();
-    let total_open_pnl: f64 = snapshot.open_positions.iter().map(|row| row.pnl_amount).sum();
+    let total_liability: f64 = snapshot
+        .open_positions
+        .iter()
+        .map(|row| row.liability)
+        .sum();
+    let total_open_pnl: f64 = snapshot
+        .open_positions
+        .iter()
+        .map(|row| row.pnl_amount)
+        .sum();
     let total_bet_stake: f64 = snapshot.other_open_bets.iter().map(|row| row.stake).sum();
     let actionable_decisions = snapshot
         .exit_recommendations
@@ -27,7 +65,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapsho
     let runtime = snapshot.runtime.as_ref();
 
     let layout = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(8),
         Constraint::Length(5),
         Constraint::Min(12),
     ])
@@ -40,48 +78,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapsho
     .split(layout[1]);
     let lower = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(layout[2]);
-    let left = Layout::vertical([Constraint::Length(9), Constraint::Min(8)]).split(lower[0]);
-    let right = Layout::vertical([Constraint::Length(9), Constraint::Min(8)]).split(lower[1]);
-
-    let summary = Paragraph::new(vec![
-        Line::raw(format!(
-            "Open positions: {} | Sportsbook bets: {} | Tracked bets: {} | Venues in scope: {}",
-            snapshot.open_positions.len(),
-            snapshot.other_open_bets.len(),
-            snapshot.tracked_bets.len(),
-            snapshot.venues.len(),
-        )),
-        Line::raw(format!(
-            "Marked P/L: {:+.2} | Liability: {:.2} | Exchange stake: {:.2} | Sportsbook stake: {:.2}",
-            total_open_pnl, total_liability, total_open_stake, total_bet_stake,
-        )),
-        Line::raw(format!(
-            "Actionable exits: {} | Decisions: {} | Watch rows: {} | Tracked sources: {}",
-            actionable_decisions,
-            snapshot.decisions.len(),
-            snapshot
-                .watch
-                .as_ref()
-                .map(|watch| watch.watch_count)
-                .unwrap_or(0),
-            tracked_source_count,
-        )),
-        Line::raw(format!(
-            "Updated: {} | Source: {} | Market EV proxy: {}",
-            runtime
-                .map(|summary| summary.updated_at.as_str())
-                .unwrap_or("unknown"),
-            runtime
-                .map(|summary| summary.source.as_str())
-                .unwrap_or("snapshot"),
-            total_market_ev(snapshot)
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| String::from("-")),
-        )),
+    let left = Layout::vertical([Constraint::Length(12), Constraint::Min(8)]).split(lower[0]);
+    let right = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Min(8),
     ])
-    .block(section_block("Trading Stats", accent_blue()))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(summary, layout[0]);
+    .split(lower[1]);
+    let running_pnl = build_running_pnl_summary(snapshot, total_open_pnl);
+
+    render_summary_cards(
+        frame,
+        layout[0],
+        snapshot,
+        total_open_pnl,
+        total_liability,
+        total_open_stake,
+        total_bet_stake,
+        actionable_decisions,
+        tracked_source_count,
+        runtime,
+    );
 
     let exposure_ratio = snapshot
         .account_stats
@@ -137,7 +154,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapsho
         format!("{}/{}", actionable_decisions, snapshot.decisions.len()),
     );
 
-    render_venue_table(frame, left[0], snapshot);
+    render_running_pnl_chart(frame, left[0], &running_pnl);
     render_capital_table(
         frame,
         left[1],
@@ -147,8 +164,117 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapsho
         total_open_pnl,
         total_bet_stake,
     );
-    render_decision_table(frame, right[0], snapshot);
-    render_tracked_mix_table(frame, right[1], snapshot);
+    render_venue_table(frame, right[0], snapshot);
+    render_decision_table(frame, right[1], snapshot);
+    render_tracked_mix_table(frame, right[2], snapshot);
+}
+
+fn render_summary_cards(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    total_open_pnl: f64,
+    total_liability: f64,
+    total_open_stake: f64,
+    total_bet_stake: f64,
+    actionable_decisions: usize,
+    tracked_source_count: usize,
+    runtime: Option<&crate::domain::RuntimeSummary>,
+) {
+    let cards = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+    ])
+    .split(area);
+
+    let coverage = Paragraph::new(vec![
+        Line::styled("󰄨 coverage", Style::default().fg(muted_text())),
+        Line::styled(
+            format!(
+                "{} venues • {} tracked",
+                snapshot.venues.len(),
+                snapshot.tracked_bets.len()
+            ),
+            Style::default()
+                .fg(accent_blue())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{} exchange • {} sportsbook",
+            snapshot.open_positions.len(),
+            snapshot.other_open_bets.len()
+        )),
+    ])
+    .block(section_block("󰊠 Trading Stats", accent_blue()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(coverage, cards[0]);
+
+    let capital = Paragraph::new(vec![
+        Line::styled("󰞇 open risk", Style::default().fg(muted_text())),
+        Line::styled(
+            format!(
+                "{:.2} stake • {:.2} liability",
+                total_open_stake, total_liability
+            ),
+            Style::default()
+                .fg(accent_pink())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!("sportsbook stake {:.2}", total_bet_stake)),
+    ])
+    .block(section_block("󰖌 Capital", accent_pink()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(capital, cards[1]);
+
+    let flow = Paragraph::new(vec![
+        Line::styled("󰍵 action queue", Style::default().fg(muted_text())),
+        Line::styled(
+            format!(
+                "{} actionable • {} decisions",
+                actionable_decisions,
+                snapshot.decisions.len()
+            ),
+            Style::default()
+                .fg(accent_gold())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{} watch rows • {} sources",
+            snapshot
+                .watch
+                .as_ref()
+                .map(|watch| watch.watch_count)
+                .unwrap_or(0),
+            tracked_source_count,
+        )),
+    ])
+    .block(section_block("󰆼 Flow", accent_gold()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(flow, cards[2]);
+
+    let runtime_card = Paragraph::new(vec![
+        Line::styled("󱂬 mark-to-market", Style::default().fg(muted_text())),
+        Line::styled(
+            format!("{:+.2}", total_open_pnl),
+            Style::default()
+                .fg(pnl_color(total_open_pnl))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{} • ev {}",
+            runtime
+                .map(|summary| summary.updated_at.as_str())
+                .unwrap_or("unknown"),
+            total_market_ev(snapshot)
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| String::from("-")),
+        )),
+    ])
+    .block(section_block("󱎆 Runtime", accent_green()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(runtime_card, cards[3]);
 }
 
 fn render_venue_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
@@ -157,7 +283,7 @@ fn render_venue_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePane
             Line::raw("No venue summaries loaded."),
             Line::raw("Refresh the provider or start the recorder-backed source."),
         ])
-        .block(section_block("Venue Split", accent_cyan()))
+        .block(section_block("󰀶 Venue Split", accent_cyan()))
         .wrap(Wrap { trim: true });
         frame.render_widget(body, area);
         return;
@@ -189,9 +315,108 @@ fn render_venue_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePane
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(section_block("Venue Split", accent_cyan()))
+    .block(section_block("󰀶 Venue Split", accent_cyan()))
     .column_spacing(1);
     frame.render_widget(table, area);
+}
+
+fn render_running_pnl_chart(frame: &mut Frame<'_>, area: Rect, summary: &RunningPnlSummary) {
+    if summary.points.is_empty() {
+        let body = Paragraph::new(vec![
+            Line::styled("󱂬 running pnl", Style::default().fg(muted_text())),
+            Line::raw("No settled P/L history is loaded yet."),
+            Line::raw("Load ledger history, tracked bets, or settled positions to draw the curve."),
+        ])
+        .block(section_block("󰁔 Running P/L", accent_green()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
+    }
+
+    let header = Layout::vertical([Constraint::Length(3), Constraint::Min(7)]).split(area);
+    let net_total = summary.realised_total + summary.marked_total;
+    let headline = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("realised ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{:+.2}", summary.realised_total),
+                Style::default()
+                    .fg(pnl_color(summary.realised_total))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("live ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{:+.2}", summary.marked_total),
+                Style::default().fg(pnl_color(summary.marked_total)),
+            ),
+            Span::raw("   "),
+            Span::styled("net ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{:+.2}", net_total),
+                Style::default()
+                    .fg(pnl_color(net_total))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(format!(
+            "source {} • std {} • promo {} • unknown {}",
+            summary.source, summary.standard_count, summary.promo_count, summary.unknown_count
+        )),
+    ])
+    .block(section_block("󰁔 Running P/L", accent_green()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(headline, header[0]);
+
+    let total_points = chart_points(
+        summary
+            .points
+            .iter()
+            .map(|point| (point.sequence, point.total)),
+    );
+    let promo_points = chart_points(
+        summary
+            .points
+            .iter()
+            .map(|point| (point.sequence, point.promo)),
+    );
+    let y_bounds = pnl_bounds(summary);
+    let x_bounds = [0.0, total_points.last().map(|point| point.0).unwrap_or(1.0)];
+    let x_labels = chart_x_labels(summary);
+    let y_labels = chart_y_labels(y_bounds);
+
+    let mut datasets = vec![Dataset::default()
+        .name("Total")
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(accent_cyan()))
+        .data(&total_points)];
+    if summary.promo_count > 0 {
+        datasets.push(
+            Dataset::default()
+                .name("Promo")
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(accent_gold()))
+                .data(&promo_points),
+        );
+    }
+
+    let chart = Chart::new(datasets)
+        .block(section_block("󰄧 Curve", accent_blue()))
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(muted_text()))
+                .bounds(x_bounds)
+                .labels(x_labels),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(muted_text()))
+                .bounds(y_bounds)
+                .labels(y_labels),
+        );
+    frame.render_widget(chart, header[1]);
 }
 
 fn render_capital_table(
@@ -211,28 +436,44 @@ fn render_capital_table(
     let account = snapshot.account_stats.as_ref();
     let rows = vec![
         key_value_row(
-            "Balance",
+            "󰟈 Balance",
             account
                 .map(|stats| format!("{:.2} {}", stats.available_balance, stats.currency))
                 .unwrap_or_else(|| String::from("-")),
             accent_green(),
         ),
-        key_value_row("Exchange stake", format!("{total_open_stake:.2}"), accent_blue()),
-        key_value_row("Liability", format!("{total_liability:.2}"), accent_pink()),
-        key_value_row("Marked P/L", format!("{total_open_pnl:+.2}"), pnl_color(total_open_pnl)),
-        key_value_row("Sportsbook stake", format!("{total_bet_stake:.2}"), accent_gold()),
         key_value_row(
-            "Avg position",
+            "󰞇 Exchange stake",
+            format!("{total_open_stake:.2}"),
+            accent_blue(),
+        ),
+        key_value_row(
+            "󰖌 Liability",
+            format!("{total_liability:.2}"),
+            accent_pink(),
+        ),
+        key_value_row(
+            "󱂬 Marked P/L",
+            format!("{total_open_pnl:+.2}"),
+            pnl_color(total_open_pnl),
+        ),
+        key_value_row(
+            "󰇚 Sportsbook stake",
+            format!("{total_bet_stake:.2}"),
+            accent_gold(),
+        ),
+        key_value_row(
+            "󰔉 Avg position",
             format!("{average_position_size:.2}"),
             text_color(),
         ),
         key_value_row(
-            "Implied band",
+            "󰹈 Implied band",
             probability_band_line(snapshot),
             muted_text(),
         ),
         key_value_row(
-            "Exit policy",
+            "󰔟 Exit policy",
             format!(
                 "target {:.2} | stop {:.2} | warn {}",
                 snapshot.exit_policy.target_profit,
@@ -244,7 +485,7 @@ fn render_capital_table(
     ];
 
     let table = Table::new(rows, [Constraint::Length(15), Constraint::Min(10)])
-        .block(section_block("Capital & Risk", accent_pink()))
+        .block(section_block("󰖌 Capital & Risk", accent_pink()))
         .column_spacing(1);
     frame.render_widget(table, area);
 }
@@ -257,9 +498,11 @@ fn render_decision_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangeP
     if counts.is_empty() {
         let body = Paragraph::new(vec![
             Line::raw("No decision rows loaded."),
-            Line::raw("Watch recommendations will appear here once the recorder has a live snapshot."),
+            Line::raw(
+                "Watch recommendations will appear here once the recorder has a live snapshot.",
+            ),
         ])
-        .block(section_block("Decision Mix", accent_gold()))
+        .block(section_block("󰍵 Decision Mix", accent_gold()))
         .wrap(Wrap { trim: true });
         frame.render_widget(body, area);
         return;
@@ -293,7 +536,7 @@ fn render_decision_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangeP
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(section_block("Decision Mix", accent_gold()))
+    .block(section_block("󰍵 Decision Mix", accent_gold()))
     .column_spacing(1);
     frame.render_widget(table, area);
 }
@@ -312,8 +555,12 @@ fn render_tracked_mix_table(frame: &mut Frame<'_>, area: Rect, snapshot: &Exchan
         };
         *counts.entry(source).or_default() += 1;
     }
-    counts.entry(String::from("sportsbook_open")).or_insert(snapshot.other_open_bets.len());
-    counts.entry(String::from("exchange_open")).or_insert(snapshot.open_positions.len());
+    counts
+        .entry(String::from("sportsbook_open"))
+        .or_insert(snapshot.other_open_bets.len());
+    counts
+        .entry(String::from("exchange_open"))
+        .or_insert(snapshot.open_positions.len());
 
     let rows = counts
         .into_iter()
@@ -326,7 +573,7 @@ fn render_tracked_mix_table(frame: &mut Frame<'_>, area: Rect, snapshot: &Exchan
             Line::raw("No tracked activity loaded."),
             Line::raw("Recorder and ledger imports will populate this board."),
         ])
-        .block(section_block("Tracked Mix", accent_green()))
+        .block(section_block("󰋼 Tracked Mix", accent_green()))
         .wrap(Wrap { trim: true });
         frame.render_widget(body, area);
         return;
@@ -340,7 +587,7 @@ fn render_tracked_mix_table(frame: &mut Frame<'_>, area: Rect, snapshot: &Exchan
                     .add_modifier(Modifier::BOLD),
             ),
         )
-        .block(section_block("Tracked Mix", accent_green()))
+        .block(section_block("󰋼 Tracked Mix", accent_green()))
         .column_spacing(1);
     frame.render_widget(table, area);
 }
@@ -453,6 +700,349 @@ fn probability_band_line(snapshot: &ExchangePanelSnapshot) -> String {
     )
 }
 
+fn build_running_pnl_summary(
+    snapshot: &ExchangePanelSnapshot,
+    total_open_pnl: f64,
+) -> RunningPnlSummary {
+    if snapshot.ledger_pnl_summary.settled_count > 0 {
+        return RunningPnlSummary {
+            points: snapshot
+                .ledger_pnl_summary
+                .points
+                .iter()
+                .enumerate()
+                .map(|(index, point)| RunningPnlPoint {
+                    sequence: index,
+                    at: point.occurred_at.clone(),
+                    total: point.total,
+                    promo: point.promo_total,
+                })
+                .collect(),
+            realised_total: snapshot.ledger_pnl_summary.realised_total,
+            marked_total: total_open_pnl,
+            standard_count: snapshot.ledger_pnl_summary.standard_count,
+            promo_count: snapshot.ledger_pnl_summary.promo_count,
+            unknown_count: snapshot.ledger_pnl_summary.unknown_count,
+            source: "ledger",
+        };
+    }
+
+    let tracked_history = build_tracked_bet_pnl_points(snapshot);
+    if !tracked_history.points.is_empty() {
+        return RunningPnlSummary {
+            marked_total: total_open_pnl,
+            ..tracked_history
+        };
+    }
+
+    let fallback_points = build_historical_position_pnl_points(snapshot);
+    if !fallback_points.is_empty() {
+        let realised_total = fallback_points
+            .last()
+            .map(|point| point.total)
+            .unwrap_or(0.0);
+        return RunningPnlSummary {
+            points: fallback_points,
+            realised_total,
+            marked_total: total_open_pnl,
+            standard_count: 0,
+            promo_count: 0,
+            unknown_count: snapshot.historical_positions.len(),
+            source: "history",
+        };
+    }
+
+    RunningPnlSummary {
+        marked_total: total_open_pnl,
+        ..RunningPnlSummary::default()
+    }
+}
+
+fn build_tracked_bet_pnl_points(snapshot: &ExchangePanelSnapshot) -> RunningPnlSummary {
+    let mut rows = snapshot
+        .tracked_bets
+        .iter()
+        .filter_map(|bet| {
+            let realised_pnl = bet.realised_pnl_gbp?;
+            let occurred_at = tracked_bet_occurred_at(bet);
+            if occurred_at.is_empty() {
+                return None;
+            }
+            Some((
+                occurred_at,
+                bet.bet_id.clone(),
+                realised_pnl,
+                classify_funding(bet),
+            ))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    let mut total = 0.0;
+    let mut promo_total = 0.0;
+    let mut standard_count = 0;
+    let mut promo_count = 0;
+    let mut unknown_count = 0;
+    let mut points = Vec::with_capacity(rows.len());
+    for (index, (occurred_at, _, realised_pnl, funding)) in rows.into_iter().enumerate() {
+        total += realised_pnl;
+        match funding {
+            FundingKind::Standard => {
+                standard_count += 1;
+            }
+            FundingKind::Promo => {
+                promo_count += 1;
+                promo_total += realised_pnl;
+            }
+            FundingKind::Unknown => {
+                unknown_count += 1;
+            }
+        }
+        points.push(RunningPnlPoint {
+            sequence: index,
+            at: occurred_at,
+            total,
+            promo: promo_total,
+        });
+    }
+
+    RunningPnlSummary {
+        realised_total: total,
+        standard_count,
+        promo_count,
+        unknown_count,
+        points,
+        source: "tracked",
+        ..RunningPnlSummary::default()
+    }
+}
+
+fn build_historical_position_pnl_points(snapshot: &ExchangePanelSnapshot) -> Vec<RunningPnlPoint> {
+    let mut rows = snapshot
+        .historical_positions
+        .iter()
+        .filter_map(|row| {
+            historical_position_occurred_at(row).map(|occurred_at| (occurred_at, row.pnl_amount))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut total = 0.0;
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (occurred_at, pnl_amount))| {
+            total += pnl_amount;
+            RunningPnlPoint {
+                sequence: index,
+                at: occurred_at,
+                total,
+                promo: 0.0,
+            }
+        })
+        .collect()
+}
+
+fn tracked_bet_occurred_at(bet: &TrackedBetRow) -> String {
+    if !bet.settled_at.is_empty() {
+        return bet.settled_at.clone();
+    }
+    if !bet.placed_at.is_empty() {
+        return bet.placed_at.clone();
+    }
+    for activity in &bet.activities {
+        if !activity.occurred_at.is_empty() {
+            return activity.occurred_at.clone();
+        }
+    }
+    String::new()
+}
+
+fn historical_position_occurred_at(row: &OpenPositionRow) -> Option<String> {
+    if looks_like_iso_timestamp(&row.live_clock) {
+        return Some(row.live_clock.clone());
+    }
+    if let Some(date) = event_date_from_row(row) {
+        let time = event_time_from_row(row).unwrap_or_else(|| String::from("00:00"));
+        return Some(format!("{date}T{time}:00"));
+    }
+    None
+}
+
+fn event_date_from_row(row: &OpenPositionRow) -> Option<String> {
+    if let Some((date, _)) = parse_iso_timestamp(row.event_status.split('|').next().unwrap_or("")) {
+        return Some(date);
+    }
+    if let Some((date, _)) = parse_iso_timestamp(&row.live_clock) {
+        return Some(date);
+    }
+    if let Some((date, _)) = parse_url_datetime(&row.event_url) {
+        return Some(date);
+    }
+    None
+}
+
+fn event_time_from_row(row: &OpenPositionRow) -> Option<String> {
+    if let Some((_, time)) = parse_iso_timestamp(row.event_status.split('|').next().unwrap_or("")) {
+        return Some(time);
+    }
+    if let Some((_, time)) = parse_iso_timestamp(&row.live_clock) {
+        return Some(time);
+    }
+    if let Some((_, time)) = parse_url_datetime(&row.event_url) {
+        return Some(time);
+    }
+    None
+}
+
+fn parse_iso_timestamp(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.len() < 16 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+    {
+        return None;
+    }
+    Some((
+        trimmed.get(0..10)?.to_string(),
+        trimmed.get(11..16)?.to_string(),
+    ))
+}
+
+fn parse_url_datetime(event_url: &str) -> Option<(String, String)> {
+    let segments = event_url
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    for window in segments.windows(4) {
+        let [year, month, day, time] = window else {
+            continue;
+        };
+        if year.len() != 4
+            || month.len() != 2
+            || day.len() != 2
+            || time.len() < 5
+            || !year.chars().all(|c| c.is_ascii_digit())
+            || !month.chars().all(|c| c.is_ascii_digit())
+            || !day.chars().all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let bytes = time.as_bytes();
+        if bytes.get(2) == Some(&b'-')
+            && bytes[0..2].iter().all(|byte| byte.is_ascii_digit())
+            && bytes[3..5].iter().all(|byte| byte.is_ascii_digit())
+        {
+            return Some((
+                format!("{year}-{month}-{day}"),
+                format!("{}:{}", &time[0..2], &time[3..5]),
+            ));
+        }
+    }
+    None
+}
+
+fn looks_like_iso_timestamp(value: &str) -> bool {
+    parse_iso_timestamp(value).is_some()
+}
+
+fn classify_funding(bet: &TrackedBetRow) -> FundingKind {
+    let notes = bet.notes.to_lowercase();
+    let bet_type = bet.bet_type.to_lowercase();
+    let status = bet.status.to_lowercase();
+    let haystack = format!("{notes} {bet_type} {status}");
+
+    if [
+        "free bet",
+        "freebet",
+        "snr",
+        "stake returned",
+        "risk free",
+        "refund",
+        "bonus",
+        "promo",
+        "promotion",
+        "boost",
+    ]
+    .iter()
+    .any(|keyword| haystack.contains(keyword))
+    {
+        return FundingKind::Promo;
+    }
+
+    if ["qualifying", "cash", "normal"]
+        .iter()
+        .any(|keyword| haystack.contains(keyword))
+    {
+        return FundingKind::Standard;
+    }
+
+    FundingKind::Unknown
+}
+
+fn chart_points(points: impl Iterator<Item = (usize, f64)>) -> Vec<(f64, f64)> {
+    let mut output = points
+        .map(|(index, value)| (index as f64, value))
+        .collect::<Vec<_>>();
+    if output.len() == 1 {
+        output.push((1.0, output[0].1));
+    }
+    output
+}
+
+fn pnl_bounds(summary: &RunningPnlSummary) -> [f64; 2] {
+    let mut min_value: f64 = 0.0;
+    let mut max_value: f64 = 0.0;
+    for point in &summary.points {
+        min_value = min_value.min(point.total).min(point.promo);
+        max_value = max_value.max(point.total).max(point.promo);
+    }
+    if (max_value - min_value).abs() < f64::EPSILON {
+        return [min_value - 1.0, max_value + 1.0];
+    }
+    let padding = ((max_value - min_value) * 0.1).max(0.5);
+    [min_value - padding, max_value + padding]
+}
+
+fn chart_x_labels(summary: &RunningPnlSummary) -> Vec<Line<'static>> {
+    let first = summary
+        .points
+        .first()
+        .map(|point| compact_label(&point.at))
+        .unwrap_or_else(|| String::from("start"));
+    let middle = summary
+        .points
+        .get(summary.points.len().saturating_sub(1) / 2)
+        .map(|point| compact_label(&point.at))
+        .unwrap_or_else(|| first.clone());
+    let last = summary
+        .points
+        .last()
+        .map(|point| compact_label(&point.at))
+        .unwrap_or_else(|| first.clone());
+    vec![Line::from(first), Line::from(middle), Line::from(last)]
+}
+
+fn chart_y_labels(bounds: [f64; 2]) -> Vec<Line<'static>> {
+    let middle = (bounds[0] + bounds[1]) / 2.0;
+    vec![
+        Line::from(format!("{:.0}", bounds[0])),
+        Line::from(format!("{middle:.0}")),
+        Line::from(format!("{:.0}", bounds[1])),
+    ]
+}
+
+fn compact_label(value: &str) -> String {
+    if value.len() >= 10 && value.as_bytes().get(4) == Some(&b'-') {
+        return value[5..10].to_string();
+    }
+    value.chars().take(10).collect()
+}
+
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
@@ -460,6 +1050,7 @@ fn section_block(title: &'static str, color: Color) -> Block<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }
@@ -520,4 +1111,149 @@ fn accent_pink() -> Color {
 
 fn accent_red() -> Color {
     Color::Rgb(255, 107, 107)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_running_pnl_summary, classify_funding, FundingKind};
+    use crate::domain::{ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow};
+
+    #[test]
+    fn classifies_promo_bets_from_notes_and_type() {
+        let mut bet = TrackedBetRow::default();
+        bet.bet_type = String::from("single");
+        bet.notes = String::from("Free Bet SNR");
+
+        assert_eq!(classify_funding(&bet), FundingKind::Promo);
+    }
+
+    #[test]
+    fn running_pnl_summary_prefers_tracked_bet_history() {
+        let mut snapshot = ExchangePanelSnapshot::default();
+        let mut open_row = sample_history_row();
+        open_row.pnl_amount = 1.5;
+        snapshot.open_positions = vec![open_row];
+        snapshot.tracked_bets = vec![
+            TrackedBetRow {
+                bet_id: String::from("bet-1"),
+                settled_at: String::from("2026-03-10T12:00:00Z"),
+                realised_pnl_gbp: Some(-1.25),
+                notes: String::from("qualifying"),
+                ..TrackedBetRow::default()
+            },
+            TrackedBetRow {
+                bet_id: String::from("bet-2"),
+                settled_at: String::from("2026-03-11T12:00:00Z"),
+                realised_pnl_gbp: Some(6.40),
+                notes: String::from("free bet snr"),
+                ..TrackedBetRow::default()
+            },
+        ];
+
+        let summary = build_running_pnl_summary(&snapshot, 1.5);
+
+        assert_eq!(summary.source, "tracked");
+        assert_eq!(summary.realised_total, 5.15);
+        assert_eq!(summary.marked_total, 1.5);
+        assert_eq!(summary.standard_count, 1);
+        assert_eq!(summary.promo_count, 1);
+        assert_eq!(summary.points.len(), 2);
+        assert_eq!(summary.points[1].total, 5.15);
+        assert_eq!(summary.points[1].promo, 6.40);
+    }
+
+    #[test]
+    fn running_pnl_summary_falls_back_to_historical_positions() {
+        let mut snapshot = ExchangePanelSnapshot::default();
+        snapshot.historical_positions = vec![
+            OpenPositionRow {
+                event_status: String::from("2026-03-10T12:00:00|Football"),
+                pnl_amount: -1.0,
+                ..sample_history_row()
+            },
+            OpenPositionRow {
+                event_status: String::from("2026-03-11T12:00:00|Football"),
+                pnl_amount: 3.5,
+                ..sample_history_row()
+            },
+        ];
+
+        let summary = build_running_pnl_summary(&snapshot, 0.0);
+
+        assert_eq!(summary.source, "history");
+        assert_eq!(summary.realised_total, 2.5);
+        assert_eq!(summary.unknown_count, 2);
+        assert_eq!(summary.points.len(), 2);
+        assert_eq!(summary.points[1].total, 2.5);
+    }
+
+    #[test]
+    fn running_pnl_summary_prefers_ledger_history_when_available() {
+        let mut snapshot = ExchangePanelSnapshot::default();
+        snapshot.ledger_pnl_summary.realised_total = 12.5;
+        snapshot.ledger_pnl_summary.settled_count = 3;
+        snapshot.ledger_pnl_summary.standard_count = 2;
+        snapshot.ledger_pnl_summary.promo_count = 1;
+        snapshot.ledger_pnl_summary.points = vec![
+            crate::domain::LedgerPnlPoint {
+                occurred_at: String::from("2026-03-10T12:00:00Z"),
+                total: 10.0,
+                promo_total: 0.0,
+                ..crate::domain::LedgerPnlPoint::default()
+            },
+            crate::domain::LedgerPnlPoint {
+                occurred_at: String::from("2026-03-11T12:00:00Z"),
+                total: 8.0,
+                promo_total: 0.0,
+                ..crate::domain::LedgerPnlPoint::default()
+            },
+            crate::domain::LedgerPnlPoint {
+                occurred_at: String::from("2026-03-12T12:00:00Z"),
+                total: 12.5,
+                promo_total: 4.5,
+                ..crate::domain::LedgerPnlPoint::default()
+            },
+        ];
+
+        let summary = build_running_pnl_summary(&snapshot, 1.5);
+
+        assert_eq!(summary.source, "ledger");
+        assert_eq!(summary.realised_total, 12.5);
+        assert_eq!(summary.marked_total, 1.5);
+        assert_eq!(summary.standard_count, 2);
+        assert_eq!(summary.promo_count, 1);
+        assert_eq!(summary.points.len(), 3);
+        assert_eq!(summary.points[2].total, 12.5);
+        assert_eq!(summary.points[2].promo, 4.5);
+    }
+
+    fn sample_history_row() -> OpenPositionRow {
+        OpenPositionRow {
+            event: String::new(),
+            event_status: String::new(),
+            event_url: String::new(),
+            contract: String::new(),
+            market: String::new(),
+            status: String::new(),
+            market_status: String::new(),
+            is_in_play: false,
+            price: 0.0,
+            stake: 0.0,
+            liability: 0.0,
+            current_value: 0.0,
+            pnl_amount: 0.0,
+            current_back_odds: None,
+            current_implied_probability: None,
+            current_implied_percentage: None,
+            current_buy_odds: None,
+            current_buy_implied_probability: None,
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::new(),
+            can_trade_out: false,
+        }
+    }
 }

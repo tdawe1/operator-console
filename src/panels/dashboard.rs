@@ -283,6 +283,8 @@ mod tests {
                 available_balance: 144.5,
                 exposure: 23.0,
                 unrealized_pnl: 1.2,
+                cumulative_pnl: None,
+                cumulative_pnl_label: String::new(),
                 currency: String::from("GBP"),
             }),
             open_positions: vec![],

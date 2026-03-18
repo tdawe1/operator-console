@@ -69,6 +69,7 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
         account_stats: None,
         open_positions: Vec::new(),
         historical_positions: Vec::new(),
+        ledger_pnl_summary: Default::default(),
         other_open_bets: Vec::new(),
         decisions: Vec::new(),
         watch: None,

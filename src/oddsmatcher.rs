@@ -7,8 +7,7 @@ use reqwest::blocking::Client;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const ODDSMATCHER_GRAPHQL_URL: &str =
-    "https://api.oddsplatform.profitaccumulator.com/graphql";
+pub const ODDSMATCHER_GRAPHQL_URL: &str = "https://api.oddsplatform.profitaccumulator.com/graphql";
 
 pub const GET_BEST_MATCHES_QUERY: &str = r#"
 query GetBestMatches(
@@ -444,7 +443,10 @@ pub struct OddsMatcherRow {
     pub rating: f64,
     #[serde(rename = "selectionName")]
     pub selection_name: String,
-    #[serde(default, deserialize_with = "deserialize_optional_f64_from_string_or_number")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_f64_from_string_or_number"
+    )]
     pub snr: Option<f64>,
     pub sport: SportSummary,
     #[serde(rename = "betRequestId")]
@@ -475,7 +477,10 @@ pub struct LayLeg {
     pub updated_at: Option<String>,
     #[serde(deserialize_with = "deserialize_f64_from_string_or_number")]
     pub odds: f64,
-    #[serde(default, deserialize_with = "deserialize_optional_f64_from_string_or_number")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_f64_from_string_or_number"
+    )]
     pub liquidity: Option<f64>,
     #[serde(rename = "betSlip")]
     pub bet_slip: Option<BetSlipRef>,
@@ -580,8 +585,7 @@ pub fn fetch_best_matches(
 mod tests {
     use super::{
         fetch_best_matches, load_query_or_default, save_query, GetBestMatchesData,
-        GetBestMatchesVariables, GraphQlRequest, GraphQlResponse, OddsMatcherField,
-        OddsMatcherRow,
+        GetBestMatchesVariables, GraphQlRequest, GraphQlResponse, OddsMatcherField, OddsMatcherRow,
     };
 
     #[test]
@@ -681,7 +685,10 @@ mod tests {
         let row: &OddsMatcherRow = data.get_best_matches.first().expect("row");
         assert_eq!(row.event_name, "Arsenal v Everton");
         assert_eq!(row.back.bookmaker.display_name, "BetVictor");
-        assert_eq!(row.back.bookmaker.active, super::BookmakerActive::Bool(true));
+        assert_eq!(
+            row.back.bookmaker.active,
+            super::BookmakerActive::Bool(true)
+        );
         assert_eq!(row.lay.liquidity, Some(30.0));
         assert_eq!(row.market_group.display_name, "Match Odds");
         assert_eq!(row.snr, Some(0.0));
@@ -764,18 +771,17 @@ mod tests {
         let row: &OddsMatcherRow = data.get_best_matches.first().expect("row");
         assert_eq!(
             row.back.bookmaker.active,
-            super::BookmakerActive::Labels(vec![
-                String::from("desktop"),
-                String::from("mobile"),
-            ])
+            super::BookmakerActive::Labels(vec![String::from("desktop"), String::from("mobile"),])
         );
     }
 
     #[test]
     fn fetch_best_matches_surface_is_linkable_for_live_use() {
         let client = reqwest::blocking::Client::new();
-        let function_ptr: fn(&reqwest::blocking::Client, &GetBestMatchesVariables)
-            -> color_eyre::Result<Vec<OddsMatcherRow>> = fetch_best_matches;
+        let function_ptr: fn(
+            &reqwest::blocking::Client,
+            &GetBestMatchesVariables,
+        ) -> color_eyre::Result<Vec<OddsMatcherRow>> = fetch_best_matches;
         let _ = (client, function_ptr);
     }
 

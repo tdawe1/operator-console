@@ -5,15 +5,18 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use reqwest::blocking::Client;
 use ratatui::backend::Backend;
 use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
+use reqwest::blocking::Client;
 
 use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
 use crate::domain::{ExchangePanelSnapshot, VenueId};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
+};
+use crate::panels::trading_positions::{
+    active_position_row_count, next_actionable_cash_out_bet_id,
 };
 use crate::provider::{ExchangeProvider, ProviderRequest};
 use crate::recorder::{
@@ -103,6 +106,21 @@ impl ObservabilitySection {
             Self::Configs => "Configs",
             Self::Logs => "Logs",
             Self::Health => "Health",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionsFocus {
+    Active,
+    Historical,
+}
+
+impl PositionsFocus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Historical => "Historical",
         }
     }
 }
@@ -264,6 +282,9 @@ pub struct App {
     observability_section: ObservabilitySection,
     exchange_list_state: ListState,
     open_position_table_state: TableState,
+    historical_position_table_state: TableState,
+    positions_focus: PositionsFocus,
+    live_view_overlay_visible: bool,
     last_recorder_refresh_at: Option<Instant>,
     running: bool,
     status_message: String,
@@ -376,9 +397,16 @@ impl App {
                 )
             });
         let mut open_position_table_state = TableState::default();
-        if !snapshot.open_positions.is_empty() {
+        let mut historical_position_table_state = TableState::default();
+        let positions_focus = if !snapshot.open_positions.is_empty() {
             open_position_table_state.select(Some(0));
-        }
+            PositionsFocus::Active
+        } else if !snapshot.historical_positions.is_empty() {
+            historical_position_table_state.select(Some(0));
+            PositionsFocus::Historical
+        } else {
+            PositionsFocus::Active
+        };
 
         Ok(Self {
             provider,
@@ -405,6 +433,9 @@ impl App {
             observability_section: ObservabilitySection::Workers,
             exchange_list_state: ListState::default(),
             open_position_table_state,
+            historical_position_table_state,
+            positions_focus,
+            live_view_overlay_visible: false,
             last_recorder_refresh_at: None,
             running: true,
             status_message,
@@ -425,6 +456,9 @@ impl App {
 
     pub fn set_active_panel(&mut self, panel: Panel) {
         self.active_panel = panel;
+        if panel != Panel::Trading {
+            self.live_view_overlay_visible = false;
+        }
     }
 
     pub fn active_trading_section(&self) -> TradingSection {
@@ -433,6 +467,9 @@ impl App {
 
     pub fn set_trading_section(&mut self, section: TradingSection) {
         self.trading_section = section;
+        if section != TradingSection::Positions {
+            self.live_view_overlay_visible = false;
+        }
     }
 
     pub fn active_observability_section(&self) -> ObservabilitySection {
@@ -440,7 +477,18 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "q quit | o observability | h/l sections | arrows nav | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults\ns start recorder | x stop recorder | c cash out | b cycle type | m toggle mode"
+        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+    }
+
+    pub fn live_view_overlay_visible(&self) -> bool {
+        self.live_view_overlay_visible
+    }
+
+    pub fn toggle_live_view_overlay(&mut self) {
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Positions
+        {
+            self.live_view_overlay_visible = !self.live_view_overlay_visible;
+        }
     }
 
     pub fn selected_exchange_row(&self) -> Option<usize> {
@@ -461,6 +509,25 @@ impl App {
 
     pub fn open_position_table_state(&mut self) -> &mut TableState {
         &mut self.open_position_table_state
+    }
+
+    pub fn historical_position_table_state(&mut self) -> &mut TableState {
+        &mut self.historical_position_table_state
+    }
+
+    pub fn position_table_states(&mut self) -> (&mut TableState, &mut TableState) {
+        (
+            &mut self.open_position_table_state,
+            &mut self.historical_position_table_state,
+        )
+    }
+
+    pub fn selected_historical_position_row(&self) -> Option<usize> {
+        self.historical_position_table_state.selected()
+    }
+
+    pub fn positions_focus(&self) -> PositionsFocus {
+        self.positions_focus
     }
 
     pub fn oddsmatcher_rows(&self) -> &[OddsMatcherRow] {
@@ -504,7 +571,11 @@ impl App {
                 } else {
                     field.display_value(&self.oddsmatcher_query)
                 };
-                (field, value, self.oddsmatcher_editor.selected_field() == field)
+                (
+                    field,
+                    value,
+                    self.oddsmatcher_editor.selected_field() == field,
+                )
             })
             .collect()
     }
@@ -613,7 +684,8 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::OddsMatcher
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::OddsMatcher
         {
             return self.refresh_oddsmatcher();
         }
@@ -644,13 +716,8 @@ impl App {
     }
 
     pub fn cash_out_next_actionable_bet(&mut self) -> Result<()> {
-        let actionable_bet_id = self
-            .snapshot
-            .exit_recommendations
-            .iter()
-            .find(|recommendation| recommendation.action == "cash_out")
-            .map(|recommendation| recommendation.bet_id.clone())
-            .ok_or_else(|| {
+        let actionable_bet_id =
+            next_actionable_cash_out_bet_id(&self.snapshot).ok_or_else(|| {
                 color_eyre::eyre::eyre!("No tracked bet is currently marked for cash out.")
             })?;
         let snapshot = self.provider.handle(ProviderRequest::CashOutTrackedBet {
@@ -743,6 +810,10 @@ impl App {
                     next_from(self.observability_section, &ObservabilitySection::ALL)
             }
         }
+        if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
+        {
+            self.live_view_overlay_visible = false;
+        }
     }
 
     pub fn previous_section(&mut self) {
@@ -754,6 +825,10 @@ impl App {
                 self.observability_section =
                     previous_from(self.observability_section, &ObservabilitySection::ALL)
             }
+        }
+        if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
+        {
+            self.live_view_overlay_visible = false;
         }
     }
 
@@ -867,9 +942,27 @@ impl App {
             }
         }
 
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Positions
+        {
+            if key_code == KeyCode::Tab {
+                self.toggle_positions_focus();
+                return;
+            }
+            if key_code == KeyCode::Char('v') {
+                self.toggle_live_view_overlay();
+                return;
+            }
+        }
+
         match key_code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Esc => self.running = false,
+            KeyCode::Esc => {
+                if self.live_view_overlay_visible {
+                    self.live_view_overlay_visible = false;
+                } else {
+                    self.running = false;
+                }
+            }
             KeyCode::Char('o') => self.toggle_observability_panel(),
             KeyCode::Right | KeyCode::Char('l') => self.next_section(),
             KeyCode::Left | KeyCode::Char('h') => self.previous_section(),
@@ -973,11 +1066,10 @@ impl App {
                     self.recorder_status = RecorderStatus::Error;
                 }
             }
-            KeyCode::Down => match (self.active_panel, self.trading_section) {
+            KeyCode::Down | KeyCode::Char('j') => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
-                (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
-                    self.select_next_open_position_row()
-                }
+                (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
+                (Panel::Trading, TradingSection::Markets) => self.select_next_open_position_row(),
                 (Panel::Trading, TradingSection::OddsMatcher) => {
                     if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
                         self.oddsmatcher_editor.select_next_field();
@@ -993,9 +1085,10 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Up => match (self.active_panel, self.trading_section) {
+            KeyCode::Up | KeyCode::Char('k') => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
-                (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
+                (Panel::Trading, TradingSection::Positions) => self.select_previous_positions_row(),
+                (Panel::Trading, TradingSection::Markets) => {
                     self.select_previous_open_position_row()
                 }
                 (Panel::Trading, TradingSection::OddsMatcher) => {
@@ -1063,14 +1156,35 @@ impl App {
     }
 
     fn clamp_selected_open_position_row(&mut self) {
-        if self.snapshot.open_positions.is_empty() {
+        let active_row_count = active_position_row_count(&self.snapshot);
+        if active_row_count == 0 {
             self.open_position_table_state.select(None);
-            return;
+        } else {
+            match self.open_position_table_state.selected() {
+                Some(index) if index < active_row_count => {}
+                _ => self.open_position_table_state.select(Some(0)),
+            }
         }
 
-        match self.open_position_table_state.selected() {
-            Some(index) if index < self.snapshot.open_positions.len() => {}
-            _ => self.open_position_table_state.select(Some(0)),
+        if self.snapshot.historical_positions.is_empty() {
+            self.historical_position_table_state.select(None);
+        } else {
+            match self.historical_position_table_state.selected() {
+                Some(index) if index < self.snapshot.historical_positions.len() => {}
+                _ => self.historical_position_table_state.select(Some(0)),
+            }
+        }
+
+        if self.positions_focus == PositionsFocus::Active && active_row_count == 0 {
+            self.positions_focus = if self.snapshot.historical_positions.is_empty() {
+                PositionsFocus::Active
+            } else {
+                PositionsFocus::Historical
+            };
+        } else if self.positions_focus == PositionsFocus::Historical
+            && self.snapshot.historical_positions.is_empty()
+        {
+            self.positions_focus = PositionsFocus::Active;
         }
     }
 
@@ -1119,13 +1233,14 @@ impl App {
     }
 
     pub fn select_next_open_position_row(&mut self) {
-        if self.snapshot.open_positions.is_empty() {
+        let active_row_count = active_position_row_count(&self.snapshot);
+        if active_row_count == 0 {
             self.open_position_table_state.select(None);
             return;
         }
 
         let next_index = match self.open_position_table_state.selected() {
-            Some(index) if index + 1 < self.snapshot.open_positions.len() => index + 1,
+            Some(index) if index + 1 < active_row_count => index + 1,
             Some(index) => index,
             None => 0,
         };
@@ -1134,7 +1249,7 @@ impl App {
     }
 
     pub fn select_previous_open_position_row(&mut self) {
-        if self.snapshot.open_positions.is_empty() {
+        if active_position_row_count(&self.snapshot) == 0 {
             self.open_position_table_state.select(None);
             return;
         }
@@ -1146,6 +1261,81 @@ impl App {
         };
 
         self.open_position_table_state.select(Some(previous_index));
+    }
+
+    pub fn select_next_positions_row(&mut self) {
+        match self.positions_focus {
+            PositionsFocus::Active => self.select_next_open_position_row(),
+            PositionsFocus::Historical => self.select_next_historical_position_row(),
+        }
+    }
+
+    pub fn select_previous_positions_row(&mut self) {
+        match self.positions_focus {
+            PositionsFocus::Active => self.select_previous_open_position_row(),
+            PositionsFocus::Historical => self.select_previous_historical_position_row(),
+        }
+    }
+
+    pub fn toggle_positions_focus(&mut self) {
+        self.positions_focus = match self.positions_focus {
+            PositionsFocus::Active if !self.snapshot.historical_positions.is_empty() => {
+                PositionsFocus::Historical
+            }
+            PositionsFocus::Historical if active_position_row_count(&self.snapshot) > 0 => {
+                PositionsFocus::Active
+            }
+            other => other,
+        };
+
+        match self.positions_focus {
+            PositionsFocus::Active => {
+                if self.open_position_table_state.selected().is_none()
+                    && active_position_row_count(&self.snapshot) > 0
+                {
+                    self.open_position_table_state.select(Some(0));
+                }
+            }
+            PositionsFocus::Historical => {
+                if self.historical_position_table_state.selected().is_none()
+                    && !self.snapshot.historical_positions.is_empty()
+                {
+                    self.historical_position_table_state.select(Some(0));
+                }
+            }
+        }
+    }
+
+    fn select_next_historical_position_row(&mut self) {
+        if self.snapshot.historical_positions.is_empty() {
+            self.historical_position_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.historical_position_table_state.selected() {
+            Some(index) if index + 1 < self.snapshot.historical_positions.len() => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.historical_position_table_state
+            .select(Some(next_index));
+    }
+
+    fn select_previous_historical_position_row(&mut self) {
+        if self.snapshot.historical_positions.is_empty() {
+            self.historical_position_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.historical_position_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.historical_position_table_state
+            .select(Some(previous_index));
     }
 
     pub fn select_next_oddsmatcher_row(&mut self) {
@@ -1253,6 +1443,9 @@ impl App {
         self.clamp_selected_exchange_row();
         self.clamp_selected_open_position_row();
         self.clamp_selected_oddsmatcher_row();
+        if active_position_row_count(&self.snapshot) == 0 {
+            self.live_view_overlay_visible = false;
+        }
     }
 
     fn load_recorder_dashboard_with_retry(&mut self) -> Result<ExchangePanelSnapshot> {
@@ -1596,11 +1789,12 @@ impl App {
     }
 
     fn refresh_oddsmatcher(&mut self) -> Result<()> {
-        let rows = oddsmatcher::fetch_best_matches(&self.oddsmatcher_client, &self.oddsmatcher_query)
-            .map_err(|error| {
-                self.status_message = format!("OddsMatcher refresh failed: {error}");
-                error
-            })?;
+        let rows =
+            oddsmatcher::fetch_best_matches(&self.oddsmatcher_client, &self.oddsmatcher_query)
+                .map_err(|error| {
+                    self.status_message = format!("OddsMatcher refresh failed: {error}");
+                    error
+                })?;
         let row_count = rows.len();
         self.replace_oddsmatcher_rows(rows, format!("Loaded {row_count} live OddsMatcher row(s)."));
         Ok(())
@@ -1611,6 +1805,10 @@ impl App {
             Panel::Trading => Panel::Observability,
             Panel::Observability => Panel::Trading,
         };
+        if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
+        {
+            self.live_view_overlay_visible = false;
+        }
     }
 }
 
@@ -1923,6 +2121,7 @@ mod tests {
             account_stats: None,
             open_positions: Vec::new(),
             historical_positions: Vec::new(),
+            ledger_pnl_summary: Default::default(),
             other_open_bets: Vec::new(),
             decisions: Vec::new(),
             watch: None,

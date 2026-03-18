@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, ObservabilitySection, Panel, TradingSection};
@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         Layout::vertical([
             Constraint::Length(6),
             Constraint::Min(10),
-            Constraint::Length(6),
+            Constraint::Length(5),
         ])
         .split(frame.area())
     };
@@ -34,20 +34,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_main(frame, shell[1], app);
 
     if !positions_owns_footer {
-        let footer = Paragraph::new(
-            std::iter::once(Line::raw(app.status_message().to_string()))
-                .chain(app.help_text().lines().map(Line::raw))
-                .collect::<Vec<_>>(),
-        )
-        .block(
-            Block::default()
-                .title("Operator Log")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color()))
-                .style(Style::default().bg(panel_background()).fg(text_color())),
-        )
-        .wrap(Wrap { trim: true });
-        frame.render_widget(footer, shell[2]);
+        render_footer(frame, shell[2], app);
     }
 }
 
@@ -61,7 +48,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 layout[0],
                 &TradingSection::ALL.map(TradingSection::label),
                 trading_index(app.active_trading_section()),
-                "Trading",
+                "󰊠 Trading",
             );
             match app.active_trading_section() {
                 TradingSection::Accounts => {
@@ -77,11 +64,17 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     let snapshot = app.snapshot().clone();
                     let status_message = app.status_message().to_string();
                     let help_text = app.help_text().to_string();
+                    let positions_focus = app.positions_focus();
+                    let show_live_view_overlay = app.live_view_overlay_visible();
+                    let (open_state, historical_state) = app.position_table_states();
                     panels::trading_positions::render(
                         frame,
                         layout[1],
                         &snapshot,
-                        app.open_position_table_state(),
+                        open_state,
+                        historical_state,
+                        positions_focus,
+                        show_live_view_overlay,
                         &status_message,
                         &help_text,
                     )
@@ -99,9 +92,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 TradingSection::Stats => {
                     panels::trading_stats::render(frame, layout[1], app.snapshot())
                 }
-                TradingSection::Calculator => {
-                    panels::calculator::render(frame, layout[1], app)
-                }
+                TradingSection::Calculator => panels::calculator::render(frame, layout[1], app),
                 TradingSection::Recorder => panels::recorder::render(frame, layout[1], app),
             }
         }
@@ -111,7 +102,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 layout[0],
                 &ObservabilitySection::ALL.map(ObservabilitySection::label),
                 observability_index(app.active_observability_section()),
-                "Observability",
+                "󰍹 Observability",
             );
             panels::observability::render(
                 frame,
@@ -121,6 +112,20 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             );
         }
     }
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("󱂬 ", Style::default().fg(accent_blue())),
+            Span::raw(app.status_message()),
+        ]),
+        Line::raw("q quit • o observability • r refresh • v live view • s start recorder • x stop recorder"),
+        Line::raw("enter edit • esc cancel • [/] cycle suggestions • u reload • D defaults"),
+    ])
+    .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, area);
 }
 
 fn render_subnav(frame: &mut Frame<'_>, area: Rect, titles: &[&str], selected: usize, title: &str) {
@@ -161,14 +166,14 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
-            Span::styled("View ", Style::default().fg(muted_text())),
+            Span::styled("󰥔 View ", Style::default().fg(muted_text())),
             Span::raw(panel_subtitle(app)),
         ]),
         Line::from(vec![
-            Span::styled("Updated ", Style::default().fg(muted_text())),
+            Span::styled("󰅐 Updated ", Style::default().fg(muted_text())),
             Span::styled(last_refresh_label(app), Style::default().fg(accent_green())),
             Span::raw("   "),
-            Span::styled("Pos ", Style::default().fg(muted_text())),
+            Span::styled("󰞇 Pos ", Style::default().fg(muted_text())),
             Span::styled(
                 app.snapshot().open_positions.len().to_string(),
                 Style::default()
@@ -176,7 +181,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("Dec ", Style::default().fg(muted_text())),
+            Span::styled("󰍵 Dec ", Style::default().fg(muted_text())),
             Span::styled(
                 app.snapshot().decisions.len().to_string(),
                 Style::default()
@@ -185,33 +190,33 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Panel ", Style::default().fg(muted_text())),
+            Span::styled("󰕮 Panel ", Style::default().fg(muted_text())),
             Span::raw(panel_cycle_label(app)),
         ]),
     ])
-    .block(shell_block("Focus", accent_blue()));
+    .block(shell_block("󰘳 Focus", accent_blue()).padding(Padding::horizontal(1)));
     frame.render_widget(focus, layout[0]);
 
     let runtime_summary = Paragraph::new(vec![
         badge_line(
-            "Worker",
+            "󰒋 Worker",
             &worker_status_label(app),
             worker_status_color(app),
         ),
         badge_line(
-            "Recorder",
+            "󰑓 Recorder",
             &format!("{:?}", app.recorder_status()),
             recorder_status_color(app.recorder_status()),
         ),
-        badge_line("Source", source_mode(app), accent_gold()),
+        badge_line("󰆼 Source", source_mode(app), accent_gold()),
     ])
-    .block(shell_block("Runtime", accent_pink()));
+    .block(shell_block("󱎆 Runtime", accent_pink()).padding(Padding::horizontal(1)));
     frame.render_widget(runtime_summary, layout[1]);
 
     let refresh = Paragraph::new(vec![
-        badge_line("Last refresh", &last_refresh_label(app), accent_green()),
+        badge_line("󰅐 Last refresh", &last_refresh_label(app), accent_green()),
         badge_line(
-            "Iteration",
+            "󰑮 Iteration",
             &runtime
                 .and_then(|summary| summary.watcher_iteration)
                 .map(|value| value.to_string())
@@ -219,7 +224,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             accent_cyan(),
         ),
         badge_line(
-            "Freshness",
+            "󰄬 Freshness",
             if runtime.map(|summary| summary.stale).unwrap_or(false) {
                 "stale"
             } else {
@@ -232,7 +237,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             },
         ),
     ])
-    .block(shell_block("Snapshot", accent_green()));
+    .block(shell_block("󰐹 Snapshot", accent_green()).padding(Padding::horizontal(1)));
     frame.render_widget(refresh, layout[2]);
 }
 
@@ -307,9 +312,13 @@ fn panel_subtitle(app: &App) -> &'static str {
             TradingSection::Accounts => "Venue state, exchange coverage, and selection context.",
             TradingSection::Positions => "Live positions, exit readiness, and watch thresholds.",
             TradingSection::Markets => "Markets and watch candidates from the current provider.",
-            TradingSection::OddsMatcher => "Live bookmaker/exchange opportunities from OddsMatcher.",
+            TradingSection::OddsMatcher => {
+                "Live bookmaker/exchange opportunities from OddsMatcher."
+            }
             TradingSection::Stats => "Trading account and performance rollups.",
-            TradingSection::Calculator => "Native matched-betting calculator and scenario analysis.",
+            TradingSection::Calculator => {
+                "Native matched-betting calculator and scenario analysis."
+            }
             TradingSection::Recorder => "Recorder controls and live capture configuration.",
         },
         Panel::Observability => "Workers, watcher freshness, and operator diagnostics.",
