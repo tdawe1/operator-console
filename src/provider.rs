@@ -1,9 +1,4 @@
-use crate::domain::{ExchangePanelSnapshot, VenueId, WatchSnapshot};
-pub use crate::transport::WorkerConfig as WatchRequest;
-
-pub trait WatchProvider {
-    fn load_watch_snapshot(&mut self, request: &WatchRequest) -> color_eyre::Result<WatchSnapshot>;
-}
+use crate::domain::{ExchangePanelSnapshot, VenueId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderRequest {

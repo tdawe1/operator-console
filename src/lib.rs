@@ -1,5 +1,4 @@
 pub mod app;
-pub mod bet_recorder_provider;
 pub mod calculator;
 pub mod domain;
 pub mod oddsmatcher;
