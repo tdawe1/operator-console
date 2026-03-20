@@ -170,6 +170,7 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             updated_at: String::from("2026-03-18T12:34:56Z"),
             source: String::from("bet-recorder"),
             refresh_kind: String::from("live_capture"),
+            worker_reconnect_count: 0,
             decision_count: 2,
             watcher_iteration: Some(42),
             stale: false,

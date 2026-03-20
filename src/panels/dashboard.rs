@@ -283,6 +283,7 @@ mod tests {
                 updated_at: String::from("2026-03-11T14:00:00Z"),
                 source: String::from("watcher-state"),
                 refresh_kind: String::from("cached"),
+                worker_reconnect_count: 0,
                 decision_count: 2,
                 watcher_iteration: Some(8),
                 stale: false,

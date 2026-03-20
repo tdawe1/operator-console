@@ -47,6 +47,10 @@ fn summary_lines(app: &App, section: ObservabilitySection) -> Vec<Line<'static>>
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or("unknown")
         )),
+        Line::raw(format!(
+            "Worker reconnects: {}",
+            app.worker_reconnect_count()
+        )),
     ]
 }
 
@@ -79,10 +83,10 @@ fn section_blocks(
             path_lines(app),
         ),
         ObservabilitySection::Logs => (
-            "Recent Status",
-            log_lines(app),
-            "Operator Notes",
-            operator_note_lines(),
+            "Recent Events",
+            recent_event_lines(app),
+            "Restart History",
+            restart_history_lines(app),
         ),
         ObservabilitySection::Health => (
             "Health Summary",
@@ -98,6 +102,7 @@ fn worker_lines(app: &App) -> Vec<Line<'static>> {
         Line::raw(format!("Name: {}", app.snapshot().worker.name)),
         Line::raw(format!("Status: {:?}", app.snapshot().worker.status)),
         Line::raw(format!("Detail: {}", app.snapshot().worker.detail)),
+        Line::raw(format!("Reconnects: {}", app.worker_reconnect_count())),
         Line::raw(format!("Status line: {}", app.snapshot().status_line)),
     ]
 }
@@ -153,6 +158,10 @@ fn watcher_lines(app: &App) -> Vec<Line<'static>> {
         Line::raw(format!(
             "Stale: {}",
             if runtime.stale { "yes" } else { "no" }
+        )),
+        Line::raw(format!(
+            "Reconnect count: {}",
+            runtime.worker_reconnect_count
         )),
         decision_preview_line(app),
     ]
@@ -256,35 +265,49 @@ fn path_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn log_lines(app: &App) -> Vec<Line<'static>> {
+fn recent_event_lines(app: &App) -> Vec<Line<'static>> {
+    let events = app.recent_events();
+    if events.is_empty() {
+        return vec![Line::raw("No operator events recorded yet.")];
+    }
+
+    events
+        .into_iter()
+        .map(|event| Line::raw(format!("- {event}")))
+        .collect()
+}
+
+fn restart_history_lines(app: &App) -> Vec<Line<'static>> {
     let mut rows = vec![
-        Line::raw(format!("UI status: {}", app.status_message())),
         Line::raw(format!(
             "Recorder lifecycle: {}",
             app.recorder_lifecycle_state()
         )),
-        Line::raw(format!("Worker detail: {}", app.snapshot().worker.detail)),
-        Line::raw(format!("Snapshot status: {}", app.snapshot().status_line)),
+        Line::raw(format!(
+            "Worker reconnect count: {}",
+            app.worker_reconnect_count()
+        )),
+        Line::raw(format!(
+            "Last successful snapshot: {}",
+            app.last_successful_snapshot_at().unwrap_or("none")
+        )),
+        Line::raw(format!(
+            "Current refresh mode: {}",
+            app.recorder_snapshot_mode()
+        )),
     ];
 
-    if let Some(runtime) = app.snapshot().runtime.as_ref() {
-        rows.push(Line::raw(format!(
-            "Runtime event: updated {} from {}",
-            runtime.updated_at, runtime.source
-        )));
-    }
     if let Some(detail) = app.last_recorder_start_failure() {
-        rows.push(Line::raw(format!("Last startup failure: {}", detail)));
+        rows.push(Line::raw(format!("Last startup failure: {detail}")));
+    } else {
+        rows.push(Line::raw("Last startup failure: <none>"));
     }
 
+    rows.push(Line::raw(format!(
+        "Current worker detail: {}",
+        app.snapshot().worker.detail
+    )));
     rows
-}
-
-fn operator_note_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::raw("This pane is currently summary-driven, not a live log tail."),
-        Line::raw("Next step: attach event history, worker restart history, and error feed."),
-    ]
 }
 
 fn health_lines(app: &App) -> Vec<Line<'static>> {
@@ -378,8 +401,17 @@ fn health_text(app: &App) -> Vec<String> {
 }
 
 #[cfg(test)]
+fn log_text(app: &App) -> Vec<String> {
+    recent_event_lines(app)
+        .into_iter()
+        .chain(restart_history_lines(app))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
-    use super::health_text;
+    use super::{health_text, log_text};
     use crate::app::App;
     use crate::domain::{ExchangePanelSnapshot, RuntimeSummary, WorkerStatus, WorkerSummary};
     use crate::provider::{ExchangeProvider, ProviderRequest};
@@ -399,6 +431,7 @@ mod tests {
                     updated_at: String::from("2026-03-11T15:00:00Z"),
                     source: String::from("watcher-state"),
                     refresh_kind: String::from("cached"),
+                    worker_reconnect_count: 2,
                     decision_count: 4,
                     watcher_iteration: Some(14),
                     stale: true,
@@ -426,5 +459,21 @@ mod tests {
         assert!(text
             .iter()
             .any(|line| line.contains("Investigate worker failure")));
+    }
+
+    #[test]
+    fn logs_section_mentions_recent_events_and_restart_history() {
+        let app = App::from_provider(FixedProvider).expect("fixed provider should initialize");
+        let text = log_text(&app);
+
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Loaded initial dashboard from watcher-state.")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Worker reconnect count: 2")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Last successful snapshot: 2026-03-11T15:00:00Z")));
     }
 }

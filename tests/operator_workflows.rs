@@ -166,6 +166,7 @@ fn workflow_snapshot(
             updated_at: String::from("2026-03-20T11:30:00Z"),
             source: String::from("bet-recorder"),
             refresh_kind: String::from(refresh_kind),
+            worker_reconnect_count: 0,
             decision_count: 1,
             watcher_iteration: Some(12),
             stale: false,

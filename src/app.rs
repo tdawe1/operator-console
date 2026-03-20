@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -398,10 +399,13 @@ pub struct App {
     last_recorder_refresh_at: Option<Instant>,
     last_successful_snapshot_at: Option<String>,
     last_recorder_start_failure: Option<String>,
+    event_history: VecDeque<String>,
     running: bool,
     status_message: String,
     status_scroll: u16,
 }
+
+const MAX_EVENT_HISTORY: usize = 25;
 
 impl Default for App {
     fn default() -> Self {
@@ -555,7 +559,7 @@ impl App {
             PositionsFocus::Active
         };
 
-        Ok(Self {
+        let mut app = Self {
             provider,
             make_stub_provider,
             make_recorder_provider,
@@ -595,10 +599,21 @@ impl App {
             last_recorder_refresh_at: None,
             last_successful_snapshot_at,
             last_recorder_start_failure: None,
+            event_history: VecDeque::with_capacity(MAX_EVENT_HISTORY),
             running: true,
             status_message,
             status_scroll: 0,
-        })
+        };
+        app.record_event(format!(
+            "Loaded initial dashboard from {}.",
+            app.snapshot
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.source.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("snapshot")
+        ));
+        Ok(app)
     }
 
     pub fn snapshot(&self) -> &ExchangePanelSnapshot {
@@ -870,6 +885,22 @@ impl App {
         self.last_recorder_start_failure.as_deref()
     }
 
+    pub fn recent_events(&self) -> Vec<&str> {
+        self.event_history
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .collect()
+    }
+
+    pub fn worker_reconnect_count(&self) -> usize {
+        self.snapshot
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.worker_reconnect_count)
+            .unwrap_or(0)
+    }
+
     pub fn recorder_config_path(&self) -> &Path {
         &self.recorder_config_path
     }
@@ -1066,7 +1097,12 @@ impl App {
         {
             return self.refresh_horse_matcher();
         }
-        self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed")
+        self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed")?;
+        self.record_event(format!(
+            "Manual cached refresh completed for {}.",
+            self.selected_venue_label()
+        ));
+        Ok(())
     }
 
     pub fn refresh_live(&mut self) -> Result<()> {
@@ -1080,7 +1116,12 @@ impl App {
         {
             return self.refresh_horse_matcher();
         }
-        self.refresh_provider_snapshot(ProviderRequest::RefreshLive, "Live refresh failed")
+        self.refresh_provider_snapshot(ProviderRequest::RefreshLive, "Live refresh failed")?;
+        self.record_event(format!(
+            "Manual live refresh completed for {}.",
+            self.selected_venue_label()
+        ));
+        Ok(())
     }
 
     pub fn replace_oddsmatcher_rows(&mut self, rows: Vec<OddsMatcherRow>, status_message: String) {
@@ -1171,23 +1212,30 @@ impl App {
     }
 
     pub fn start_recorder(&mut self) -> Result<()> {
+        self.record_event("Recorder start requested.");
         self.persist_recorder_config()?;
         self.recorder_supervisor.start(&self.recorder_config)?;
         self.recorder_status = self.recorder_supervisor.poll_status();
         self.last_recorder_start_failure = None;
         self.provider = (self.make_recorder_provider)(&self.recorder_config);
         self.exchange_list_state.select(None);
+        self.record_event("Recorder process started.");
         match self.provider.handle(ProviderRequest::LoadDashboard) {
             Ok(snapshot) => {
                 self.replace_snapshot(snapshot);
                 self.last_recorder_refresh_at = Some(Instant::now());
                 self.status_message = self.snapshot.status_line.clone();
+                self.record_event(format!(
+                    "Recorder dashboard loaded with {} refresh.",
+                    self.recorder_snapshot_mode()
+                ));
             }
             Err(error) => {
                 self.last_recorder_refresh_at = None;
                 self.status_message =
                     format!("Recorder started; waiting for first snapshot. {}", error);
                 self.status_scroll = 0;
+                self.record_event("Recorder started; waiting for first snapshot.");
             }
         }
         self.active_panel = Panel::Trading;
@@ -1203,6 +1251,7 @@ impl App {
     }
 
     pub fn stop_recorder(&mut self) -> Result<()> {
+        self.record_event("Recorder stop requested.");
         self.recorder_supervisor.stop()?;
         self.recorder_status = RecorderStatus::Disabled;
         self.last_recorder_refresh_at = None;
@@ -1210,6 +1259,7 @@ impl App {
         self.provider = (self.make_stub_provider)();
         let snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
         self.replace_snapshot(snapshot);
+        self.record_event("Recorder stopped; restored stub dashboard.");
         Ok(())
     }
 
@@ -1705,12 +1755,14 @@ impl App {
                     self.status_message = format!("Recorder start failed: {error}");
                     self.recorder_status = RecorderStatus::Error;
                     self.last_recorder_start_failure = Some(error.to_string());
+                    self.record_event(format!("Recorder start failed: {error}"));
                 }
             }
             KeyCode::Char('x') => {
                 if let Err(error) = self.stop_recorder() {
                     self.status_message = format!("Recorder stop failed: {error}");
                     self.recorder_status = RecorderStatus::Error;
+                    self.record_event(format!("Recorder stop failed: {error}"));
                 }
             }
             KeyCode::PageDown => {
@@ -2133,8 +2185,8 @@ impl App {
 
         match self.provider.handle(ProviderRequest::SelectVenue(venue.id)) {
             Ok(snapshot) => {
-                self.snapshot = snapshot;
-                self.status_message = self.snapshot.status_line.clone();
+                self.replace_snapshot(snapshot);
+                self.record_event(format!("Selected venue {}.", self.selected_venue_label()));
             }
             Err(error) => {
                 self.record_provider_error("Venue sync failed", &error.to_string(), Some(venue.id));
@@ -2152,7 +2204,11 @@ impl App {
     fn poll_recorder(&mut self) {
         let next_status = self.recorder_supervisor.poll_status();
         if next_status != self.recorder_status {
+            let previous_status = self.recorder_status.clone();
             self.recorder_status = next_status.clone();
+            self.record_event(format!(
+                "Recorder status changed from {previous_status:?} to {next_status:?}."
+            ));
             if matches!(next_status, RecorderStatus::Stopped | RecorderStatus::Error) {
                 self.status_message = format!("Recorder status changed to {next_status:?}.");
                 self.status_scroll = 0;
@@ -2179,6 +2235,7 @@ impl App {
         self.snapshot.status_line = message.clone();
         self.snapshot.worker.status = crate::domain::WorkerStatus::Error;
         self.snapshot.worker.detail = message.clone();
+        self.record_event(message.clone());
 
         if let Some(venue_id) = selected_venue {
             if let Some(venue) = self
@@ -2194,9 +2251,20 @@ impl App {
     }
 
     fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
+        let had_successful_snapshot = self.last_successful_snapshot_at.is_some();
+        let previous_reconnect_count = self.worker_reconnect_count();
         self.snapshot = snapshot;
         if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
             self.last_successful_snapshot_at = Some(updated_at.to_string());
+        }
+        let reconnect_count = self.worker_reconnect_count();
+        if reconnect_count > previous_reconnect_count {
+            self.record_event(format!(
+                "Worker session recovered; reconnect count is now {reconnect_count}."
+            ));
+        }
+        if !had_successful_snapshot && self.last_successful_snapshot_at.is_some() {
+            self.record_event("Received first successful recorder snapshot.");
         }
         self.status_message = self.snapshot.status_line.clone();
         self.status_scroll = 0;
@@ -2223,6 +2291,27 @@ impl App {
                 .to_ascii_lowercase()
                 .contains("waiting for first snapshot")
                 || self.snapshot.worker.status == WorkerStatus::Busy)
+    }
+
+    fn record_event(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self
+            .event_history
+            .back()
+            .is_some_and(|last| last == &message)
+        {
+            return;
+        }
+        if self.event_history.len() == MAX_EVENT_HISTORY {
+            self.event_history.pop_front();
+        }
+        self.event_history.push_back(message);
+    }
+
+    fn selected_venue_label(&self) -> String {
+        self.selected_venue()
+            .map(|venue| venue.as_str().to_string())
+            .unwrap_or_else(|| String::from("current venue"))
     }
 
     fn scroll_status_down(&mut self, lines: u16) {
@@ -2312,8 +2401,10 @@ impl App {
 
     fn apply_recorder_change(&mut self, message: &str) -> Result<()> {
         self.persist_recorder_config()?;
+        self.record_event(message.to_string());
 
         if self.recorder_status == RecorderStatus::Running {
+            self.record_event("Restarting recorder to apply config change.");
             self.recorder_supervisor.stop()?;
             self.recorder_supervisor.start(&self.recorder_config)?;
             self.recorder_status = self.recorder_supervisor.poll_status();
@@ -2326,6 +2417,7 @@ impl App {
                     self.status_message =
                         format!("{message} Restarted recorder to apply the change.");
                     self.status_scroll = 0;
+                    self.record_event("Recorder restart completed after config change.");
                 }
                 Err(error) => {
                     self.last_recorder_refresh_at = None;
@@ -2333,6 +2425,9 @@ impl App {
                         "{message} Restarted recorder to apply the change; waiting for next snapshot. {error}"
                     );
                     self.status_scroll = 0;
+                    self.record_event(
+                        "Recorder restarted after config change; waiting for next snapshot.",
+                    );
                 }
             }
             return Ok(());
@@ -2987,9 +3082,10 @@ mod tests {
     };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
+    use crate::stub_provider::StubExchangeProvider;
     use crossterm::event::KeyCode;
 
-    use super::{App, Panel, TradingSection};
+    use super::{App, Panel, TradingSection, MAX_EVENT_HISTORY};
 
     struct RefreshingProvider {
         cached_refresh_count: Rc<RefCell<usize>>,
@@ -3407,6 +3503,102 @@ mod tests {
             .last_recorder_start_failure()
             .is_some_and(|detail| detail.contains("watcher binary missing")));
         assert!(app.status_message().contains("Recorder start failed"));
+        assert!(app
+            .recent_events()
+            .iter()
+            .any(|event| event.contains("Recorder start failed: watcher binary missing")));
+    }
+
+    #[test]
+    fn record_event_deduplicates_and_trims_history() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.event_history.clear();
+
+        app.record_event("duplicate event");
+        app.record_event("duplicate event");
+        for index in 0..MAX_EVENT_HISTORY {
+            app.record_event(format!("event {index}"));
+        }
+
+        assert_eq!(app.event_history.len(), MAX_EVENT_HISTORY);
+        assert_eq!(
+            app.event_history.front().map(String::as_str),
+            Some("event 0")
+        );
+        assert_eq!(
+            app.event_history.back().map(String::as_str),
+            Some("event 24")
+        );
+    }
+
+    #[test]
+    fn refresh_logs_worker_reconnect_recovery_event() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: sample_runtime_snapshot(
+                    "Initial dashboard",
+                    "2026-03-19T10:00:00Z",
+                    false,
+                    "cached",
+                ),
+                cached_refresh_snapshot: {
+                    let mut snapshot = sample_runtime_snapshot(
+                        "Recovered dashboard",
+                        "2026-03-19T10:00:01Z",
+                        false,
+                        "cached",
+                    );
+                    snapshot
+                        .runtime
+                        .as_mut()
+                        .expect("runtime")
+                        .worker_reconnect_count = 2;
+                    snapshot
+                },
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.refresh().expect("refresh should succeed");
+
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert!(app
+            .recent_events()
+            .iter()
+            .any(|event| event.contains("Worker session recovered; reconnect count is now 2.")));
+        assert!(app
+            .recent_events()
+            .iter()
+            .any(|event| event.contains("Manual cached refresh completed for smarkets.")));
     }
 
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
@@ -3455,6 +3647,7 @@ mod tests {
             updated_at: String::from(updated_at),
             source: String::from("watcher-state"),
             refresh_kind: String::from(refresh_kind),
+            worker_reconnect_count: 0,
             decision_count: 1,
             watcher_iteration: Some(4),
             stale,

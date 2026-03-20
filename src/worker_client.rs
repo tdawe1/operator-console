@@ -26,6 +26,10 @@ impl WorkerSessionError {
 
 pub trait WorkerClient {
     fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse>;
+
+    fn session_reconnect_count(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,13 +75,18 @@ impl<C: WorkerClient> ExchangeProvider for WorkerClientExchangeProvider<C> {
             }
         };
 
-        Ok(self.client.send(worker_request)?.snapshot)
+        let mut snapshot = self.client.send(worker_request)?.snapshot;
+        if let Some(runtime) = snapshot.runtime.as_mut() {
+            runtime.worker_reconnect_count = self.client.session_reconnect_count();
+        }
+        Ok(snapshot)
     }
 }
 
 pub struct BetRecorderWorkerClient {
     command: BetRecorderCommand,
     bootstrap_config: Option<WorkerConfig>,
+    reconnect_count: usize,
     session: Option<WorkerSession>,
 }
 
@@ -89,6 +98,7 @@ impl BetRecorderWorkerClient {
                 bet_recorder_root,
             },
             bootstrap_config: None,
+            reconnect_count: 0,
             session: None,
         }
     }
@@ -97,6 +107,7 @@ impl BetRecorderWorkerClient {
         Self {
             command: BetRecorderCommand::Direct { executable },
             bootstrap_config: None,
+            reconnect_count: 0,
             session: None,
         }
     }
@@ -166,6 +177,10 @@ impl WorkerClient for BetRecorderWorkerClient {
                 }
             }
         }
+    }
+
+    fn session_reconnect_count(&self) -> usize {
+        self.reconnect_count
     }
 }
 
@@ -243,6 +258,7 @@ impl BetRecorderWorkerClient {
             .send_once(&bootstrap_request)
             .map_err(WorkerSessionError::into_report)
             .wrap_err("failed to replay worker bootstrap after reconnect")?;
+        self.reconnect_count += 1;
         self.send_once(request)
             .map_err(WorkerSessionError::into_report)
     }

@@ -1,10 +1,83 @@
 use std::fs;
 use std::path::PathBuf;
 
+use operator_console::domain::{
+    ExchangePanelSnapshot, RuntimeSummary, WorkerStatus, WorkerSummary,
+};
+use operator_console::provider::ExchangeProvider;
 use operator_console::transport::WorkerConfig;
-use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClient, WorkerRequest};
+use operator_console::worker_client::{
+    BetRecorderWorkerClient, WorkerClient, WorkerClientExchangeProvider, WorkerRequest,
+    WorkerResponse,
+};
 use serde_json::Value;
 use tempfile::tempdir;
+
+struct CountingClient {
+    reconnect_count: usize,
+}
+
+impl WorkerClient for CountingClient {
+    fn send(&mut self, _request: WorkerRequest) -> color_eyre::Result<WorkerResponse> {
+        Ok(WorkerResponse {
+            snapshot: ExchangePanelSnapshot {
+                worker: WorkerSummary {
+                    name: String::from("stub-worker"),
+                    status: WorkerStatus::Ready,
+                    detail: String::from("ok"),
+                },
+                runtime: Some(RuntimeSummary {
+                    updated_at: String::from("2026-03-20T12:00:00Z"),
+                    source: String::from("bet-recorder"),
+                    refresh_kind: String::from("cached"),
+                    worker_reconnect_count: 0,
+                    decision_count: 0,
+                    watcher_iteration: Some(1),
+                    stale: false,
+                }),
+                ..ExchangePanelSnapshot::default()
+            },
+            request_error: None,
+        })
+    }
+
+    fn session_reconnect_count(&self) -> usize {
+        self.reconnect_count
+    }
+}
+
+#[test]
+fn worker_exchange_provider_stamps_runtime_with_client_reconnect_count() {
+    let mut provider = WorkerClientExchangeProvider::new(
+        CountingClient { reconnect_count: 3 },
+        WorkerConfig {
+            positions_payload_path: None,
+            run_dir: None,
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: None,
+            agent_browser_session: None,
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
+        },
+    );
+
+    let snapshot = provider
+        .handle(operator_console::provider::ProviderRequest::LoadDashboard)
+        .expect("provider response");
+
+    assert_eq!(
+        snapshot
+            .runtime
+            .as_ref()
+            .expect("runtime should be present")
+            .worker_reconnect_count,
+        3
+    );
+}
 
 #[test]
 fn worker_client_reuses_one_process_for_multiple_requests() {
