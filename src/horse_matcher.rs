@@ -89,9 +89,19 @@ pub fn load_query_or_default(path: &Path) -> Result<(HorseMatcherQuery, String)>
 
     let content = fs::read_to_string(path)?;
     let query = serde_json::from_str::<HorseMatcherQuery>(&content)?;
+    let (query, repaired_fields) = normalize_loaded_query(query);
+    let repair_note = if repaired_fields.is_empty() {
+        String::new()
+    } else {
+        format!(" Repaired {}.", repaired_fields.join(", "))
+    };
     Ok((
         query,
-        format!("Loaded Horse Matcher config from {}.", path.display()),
+        format!(
+            "Loaded Horse Matcher config from {}.{}",
+            path.display(),
+            repair_note
+        ),
     ))
 }
 
@@ -416,6 +426,49 @@ fn lower_set(values: &[String]) -> Vec<String> {
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+fn normalize_loaded_query(mut query: HorseMatcherQuery) -> (HorseMatcherQuery, Vec<&'static str>) {
+    let defaults = HorseMatcherQuery::default();
+    let mut repaired_fields = Vec::new();
+
+    if query.rating_type.trim().is_empty() {
+        query.rating_type = defaults.rating_type;
+        repaired_fields.push("rating type");
+    } else {
+        query.rating_type = query.rating_type.trim().to_string();
+    }
+    if query.limit == 0 {
+        query.limit = defaults.limit;
+        repaired_fields.push("limit");
+    }
+
+    normalize_query_lists(&mut query.bookmakers);
+    normalize_query_lists(&mut query.exchanges);
+    normalize_query_lists(&mut query.search);
+    normalize_query_lists(&mut query.offers);
+    normalize_query_lists(&mut query.offer_types);
+    normalize_optional_query_string(&mut query.min_rating);
+    normalize_optional_query_string(&mut query.min_odds);
+    normalize_optional_query_string(&mut query.date_from);
+    normalize_optional_query_string(&mut query.date_to);
+
+    (query, repaired_fields)
+}
+
+fn normalize_query_lists(values: &mut Vec<String>) {
+    *values = values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+}
+
+fn normalize_optional_query_string(value: &mut Option<String>) {
+    *value = value
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 }
 
 fn normalize_key(value: &str) -> String {
@@ -799,6 +852,39 @@ mod tests {
             ]
         );
         assert_eq!(query.limit, 50);
+    }
+
+    #[test]
+    fn horse_matcher_load_repairs_blank_required_fields() {
+        let temp_dir = tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("horsematcher.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "mode": "races_per_offer",
+              "bookmakers": ["betfred", ""],
+              "exchanges": ["smarkets"],
+              "rating_type": "",
+              "min_rating": "",
+              "min_odds": "2.0",
+              "search": [""],
+              "limit": 0,
+              "date_from": "",
+              "date_to": null,
+              "offers": [""],
+              "offer_types": []
+            }"#,
+        )
+        .expect("write query");
+
+        let (loaded, note) = load_query_or_default(&config_path).expect("load query");
+
+        assert_eq!(loaded.rating_type, "rating");
+        assert_eq!(loaded.min_rating, None);
+        assert_eq!(loaded.limit, HorseMatcherQuery::default().limit);
+        assert_eq!(loaded.bookmakers, vec![String::from("betfred")]);
+        assert!(loaded.search.is_empty());
+        assert!(note.contains("Repaired rating type"));
     }
 
     #[test]

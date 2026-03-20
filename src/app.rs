@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -12,7 +12,9 @@ use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
 
 use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
-use crate::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus};
+use crate::domain::{
+    ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId, WorkerStatus,
+};
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
@@ -528,7 +530,7 @@ impl App {
         oddsmatcher_query_path: PathBuf,
         horse_matcher_query_path: PathBuf,
     ) -> Result<Self> {
-        let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
+        let snapshot = normalize_snapshot(provider.handle(ProviderRequest::LoadDashboard)?);
         let last_successful_snapshot_at = runtime_updated_at(&snapshot).map(str::to_string);
         let status_message = snapshot.status_line.clone();
         let (oddsmatcher_query, oddsmatcher_query_note) =
@@ -570,7 +572,13 @@ impl App {
             recorder_editor: RecorderEditorState::default(),
             recorder_status: RecorderStatus::Disabled,
             calculator: CalculatorState::default(),
-            oddsmatcher_client: Client::new(),
+            oddsmatcher_client: oddsmatcher::build_client().unwrap_or_else(|_| {
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(12))
+                    .build()
+                    .unwrap_or_else(|_| Client::new())
+            }),
             oddsmatcher_query_path,
             oddsmatcher_query_note,
             oddsmatcher_query,
@@ -2254,7 +2262,7 @@ impl App {
         let had_successful_snapshot = self.last_successful_snapshot_at.is_some();
         let previous_reconnect_count = self.worker_reconnect_count();
         let previous_decision_counts = decision_status_counts(&self.snapshot);
-        self.snapshot = snapshot;
+        self.snapshot = normalize_snapshot(snapshot);
         if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
             self.last_successful_snapshot_at = Some(updated_at.to_string());
         }
@@ -3010,6 +3018,186 @@ impl App {
     }
 }
 
+fn normalize_snapshot(mut snapshot: ExchangePanelSnapshot) -> ExchangePanelSnapshot {
+    snapshot.historical_positions = merge_historical_positions(&snapshot);
+    snapshot
+}
+
+fn merge_historical_positions(snapshot: &ExchangePanelSnapshot) -> Vec<OpenPositionRow> {
+    let mut rows = snapshot.historical_positions.clone();
+    let mut seen = rows
+        .iter()
+        .map(historical_position_key)
+        .collect::<HashSet<_>>();
+
+    for tracked_bet in snapshot
+        .tracked_bets
+        .iter()
+        .filter(|tracked_bet| tracked_bet_is_closed(tracked_bet))
+    {
+        let row = historical_position_from_tracked_bet(tracked_bet);
+        let row_key = historical_position_key(&row);
+        if seen.insert(row_key) {
+            rows.push(row);
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        (right.live_clock.as_str(), right.event.as_str())
+            .cmp(&(left.live_clock.as_str(), left.event.as_str()))
+    });
+    rows
+}
+
+fn historical_position_key(row: &OpenPositionRow) -> String {
+    format!(
+        "{}|{}|{}|{}|{:.2}|{:.2}|{:.2}",
+        canonical_history_text(&row.event),
+        canonical_history_text(&row.market),
+        canonical_history_text(&row.contract),
+        row.live_clock.trim(),
+        row.stake,
+        row.price,
+        row.pnl_amount
+    )
+}
+
+fn canonical_history_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn tracked_bet_is_closed(tracked_bet: &TrackedBetRow) -> bool {
+    if !tracked_bet.settled_at.trim().is_empty() {
+        return true;
+    }
+
+    matches!(
+        tracked_bet.status.trim().to_ascii_lowercase().as_str(),
+        "settled" | "closed" | "cashedout" | "void" | "lost" | "won"
+    )
+}
+
+fn historical_position_from_tracked_bet(tracked_bet: &TrackedBetRow) -> OpenPositionRow {
+    let price = tracked_bet
+        .back_price
+        .or(tracked_bet.lay_price)
+        .or_else(|| tracked_bet.legs.first().map(|leg| leg.odds))
+        .unwrap_or(0.0);
+    let stake = tracked_bet
+        .stake_gbp
+        .or_else(|| {
+            tracked_bet
+                .legs
+                .iter()
+                .find(|leg| is_back_leg(leg))
+                .map(|leg| leg.stake)
+        })
+        .or_else(|| tracked_bet.legs.first().map(|leg| leg.stake))
+        .unwrap_or(0.0);
+    let liability = tracked_bet_liability(tracked_bet).unwrap_or(stake);
+    let pnl_amount = tracked_bet
+        .realised_pnl_gbp
+        .or_else(|| {
+            tracked_bet
+                .payout_gbp
+                .map(|payout| payout - tracked_bet.stake_gbp.unwrap_or(stake))
+        })
+        .unwrap_or(0.0);
+    let current_value = tracked_bet
+        .payout_gbp
+        .unwrap_or_else(|| (stake + pnl_amount).max(0.0));
+
+    OpenPositionRow {
+        event: tracked_bet.event.clone(),
+        event_status: String::from("Settled"),
+        event_url: String::new(),
+        contract: tracked_bet.selection.clone(),
+        market: tracked_bet.market.clone(),
+        status: if tracked_bet.status.trim().is_empty() {
+            String::from("settled")
+        } else {
+            tracked_bet.status.clone()
+        },
+        market_status: String::from("settled"),
+        is_in_play: false,
+        price,
+        stake,
+        liability,
+        current_value,
+        pnl_amount,
+        current_back_odds: if price > 0.0 { Some(price) } else { None },
+        current_implied_probability: if price > 0.0 { Some(1.0 / price) } else { None },
+        current_implied_percentage: if price > 0.0 {
+            Some(100.0 / price)
+        } else {
+            None
+        },
+        current_buy_odds: if price > 0.0 { Some(price) } else { None },
+        current_buy_implied_probability: if price > 0.0 { Some(1.0 / price) } else { None },
+        current_sell_odds: None,
+        current_sell_implied_probability: None,
+        current_score: String::new(),
+        current_score_home: None,
+        current_score_away: None,
+        live_clock: tracked_bet
+            .settled_at
+            .trim()
+            .to_string()
+            .if_empty_then(|| tracked_bet.placed_at.clone()),
+        can_trade_out: false,
+    }
+}
+
+fn tracked_bet_liability(tracked_bet: &TrackedBetRow) -> Option<f64> {
+    let total = tracked_bet
+        .legs
+        .iter()
+        .map(tracked_leg_liability)
+        .sum::<f64>();
+    if total > 0.0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn tracked_leg_liability(leg: &TrackedLeg) -> f64 {
+    if let Some(liability) = leg.liability {
+        return liability.abs();
+    }
+    if is_back_leg(leg) {
+        return leg.stake;
+    }
+    let implied_liability = leg.stake * (leg.odds - 1.0);
+    if implied_liability.is_sign_negative() {
+        0.0
+    } else {
+        implied_liability
+    }
+}
+
+fn is_back_leg(leg: &TrackedLeg) -> bool {
+    leg.side.trim().eq_ignore_ascii_case("back")
+}
+
+trait StringFallbackExt {
+    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String;
+}
+
+impl StringFallbackExt for String {
+    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String {
+        if self.is_empty() {
+            fallback()
+        } else {
+            self
+        }
+    }
+}
+
 fn runtime_updated_at(snapshot: &ExchangePanelSnapshot) -> Option<&str> {
     snapshot
         .runtime
@@ -3104,8 +3292,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::domain::{
-        ExchangePanelSnapshot, RuntimeSummary, VenueId, VenueStatus, VenueSummary, WorkerStatus,
-        WorkerSummary,
+        ExchangePanelSnapshot, RuntimeSummary, TrackedBetRow, VenueId, VenueStatus, VenueSummary,
+        WorkerStatus, WorkerSummary,
     };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
@@ -3626,6 +3814,108 @@ mod tests {
             .recent_events()
             .iter()
             .any(|event| event.contains("Manual cached refresh completed for smarkets.")));
+    }
+
+    #[test]
+    fn initial_snapshot_merges_closed_tracked_bets_into_historical_positions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = sample_snapshot("Initial dashboard");
+        snapshot.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            group_id: String::from("group-1"),
+            event: String::from("Arsenal vs Spurs"),
+            market: String::from("Match Odds"),
+            selection: String::from("Draw"),
+            status: String::from("settled"),
+            placed_at: String::from("2026-03-19T19:00:00Z"),
+            settled_at: String::from("2026-03-19T21:55:00Z"),
+            stake_gbp: Some(10.0),
+            realised_pnl_gbp: Some(4.5),
+            back_price: Some(3.2),
+            ..TrackedBetRow::default()
+        }];
+        let app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: snapshot,
+                cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        assert_eq!(app.snapshot().historical_positions.len(), 1);
+        assert_eq!(
+            app.snapshot().historical_positions[0].event,
+            "Arsenal vs Spurs"
+        );
+        assert_eq!(app.snapshot().historical_positions[0].contract, "Draw");
+        assert_eq!(
+            app.snapshot().historical_positions[0].live_clock,
+            "2026-03-19T21:55:00Z"
+        );
+    }
+
+    #[test]
+    fn refresh_merges_newly_closed_tracked_bets_into_historical_positions() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut refreshed_snapshot = sample_snapshot("Refreshed dashboard");
+        refreshed_snapshot.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-2"),
+            group_id: String::from("group-2"),
+            event: String::from("Chelsea vs Liverpool"),
+            market: String::from("Both Teams To Score"),
+            selection: String::from("Yes"),
+            status: String::from("won"),
+            placed_at: String::from("2026-03-20T14:00:00Z"),
+            settled_at: String::from("2026-03-20T15:57:00Z"),
+            stake_gbp: Some(12.0),
+            realised_pnl_gbp: Some(9.6),
+            back_price: Some(1.8),
+            ..TrackedBetRow::default()
+        }];
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: refreshed_snapshot,
+                live_refresh_snapshot: sample_snapshot("Live dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        assert!(app.snapshot().historical_positions.is_empty());
+
+        app.refresh().expect("refresh should succeed");
+
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(app.snapshot().historical_positions.len(), 1);
+        assert_eq!(
+            app.snapshot().historical_positions[0].event,
+            "Chelsea vs Liverpool"
+        );
+        assert_eq!(app.snapshot().historical_positions[0].contract, "Yes");
+        assert_eq!(
+            app.snapshot().historical_positions[0].live_clock,
+            "2026-03-20T15:57:00Z"
+        );
     }
 
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

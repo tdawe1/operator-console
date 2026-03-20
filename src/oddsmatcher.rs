@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Context, Result};
 use reqwest::blocking::Client;
@@ -179,9 +180,19 @@ pub fn load_query_or_default(path: &Path) -> Result<(GetBestMatchesVariables, St
 
     let content = fs::read_to_string(path)?;
     let query = serde_json::from_str::<GetBestMatchesVariables>(&content)?;
+    let (query, repaired_fields) = normalize_loaded_query(query);
+    let repair_note = if repaired_fields.is_empty() {
+        String::new()
+    } else {
+        format!(" Repaired {}.", repaired_fields.join(", "))
+    };
     Ok((
         query,
-        format!("Loaded OddsMatcher config from {}.", path.display()),
+        format!(
+            "Loaded OddsMatcher config from {}.{}",
+            path.display(),
+            repair_note
+        ),
     ))
 }
 
@@ -632,6 +643,66 @@ fn decode_best_matches_response(status: StatusCode, body: &str) -> Result<Vec<Od
     Ok(rows)
 }
 
+pub fn build_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .wrap_err("failed to build OddsMatcher HTTP client")
+}
+
+fn normalize_loaded_query(
+    mut query: GetBestMatchesVariables,
+) -> (GetBestMatchesVariables, Vec<&'static str>) {
+    let defaults = GetBestMatchesVariables::default();
+    let mut repaired_fields = Vec::new();
+
+    if query.rating_type.trim().is_empty() {
+        query.rating_type = defaults.rating_type;
+        repaired_fields.push("rating type");
+    } else {
+        query.rating_type = query.rating_type.trim().to_string();
+    }
+    if query.limit == 0 {
+        query.limit = defaults.limit;
+        repaired_fields.push("limit");
+    }
+    if query.updated_within_seconds == 0 {
+        query.updated_within_seconds = defaults.updated_within_seconds;
+        repaired_fields.push("updated window");
+    }
+
+    normalize_query_lists(&mut query.bookmaker);
+    normalize_query_lists(&mut query.exchange);
+    normalize_query_lists(&mut query.permitted_sports);
+    normalize_query_lists(&mut query.permitted_market_groups);
+    normalize_query_lists(&mut query.permitted_event_groups);
+    normalize_query_lists(&mut query.permitted_countries);
+    normalize_query_lists(&mut query.permitted_event_ids);
+    normalize_optional_query_string(&mut query.min_rating);
+    normalize_optional_query_string(&mut query.max_rating);
+    normalize_optional_query_string(&mut query.min_odds);
+    normalize_optional_query_string(&mut query.max_odds);
+    normalize_optional_query_string(&mut query.min_liquidity);
+
+    (query, repaired_fields)
+}
+
+fn normalize_query_lists(values: &mut Vec<String>) {
+    *values = values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+}
+
+fn normalize_optional_query_string(value: &mut Option<String>) {
+    *value = value
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+}
+
 fn truncate_for_error(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         value.to_string()
@@ -644,8 +715,8 @@ fn truncate_for_error(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_best_matches_response, fetch_best_matches, load_query_or_default, save_query,
-        GetBestMatchesData, GetBestMatchesVariables, GraphQlRequest, GraphQlResponse,
+        build_client, decode_best_matches_response, fetch_best_matches, load_query_or_default,
+        save_query, GetBestMatchesData, GetBestMatchesVariables, GraphQlRequest, GraphQlResponse,
         OddsMatcherField, OddsMatcherRow,
     };
     use reqwest::StatusCode;
@@ -977,7 +1048,7 @@ mod tests {
 
     #[test]
     fn fetch_best_matches_surface_is_linkable_for_live_use() {
-        let client = reqwest::blocking::Client::new();
+        let client = build_client().expect("client");
         let function_ptr: fn(
             &reqwest::blocking::Client,
             &GetBestMatchesVariables,
@@ -1041,6 +1112,46 @@ mod tests {
         assert_eq!(query.min_liquidity, None);
         assert_eq!(query.limit, 25);
         assert!(query.exclude_draw);
+    }
+
+    #[test]
+    fn oddsmatcher_load_repairs_blank_required_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("oddsmatcher.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+              "bookmaker": ["betuk"],
+              "exchange": ["smarketsexchange"],
+              "ratingType": "",
+              "minRating": "",
+              "maxRating": null,
+              "minOdds": null,
+              "maxOdds": null,
+              "minLiquidity": "30",
+              "limit": 0,
+              "skip": 0,
+              "updatedWithinSeconds": 0,
+              "excludeDraw": false,
+              "permittedSports": ["soccer"],
+              "permittedMarketGroups": [],
+              "permittedEventGroups": [],
+              "permittedCountries": [],
+              "permittedEventIds": []
+            }"#,
+        )
+        .expect("write config");
+
+        let (loaded, note) = load_query_or_default(&config_path).expect("load config");
+
+        assert_eq!(loaded.rating_type, "rating");
+        assert_eq!(loaded.min_rating, None);
+        assert_eq!(loaded.limit, GetBestMatchesVariables::default().limit);
+        assert_eq!(
+            loaded.updated_within_seconds,
+            GetBestMatchesVariables::default().updated_within_seconds
+        );
+        assert!(note.contains("Repaired rating type"));
     }
 }
 
