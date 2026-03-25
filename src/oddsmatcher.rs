@@ -137,7 +137,10 @@ impl Default for GetBestMatchesVariables {
     fn default() -> Self {
         Self {
             bookmaker: vec![String::from("betvictor")],
-            exchange: vec![String::from("smarketsexchange")],
+            exchange: vec![
+                String::from("smarketsexchange"),
+                String::from("matchbookexchange"),
+            ],
             rating_type: String::from("rating"),
             min_rating: None,
             max_rating: Some(String::from("99")),
@@ -345,7 +348,12 @@ impl OddsMatcherField {
                 String::from("bet600"),
                 String::from("bet365"),
             ],
-            Self::Exchange => vec![String::from("smarketsexchange")],
+            Self::Exchange => vec![
+                String::from("smarketsexchange"),
+                String::from("matchbookexchange"),
+                String::from("betfair"),
+                String::from("betdaq"),
+            ],
             Self::Sport => vec![String::from("soccer")],
             Self::MarketGroup => vec![String::from("match-odds")],
             Self::EventGroup | Self::Country | Self::EventId | Self::MinRating => Vec::new(),

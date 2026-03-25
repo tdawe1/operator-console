@@ -3,6 +3,7 @@ pub mod app;
 mod app_state;
 pub mod calculator;
 pub mod domain;
+pub mod exchange_api;
 pub mod horse_matcher;
 pub mod native_provider;
 pub mod native_trading;

@@ -366,6 +366,58 @@ fn native_provider_executes_confirm_action_in_rust() -> Result<()> {
 }
 
 #[test]
+fn native_provider_routes_matchbook_actions_to_api_runner() -> Result<()> {
+    let run_dir = temp_run_dir("native-trade-matchbook");
+    fs::write(
+        run_dir.join("watcher-state.json"),
+        r#"{
+          "worker": { "name": "bet-recorder", "status": "ready", "detail": "native ready" },
+          "status_line": "native watcher state"
+        }"#,
+    )?;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let runner = Arc::new(move |intent: &TradingActionIntent| -> Result<_> {
+        seen_clone
+            .lock()
+            .expect("seen")
+            .push((intent.venue, intent.selection_name.clone()));
+        Ok(operator_console::native_trading::NativeTradingResult {
+            detail: String::from("Matchbook review ready: Arsenal @ 2.16"),
+            action_status: String::from("review_ready"),
+        })
+    });
+    let mut provider = NativeExchangeProvider::with_api_runner(
+        WorkerConfig {
+            positions_payload_path: None,
+            run_dir: Some(run_dir),
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: None,
+            agent_browser_session: None,
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
+        },
+        runner,
+    );
+
+    let snapshot = provider.handle(ProviderRequest::ExecuteTradingAction {
+        intent: sample_api_trading_intent(),
+    })?;
+
+    assert!(snapshot.status_line.contains("Matchbook review ready"));
+    let recorded = seen.lock().expect("seen");
+    assert_eq!(
+        recorded.as_slice(),
+        &[(VenueId::Matchbook, String::from("Arsenal"))]
+    );
+    Ok(())
+}
+
+#[test]
 fn native_provider_handles_cash_out_request_without_python() -> Result<()> {
     let run_dir = temp_run_dir("native-cashout");
     fs::write(
@@ -475,6 +527,17 @@ fn sample_trading_intent(
         },
         source_context: TradingActionSourceContext::default(),
         notes: vec![String::from("native test")],
+    }
+}
+
+fn sample_api_trading_intent() -> TradingActionIntent {
+    TradingActionIntent {
+        venue: VenueId::Matchbook,
+        expected_price: 2.16,
+        deep_link_url: Some(String::from("https://www.matchbook.com/events/1")),
+        betslip_selection_id: Some(String::from("runner-7")),
+        notes: vec![String::from("runner_id:runner-7")],
+        ..sample_trading_intent(TradingActionMode::Review, TradingTimeInForce::GoodTilCancel)
     }
 }
 

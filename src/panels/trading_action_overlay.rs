@@ -12,7 +12,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let popup = popup_area(area, 72, 70);
+    let popup = popup_area(area, 78, 76);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -36,8 +36,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_price()
         .map(format_decimal)
         .unwrap_or_else(|| String::from("-"));
-
-    let lines = vec![
+    let header_lines = vec![
         Line::from(vec![
             label("Source"),
             value(match overlay.seed.source {
@@ -52,6 +51,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(vec![label("Event "), value(&overlay.seed.event_name)]),
         Line::from(vec![label("Market"), value(&overlay.seed.market_name)]),
         Line::from(vec![label("Pick  "), value(&overlay.seed.selection_name)]),
+        Line::from(vec![
+            label("Route "),
+            value(
+                overlay
+                    .seed
+                    .deep_link_url
+                    .as_deref()
+                    .or(overlay.seed.event_url.as_deref())
+                    .unwrap_or("-"),
+            ),
+        ]),
+    ];
+    let layout = Layout::vertical([Constraint::Length(7), Constraint::Min(12)]).split(inner);
+    let body = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(layout[1]);
+
+    let ticket_lines = vec![
         Line::from(vec![
             field_value(
                 overlay.selected_field == TradingActionField::Mode,
@@ -82,13 +98,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             label("Quote "),
             value(&price_display),
             Span::raw("   "),
-            label("Risk  "),
-            value(&overlay.risk_report.summary),
+            label("Exec  "),
+            value(
+                if overlay.mode == crate::trading_actions::TradingActionMode::Review {
+                    "dry review"
+                } else {
+                    "submit"
+                },
+            ),
+        ]),
+        Line::from(vec![
+            label("Slip  "),
+            value(overlay.seed.betslip_market_id.as_deref().unwrap_or("-")),
+        ]),
+        Line::from(vec![
+            label("SelId "),
+            value(overlay.seed.betslip_selection_id.as_deref().unwrap_or("-")),
         ]),
         Line::from(vec![
             if overlay.selected_field == TradingActionField::Execute {
                 Span::styled(
-                    " Execute ",
+                    " Submit Ticket ",
                     Style::default()
                         .fg(Color::Black)
                         .bg(accent_gold())
@@ -96,7 +126,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 )
             } else {
                 Span::styled(
-                    " Execute ",
+                    " Submit Ticket ",
                     Style::default()
                         .fg(text_color())
                         .bg(elevated_background())
@@ -105,30 +135,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             },
             Span::raw("   "),
             Span::styled(
-                "Enter run  •  h/l or [/] cycle  •  j/k move  •  Esc close",
+                "Enter run • h/l or [/] cycle • j/k move • Esc close",
                 Style::default().fg(muted_text()),
             ),
         ]),
-        Line::raw(""),
-        Line::from(vec![
-            label("Policy"),
-            value(if overlay.risk_report.reduce_only {
-                "reduce-only"
-            } else {
-                "open/increase"
-            }),
-            Span::raw("   "),
-            label("Warn"),
-            value(&overlay.risk_report.warning_count.to_string()),
-            Span::raw("   "),
-            label("Block"),
-            value(&overlay.risk_report.blocking_submit_count.to_string()),
-        ]),
-        Line::raw(""),
     ];
-    let mut lines = lines;
+    let mut risk_lines = vec![Line::from(vec![
+        label("Policy"),
+        value(if overlay.risk_report.reduce_only {
+            "reduce-only"
+        } else {
+            "open/increase"
+        }),
+        Span::raw("   "),
+        label("Warn"),
+        value(&overlay.risk_report.warning_count.to_string()),
+        Span::raw("   "),
+        label("Block"),
+        value(&overlay.risk_report.blocking_submit_count.to_string()),
+    ])];
     for check in overlay.risk_report.checks.iter().take(4) {
-        lines.push(Line::from(vec![
+        risk_lines.push(Line::from(vec![
             Span::styled(
                 format!("[{}:{}] ", check.severity.label(), check.scope.label()),
                 Style::default().fg(match check.severity {
@@ -144,23 +171,62 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-        lines.push(Line::from(Span::styled(
+        risk_lines.push(Line::from(Span::styled(
             check.detail.clone(),
             Style::default().fg(muted_text()),
         )));
     }
-    lines.extend([
+    if !overlay.seed.notes.is_empty() {
+        risk_lines.push(Line::raw(""));
+        for note in overlay.seed.notes.iter().take(3) {
+            risk_lines.push(Line::from(Span::styled(
+                format!("• {note}"),
+                Style::default().fg(muted_text()),
+            )));
+        }
+    }
+    risk_lines.extend([
         Line::raw(""),
         Line::from(Span::styled(
             app.status_message(),
             Style::default().fg(muted_text()),
         )),
     ]);
-
-    let paragraph = Paragraph::new(lines)
+    let header = Paragraph::new(header_lines)
         .style(Style::default().bg(panel_background()).fg(text_color()))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(border_color())),
+        );
+    frame.render_widget(header, layout[0]);
+    let ticket = Paragraph::new(ticket_lines)
+        .style(Style::default().bg(panel_background()).fg(text_color()))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    "Bet Slip",
+                    Style::default()
+                        .fg(accent_cyan())
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::RIGHT),
+        );
+    frame.render_widget(ticket, body[0]);
+    let paragraph = Paragraph::new(risk_lines)
+        .style(Style::default().bg(panel_background()).fg(text_color()))
+        .block(
+            Block::default().title(Span::styled(
+                "Risk Tape",
+                Style::default()
+                    .fg(accent_gold())
+                    .add_modifier(Modifier::BOLD),
+            )),
+        )
         .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, body[1]);
 }
 
 fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {

@@ -13,6 +13,7 @@ use crate::domain::{
     TransportMarkerSummary, VenueId, VenueStatus, VenueSummary, WatchRow, WatchSnapshot,
     WorkerStatus,
 };
+use crate::exchange_api::execute_trade as execute_exchange_api_trade;
 use crate::native_trading::{execute_smarkets_trade, NativeTradingResult};
 use crate::provider::{ExchangeProvider, ProviderRequest};
 use crate::trading_actions::TradingActionIntent;
@@ -20,12 +21,14 @@ use crate::transport::WorkerConfig;
 
 const DEFAULT_RECENT_EVENT_LIMIT: usize = 12;
 type BrowserRunner = dyn Fn(&[String]) -> Result<Value> + Send + Sync;
+type ApiRunner = dyn Fn(&TradingActionIntent) -> Result<NativeTradingResult> + Send + Sync;
 
 pub struct NativeExchangeProvider {
     config: WorkerConfig,
     selected_venue: VenueId,
     cached_snapshot: Option<ExchangePanelSnapshot>,
     browser_runner: Option<Arc<BrowserRunner>>,
+    api_runner: Option<Arc<ApiRunner>>,
 }
 
 impl NativeExchangeProvider {
@@ -35,6 +38,7 @@ impl NativeExchangeProvider {
             selected_venue: VenueId::Smarkets,
             cached_snapshot: None,
             browser_runner: None,
+            api_runner: None,
         }
     }
 
@@ -44,6 +48,17 @@ impl NativeExchangeProvider {
             selected_venue: VenueId::Smarkets,
             cached_snapshot: None,
             browser_runner: Some(runner),
+            api_runner: None,
+        }
+    }
+
+    pub fn with_api_runner(config: WorkerConfig, runner: Arc<ApiRunner>) -> Self {
+        Self {
+            config,
+            selected_venue: VenueId::Smarkets,
+            cached_snapshot: None,
+            browser_runner: None,
+            api_runner: Some(runner),
         }
     }
 
@@ -206,17 +221,26 @@ impl NativeExchangeProvider {
         &mut self,
         intent: &TradingActionIntent,
     ) -> Result<NativeTradingResult> {
-        if intent.venue != VenueId::Smarkets {
-            return Err(eyre!(
-                "native provider only supports Smarkets trading actions right now"
-            ));
+        if intent.venue == VenueId::Smarkets {
+            return execute_smarkets_trade(
+                intent,
+                self.config.agent_browser_session.clone(),
+                self.config.run_dir.as_deref(),
+                self.browser_runner.clone(),
+            );
         }
-        execute_smarkets_trade(
-            intent,
-            self.config.agent_browser_session.clone(),
-            self.config.run_dir.as_deref(),
-            self.browser_runner.clone(),
-        )
+        if let Some(runner) = self.api_runner.as_ref() {
+            return runner(intent);
+        }
+        let result = execute_exchange_api_trade(intent)?;
+        Ok(NativeTradingResult {
+            detail: result.detail,
+            action_status: if intent.mode == crate::trading_actions::TradingActionMode::Review {
+                String::from("review_ready")
+            } else {
+                String::from("submitted")
+            },
+        })
     }
 }
 
