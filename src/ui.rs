@@ -57,9 +57,12 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 TradingSection::Live => panels::trading_markets::render(frame, layout[1], app),
                 TradingSection::Props => panels::trading_markets::render(frame, layout[1], app),
                 TradingSection::Matcher => panels::matcher::render(frame, layout[1], app),
-                TradingSection::Stats => {
-                    panels::trading_stats::render(frame, layout[1], app.snapshot())
-                }
+                TradingSection::Stats => panels::trading_stats::render(
+                    frame,
+                    layout[1],
+                    app.snapshot(),
+                    app.matchbook_account_state(),
+                ),
                 TradingSection::Calculator => panels::calculator::render(frame, layout[1], app),
                 TradingSection::Recorder => panels::recorder::render(frame, layout[1], app),
             }

@@ -23,6 +23,7 @@ use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
     ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId, WorkerStatus,
 };
+use crate::exchange_api::{load_matchbook_account_state, MatchbookAccountState};
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
@@ -50,8 +51,21 @@ use crate::transport::WorkerConfig;
 use crate::ui;
 use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
 
-type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider>;
-type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider>;
+type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider + Send>;
+type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider + Send>;
+
+struct ProviderJob {
+    request: ProviderRequest,
+    failure_context: String,
+    event_message: Option<String>,
+}
+
+struct ProviderResult {
+    request: ProviderRequest,
+    result: std::result::Result<ExchangePanelSnapshot, String>,
+    failure_context: String,
+    event_message: Option<String>,
+}
 
 struct OwlsSyncJob {
     dashboard: OwlsDashboard,
@@ -62,6 +76,38 @@ struct OwlsSyncJob {
 struct OwlsSyncResult {
     outcome: owls::OwlsSyncOutcome,
     reason: OwlsSyncReason,
+}
+
+#[derive(Clone, Copy)]
+enum MatchbookSyncReason {
+    Manual,
+    Background,
+}
+
+impl MatchbookSyncReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Background => "monitor",
+        }
+    }
+}
+
+struct MatchbookSyncJob {
+    reason: MatchbookSyncReason,
+}
+
+struct MatchbookSyncResult {
+    state: std::result::Result<MatchbookAccountState, String>,
+    reason: MatchbookSyncReason,
+}
+
+struct OddsMatcherJob {
+    query: GetBestMatchesVariables,
+}
+
+struct OddsMatcherResult {
+    result: std::result::Result<Vec<OddsMatcherRow>, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -78,7 +124,10 @@ struct MouseTarget {
 }
 
 pub struct App {
-    provider: Box<dyn ExchangeProvider>,
+    provider_tx: Sender<ProviderJob>,
+    provider_rx: Receiver<ProviderResult>,
+    provider_in_flight: bool,
+    provider_pending_job: Option<ProviderJob>,
     make_stub_provider: Box<StubFactory>,
     make_recorder_provider: Box<ProviderFactory>,
     recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -89,12 +138,21 @@ pub struct App {
     recorder_status: RecorderStatus,
     calculator: CalculatorState,
     calculator_tool: CalculatorTool,
-    oddsmatcher_client: Client,
+    oddsmatcher_tx: Sender<OddsMatcherJob>,
+    oddsmatcher_rx: Receiver<OddsMatcherResult>,
+    oddsmatcher_in_flight: bool,
+    oddsmatcher_pending_query: Option<GetBestMatchesVariables>,
     owls_sync_tx: Sender<OwlsSyncJob>,
     owls_sync_rx: Receiver<OwlsSyncResult>,
     owls_sync_in_flight: bool,
     owls_sync_pending_reason: Option<OwlsSyncReason>,
     last_owls_sync_dispatch_at: Option<Instant>,
+    matchbook_sync_tx: Sender<MatchbookSyncJob>,
+    matchbook_sync_rx: Receiver<MatchbookSyncResult>,
+    matchbook_sync_in_flight: bool,
+    matchbook_sync_pending_reason: Option<MatchbookSyncReason>,
+    last_matchbook_sync_dispatch_at: Option<Instant>,
+    matchbook_account_state: Option<MatchbookAccountState>,
     owls_dashboard: OwlsDashboard,
     owls_endpoint_table_state: TableState,
     oddsmatcher_query_path: PathBuf,
@@ -140,11 +198,12 @@ const RECORDER_REFRESH_INTERVAL_IDLE: Duration = Duration::from_secs(5);
 const RECORDER_REFRESH_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
 const RECORDER_REFRESH_INTERVAL_BOOTSTRAP: Duration = Duration::from_secs(1);
 const OWLS_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
+const MATCHBOOK_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(4);
 
 impl Default for App {
     fn default() -> Self {
         let stub_factory =
-            || Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>;
+            || Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>;
         let provider = stub_factory();
         let recorder_config_path = default_config_path();
         let (recorder_config, recorder_config_note) =
@@ -169,7 +228,7 @@ impl Default for App {
 }
 
 impl App {
-    pub fn from_provider<P: ExchangeProvider + 'static>(provider: P) -> Result<Self> {
+    pub fn from_provider<P: ExchangeProvider + Send + 'static>(provider: P) -> Result<Self> {
         let recorder_config_path = default_config_path();
         let (recorder_config, recorder_config_note) =
             load_recorder_config_or_default(&recorder_config_path).unwrap_or_else(|error| {
@@ -190,7 +249,7 @@ impl App {
     }
 
     pub fn with_dependencies(
-        provider: Box<dyn ExchangeProvider>,
+        provider: Box<dyn ExchangeProvider + Send>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -208,7 +267,7 @@ impl App {
     }
 
     pub fn with_dependencies_and_storage(
-        provider: Box<dyn ExchangeProvider>,
+        provider: Box<dyn ExchangeProvider + Send>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -229,7 +288,7 @@ impl App {
     }
 
     pub fn with_dependencies_and_storage_paths(
-        provider: Box<dyn ExchangeProvider>,
+        provider: Box<dyn ExchangeProvider + Send>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -252,7 +311,7 @@ impl App {
     }
 
     pub fn with_dependencies_and_storage_matcher_paths(
-        mut provider: Box<dyn ExchangeProvider>,
+        mut provider: Box<dyn ExchangeProvider + Send>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -295,6 +354,13 @@ impl App {
         } else {
             PositionsFocus::Active
         };
+        let oddsmatcher_client = oddsmatcher::build_client().unwrap_or_else(|_| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(12))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        });
         let owls_client = owls::build_client().unwrap_or_else(|_| {
             Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -302,10 +368,16 @@ impl App {
                 .build()
                 .unwrap_or_else(|_| Client::new())
         });
+        let (provider_tx, provider_rx) = start_provider_worker(provider);
+        let (oddsmatcher_tx, oddsmatcher_rx) = start_oddsmatcher_worker(oddsmatcher_client);
         let (owls_sync_tx, owls_sync_rx) = start_owls_sync_worker(owls_client.clone());
+        let (matchbook_sync_tx, matchbook_sync_rx) = start_matchbook_sync_worker();
 
         let mut app = Self {
-            provider,
+            provider_tx,
+            provider_rx,
+            provider_in_flight: false,
+            provider_pending_job: None,
             make_stub_provider,
             make_recorder_provider,
             recorder_supervisor,
@@ -316,18 +388,21 @@ impl App {
             recorder_status: RecorderStatus::Disabled,
             calculator: CalculatorState::default(),
             calculator_tool: CalculatorTool::Basic,
-            oddsmatcher_client: oddsmatcher::build_client().unwrap_or_else(|_| {
-                Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .timeout(Duration::from_secs(12))
-                    .build()
-                    .unwrap_or_else(|_| Client::new())
-            }),
+            oddsmatcher_tx,
+            oddsmatcher_rx,
+            oddsmatcher_in_flight: false,
+            oddsmatcher_pending_query: None,
             owls_sync_tx,
             owls_sync_rx,
             owls_sync_in_flight: false,
             owls_sync_pending_reason: None,
             last_owls_sync_dispatch_at: None,
+            matchbook_sync_tx,
+            matchbook_sync_rx,
+            matchbook_sync_in_flight: false,
+            matchbook_sync_pending_reason: None,
+            last_matchbook_sync_dispatch_at: None,
+            matchbook_account_state: None,
             owls_dashboard: {
                 let dashboard = OwlsDashboard::default();
                 dashboard
@@ -392,6 +467,10 @@ impl App {
 
     pub fn owls_dashboard(&self) -> &OwlsDashboard {
         &self.owls_dashboard
+    }
+
+    pub fn matchbook_account_state(&self) -> Option<&MatchbookAccountState> {
+        self.matchbook_account_state.as_ref()
     }
 
     pub fn owls_sport(&self) -> &str {
@@ -579,6 +658,27 @@ impl App {
 
     pub fn status_message(&self) -> &str {
         &self.status_message
+    }
+
+    pub fn wait_for_async_idle(&mut self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            self.drain_provider_results();
+            self.drain_oddsmatcher_results();
+            self.drain_owls_sync_results();
+            self.drain_matchbook_sync_results();
+            if !self.provider_in_flight
+                && !self.oddsmatcher_in_flight
+                && !self.owls_sync_in_flight
+                && !self.matchbook_sync_in_flight
+            {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn status_scroll(&self) -> u16 {
@@ -1014,11 +1114,17 @@ impl App {
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
             return self.refresh_matcher();
         }
-        self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed")?;
-        self.record_event(format!(
-            "Manual cached refresh completed for {}.",
-            self.selected_venue_label()
-        ));
+        self.refresh_provider_snapshot(
+            ProviderRequest::RefreshCached,
+            "Refresh failed",
+            Some(format!(
+                "Manual cached refresh completed for {}.",
+                self.selected_venue_label()
+            )),
+        )?;
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Stats {
+            self.request_matchbook_sync(MatchbookSyncReason::Manual);
+        }
         Ok(())
     }
 
@@ -1029,11 +1135,17 @@ impl App {
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
             return self.refresh_matcher();
         }
-        self.refresh_provider_snapshot(ProviderRequest::RefreshLive, "Live refresh failed")?;
-        self.record_event(format!(
-            "Manual live refresh completed for {}.",
-            self.selected_venue_label()
-        ));
+        self.refresh_provider_snapshot(
+            ProviderRequest::RefreshLive,
+            "Live refresh failed",
+            Some(format!(
+                "Manual live refresh completed for {}.",
+                self.selected_venue_label()
+            )),
+        )?;
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Stats {
+            self.request_matchbook_sync(MatchbookSyncReason::Manual);
+        }
         Ok(())
     }
 
@@ -1057,21 +1169,14 @@ impl App {
         &mut self,
         request: ProviderRequest,
         failure_context: &str,
+        event_message: Option<String>,
     ) -> Result<()> {
-        match self.provider.handle(request) {
-            Ok(snapshot) => {
-                self.replace_snapshot(snapshot);
-                Ok(())
-            }
-            Err(error) => {
-                self.record_provider_error(
-                    failure_context,
-                    &error.to_string(),
-                    self.selected_venue(),
-                );
-                Err(error)
-            }
-        }
+        self.queue_provider_request(ProviderJob {
+            request,
+            failure_context: String::from(failure_context),
+            event_message,
+        });
+        Ok(())
     }
 
     fn refresh_owls_dashboard(&mut self) -> Result<()> {
@@ -1082,15 +1187,253 @@ impl App {
         Ok(())
     }
 
+    fn queue_provider_request(&mut self, job: ProviderJob) {
+        self.drain_provider_results();
+        if self.provider_in_flight {
+            self.provider_pending_job = Some(match self.provider_pending_job.take() {
+                Some(existing)
+                    if provider_job_priority(&existing.request)
+                        > provider_job_priority(&job.request) =>
+                {
+                    existing
+                }
+                _ => job,
+            });
+            return;
+        }
+        self.dispatch_provider_request(job);
+    }
+
+    fn dispatch_provider_request(&mut self, job: ProviderJob) {
+        let request = job.request.clone();
+        match self.provider_tx.send(job) {
+            Ok(()) => {
+                self.provider_in_flight = true;
+                self.status_message = provider_queue_message(&request);
+                self.status_scroll = 0;
+            }
+            Err(error) => {
+                self.status_message = format!("Provider worker unavailable: {error}");
+                self.status_scroll = 0;
+                self.record_event("Provider worker unavailable.");
+            }
+        }
+    }
+
+    fn restart_provider_worker(&mut self, provider: Box<dyn ExchangeProvider + Send>) {
+        let (provider_tx, provider_rx) = start_provider_worker(provider);
+        self.provider_tx = provider_tx;
+        self.provider_rx = provider_rx;
+        self.provider_in_flight = false;
+        self.provider_pending_job = None;
+    }
+
+    fn drain_provider_results(&mut self) {
+        let mut latest_result = None;
+        while let Ok(result) = self.provider_rx.try_recv() {
+            latest_result = Some(result);
+        }
+        let Some(result) = latest_result else {
+            return;
+        };
+
+        self.provider_in_flight = false;
+        match result.result {
+            Ok(snapshot) => {
+                self.apply_provider_snapshot_result(result.request, snapshot, result.event_message)
+            }
+            Err(error) => {
+                if matches!(result.request, ProviderRequest::LoadDashboard)
+                    && self.recorder_status == RecorderStatus::Running
+                    && self.last_successful_snapshot_at.is_none()
+                {
+                    self.status_message =
+                        String::from("Recorder started; waiting for first snapshot.");
+                    self.status_scroll = 0;
+                    self.record_event(format!("{}: {}", result.failure_context, error));
+                } else {
+                    self.record_provider_error(
+                        &result.failure_context,
+                        &error,
+                        self.selected_venue(),
+                    );
+                }
+            }
+        }
+
+        if let Some(job) = self.provider_pending_job.take() {
+            self.dispatch_provider_request(job);
+        }
+    }
+
+    fn apply_provider_snapshot_result(
+        &mut self,
+        request: ProviderRequest,
+        snapshot: ExchangePanelSnapshot,
+        event_message: Option<String>,
+    ) {
+        match request {
+            ProviderRequest::LoadHorseMatcher { query } => {
+                let Some(market_snapshot) = snapshot.horse_matcher.clone() else {
+                    self.status_message =
+                        String::from("Horse Matcher refresh failed: missing market data.");
+                    self.status_scroll = 0;
+                    return;
+                };
+                match horse_matcher::build_rows(&market_snapshot, &query) {
+                    Ok(rows) => {
+                        let row_count = rows.len();
+                        self.horse_matcher_snapshot = Some(market_snapshot);
+                        self.replace_horse_matcher_rows(
+                            rows,
+                            format!("Loaded {row_count} internal Horse Matcher row(s)."),
+                        );
+                    }
+                    Err(error) => {
+                        self.status_message = format!("Horse Matcher refresh failed: {error}");
+                        self.status_scroll = 0;
+                    }
+                }
+            }
+            _ => {
+                self.replace_snapshot(snapshot);
+            }
+        }
+
+        if let Some(message) = event_message {
+            self.record_event(message);
+        }
+    }
+
+    fn request_matchbook_sync(&mut self, reason: MatchbookSyncReason) {
+        self.drain_matchbook_sync_results();
+        if self.matchbook_sync_in_flight {
+            self.matchbook_sync_pending_reason =
+                Some(match (self.matchbook_sync_pending_reason, reason) {
+                    (Some(MatchbookSyncReason::Manual), _) | (_, MatchbookSyncReason::Manual) => {
+                        MatchbookSyncReason::Manual
+                    }
+                    _ => MatchbookSyncReason::Background,
+                });
+            return;
+        }
+        self.dispatch_matchbook_sync(reason);
+    }
+
+    fn dispatch_matchbook_sync(&mut self, reason: MatchbookSyncReason) {
+        match self.matchbook_sync_tx.send(MatchbookSyncJob { reason }) {
+            Ok(()) => {
+                self.matchbook_sync_in_flight = true;
+                self.last_matchbook_sync_dispatch_at = Some(Instant::now());
+            }
+            Err(error) => {
+                self.status_message = format!("Matchbook sync worker unavailable: {error}");
+                self.status_scroll = 0;
+                self.record_event("Matchbook sync worker unavailable.");
+            }
+        }
+    }
+
+    fn queue_oddsmatcher_refresh(&mut self, query: GetBestMatchesVariables) {
+        self.drain_oddsmatcher_results();
+        if self.oddsmatcher_in_flight {
+            self.oddsmatcher_pending_query = Some(query);
+            return;
+        }
+        self.dispatch_oddsmatcher_refresh(query);
+    }
+
+    fn dispatch_oddsmatcher_refresh(&mut self, query: GetBestMatchesVariables) {
+        match self.oddsmatcher_tx.send(OddsMatcherJob {
+            query: query.clone(),
+        }) {
+            Ok(()) => {
+                self.oddsmatcher_in_flight = true;
+                self.status_message = String::from("OddsMatcher refresh queued.");
+                self.status_scroll = 0;
+            }
+            Err(error) => {
+                self.status_message = format!("OddsMatcher worker unavailable: {error}");
+                self.status_scroll = 0;
+            }
+        }
+    }
+
+    fn drain_oddsmatcher_results(&mut self) {
+        let mut latest_result = None;
+        while let Ok(result) = self.oddsmatcher_rx.try_recv() {
+            latest_result = Some(result);
+        }
+        let Some(result) = latest_result else {
+            return;
+        };
+
+        self.oddsmatcher_in_flight = false;
+        match result.result {
+            Ok(rows) => {
+                let row_count = rows.len();
+                self.replace_oddsmatcher_rows(
+                    rows,
+                    format!("Loaded {row_count} live OddsMatcher row(s)."),
+                );
+            }
+            Err(error) => {
+                self.status_message = format!("OddsMatcher refresh failed: {error}");
+                self.status_scroll = 0;
+            }
+        }
+
+        if let Some(query) = self.oddsmatcher_pending_query.take() {
+            self.dispatch_oddsmatcher_refresh(query);
+        }
+    }
+
+    fn drain_matchbook_sync_results(&mut self) {
+        let mut latest_result = None;
+        while let Ok(result) = self.matchbook_sync_rx.try_recv() {
+            latest_result = Some(result);
+        }
+        let Some(result) = latest_result else {
+            return;
+        };
+
+        self.matchbook_sync_in_flight = false;
+        match result.state {
+            Ok(state) => {
+                let first_load = self.matchbook_account_state.is_none();
+                self.matchbook_account_state = Some(state.clone());
+                if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
+                    self.status_message = state.status_line.clone();
+                    self.status_scroll = 0;
+                }
+                self.record_event(format!("Matchbook {} sync applied.", result.reason.label()));
+            }
+            Err(error) => {
+                if matches!(result.reason, MatchbookSyncReason::Manual) {
+                    self.status_message = format!("Matchbook sync failed: {error}");
+                    self.status_scroll = 0;
+                }
+                self.record_event(format!("Matchbook sync failed: {error}"));
+            }
+        }
+
+        if let Some(reason) = self.matchbook_sync_pending_reason.take() {
+            self.dispatch_matchbook_sync(reason);
+        }
+    }
+
     pub fn cash_out_next_actionable_bet(&mut self) -> Result<()> {
         let actionable_bet_id =
             next_actionable_cash_out_bet_id(&self.snapshot).ok_or_else(|| {
                 color_eyre::eyre::eyre!("No tracked bet is currently marked for cash out.")
             })?;
-        let snapshot = self.provider.handle(ProviderRequest::CashOutTrackedBet {
-            bet_id: actionable_bet_id,
-        })?;
-        self.replace_snapshot(snapshot);
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::CashOutTrackedBet {
+                bet_id: actionable_bet_id,
+            },
+            failure_context: String::from("Cash out failed"),
+            event_message: Some(String::from("Cash out request completed.")),
+        });
         Ok(())
     }
 
@@ -1122,6 +1465,13 @@ impl App {
             }
         };
         self.trading_action_overlay = Some(TradingActionOverlayState::new(seed, risk_report));
+        if self
+            .trading_action_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.seed.venue == VenueId::Matchbook)
+        {
+            self.request_matchbook_sync(MatchbookSyncReason::Manual);
+        }
         self.status_message = String::from("Trading action overlay opened.");
     }
 
@@ -1131,32 +1481,17 @@ impl App {
         self.recorder_supervisor.start(&self.recorder_config)?;
         self.recorder_status = self.recorder_supervisor.poll_status();
         self.last_recorder_start_failure = None;
-        self.provider = (self.make_recorder_provider)(&self.recorder_config);
+        self.restart_provider_worker((self.make_recorder_provider)(&self.recorder_config));
         self.exchange_list_state.select(None);
         self.record_event("Recorder process started.");
-        match self.provider.handle(ProviderRequest::LoadDashboard) {
-            Ok(snapshot) => {
-                let waiting_for_snapshot = snapshot.worker.status == WorkerStatus::Busy;
-                self.replace_snapshot(snapshot);
-                self.last_recorder_refresh_at = if waiting_for_snapshot {
-                    None
-                } else {
-                    Some(Instant::now())
-                };
-                self.status_message = self.snapshot.status_line.clone();
-                self.record_event(format!(
-                    "Recorder dashboard loaded with {} refresh.",
-                    self.recorder_snapshot_mode()
-                ));
-            }
-            Err(error) => {
-                self.last_recorder_refresh_at = None;
-                self.status_message =
-                    format!("Recorder started; waiting for first snapshot. {}", error);
-                self.status_scroll = 0;
-                self.record_event("Recorder started; waiting for first snapshot.");
-            }
-        }
+        self.last_recorder_refresh_at = None;
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::LoadDashboard,
+            failure_context: String::from("Recorder dashboard load failed"),
+            event_message: Some(String::from("Recorder dashboard loaded.")),
+        });
+        self.status_message = String::from("Recorder started; waiting for first snapshot.");
+        self.status_scroll = 0;
         self.active_panel = Panel::Trading;
         self.trading_section = TradingSection::Positions;
         Ok(())
@@ -1175,9 +1510,12 @@ impl App {
         self.recorder_status = RecorderStatus::Disabled;
         self.last_recorder_refresh_at = None;
         self.last_recorder_start_failure = None;
-        self.provider = (self.make_stub_provider)();
-        let snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
-        self.replace_snapshot(snapshot);
+        self.restart_provider_worker((self.make_stub_provider)());
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::LoadDashboard,
+            failure_context: String::from("Stub dashboard load failed"),
+            event_message: Some(String::from("Recorder stopped; restored stub dashboard.")),
+        });
         self.record_event("Recorder stopped; restored stub dashboard.");
         Ok(())
     }
@@ -1311,7 +1649,10 @@ impl App {
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while self.running {
             self.poll_recorder();
+            self.drain_provider_results();
+            self.drain_oddsmatcher_results();
             self.poll_owls_dashboard();
+            self.poll_matchbook_account();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(250))? {
@@ -2298,16 +2639,11 @@ impl App {
         };
 
         self.snapshot.selected_venue = Some(venue.id);
-
-        match self.provider.handle(ProviderRequest::SelectVenue(venue.id)) {
-            Ok(snapshot) => {
-                self.replace_snapshot(snapshot);
-                self.record_event(format!("Selected venue {}.", self.selected_venue_label()));
-            }
-            Err(error) => {
-                self.record_provider_error("Venue sync failed", &error.to_string(), Some(venue.id));
-            }
-        }
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::SelectVenue(venue.id),
+            failure_context: String::from("Venue sync failed"),
+            event_message: Some(format!("Selected venue {}.", venue.id.as_str())),
+        });
     }
 
     pub fn selected_venue(&self) -> Option<VenueId> {
@@ -2335,7 +2671,7 @@ impl App {
         if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
             self.last_recorder_refresh_at = Some(Instant::now());
             let request = self.recorder_auto_refresh_request();
-            let _ = self.refresh_provider_snapshot(request, "Refresh failed");
+            let _ = self.refresh_provider_snapshot(request, "Refresh failed", None);
         }
     }
 
@@ -2361,6 +2697,26 @@ impl App {
             return;
         }
         self.dispatch_owls_sync(OwlsSyncReason::Background);
+    }
+
+    fn poll_matchbook_account(&mut self) {
+        self.drain_matchbook_sync_results();
+        let should_sync = self.active_panel == Panel::Trading
+            && (self.trading_section == TradingSection::Stats
+                || self
+                    .trading_action_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.seed.venue == VenueId::Matchbook));
+        if !should_sync || self.matchbook_sync_in_flight {
+            return;
+        }
+        if self
+            .last_matchbook_sync_dispatch_at
+            .is_some_and(|last| last.elapsed() < MATCHBOOK_SYNC_DISPATCH_INTERVAL)
+        {
+            return;
+        }
+        self.dispatch_matchbook_sync(MatchbookSyncReason::Background);
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
@@ -2594,28 +2950,18 @@ impl App {
             self.recorder_supervisor.stop()?;
             self.recorder_supervisor.start(&self.recorder_config)?;
             self.recorder_status = self.recorder_supervisor.poll_status();
-            self.provider = (self.make_recorder_provider)(&self.recorder_config);
+            self.restart_provider_worker((self.make_recorder_provider)(&self.recorder_config));
             self.exchange_list_state.select(None);
-            match self.provider.handle(ProviderRequest::LoadDashboard) {
-                Ok(snapshot) => {
-                    self.replace_snapshot(snapshot);
-                    self.last_recorder_refresh_at = Some(Instant::now());
-                    self.status_message =
-                        format!("{message} Restarted recorder to apply the change.");
-                    self.status_scroll = 0;
-                    self.record_event("Recorder restart completed after config change.");
-                }
-                Err(error) => {
-                    self.last_recorder_refresh_at = None;
-                    self.status_message = format!(
-                        "{message} Restarted recorder to apply the change; waiting for next snapshot. {error}"
-                    );
-                    self.status_scroll = 0;
-                    self.record_event(
-                        "Recorder restarted after config change; waiting for next snapshot.",
-                    );
-                }
-            }
+            self.last_recorder_refresh_at = None;
+            self.status_message = format!("{message} Restarted recorder; dashboard reload queued.");
+            self.status_scroll = 0;
+            self.queue_provider_request(ProviderJob {
+                request: ProviderRequest::LoadDashboard,
+                failure_context: String::from("Recorder dashboard load failed"),
+                event_message: Some(String::from(
+                    "Recorder restart completed after config change.",
+                )),
+            });
             return Ok(());
         }
 
@@ -2810,10 +3156,11 @@ impl App {
             stake,
             overlay.time_in_force,
         )?;
-        let snapshot = self
-            .provider
-            .handle(ProviderRequest::ExecuteTradingAction { intent })?;
-        self.replace_snapshot(snapshot);
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::ExecuteTradingAction { intent },
+            failure_context: String::from("Trading action failed"),
+            event_message: Some(String::from("Trading action completed.")),
+        });
         Ok(())
     }
 
@@ -3135,49 +3482,18 @@ impl App {
     }
 
     fn refresh_oddsmatcher(&mut self) -> Result<()> {
-        let rows =
-            oddsmatcher::fetch_best_matches(&self.oddsmatcher_client, &self.oddsmatcher_query)
-                .map_err(|error| {
-                    self.status_message = format!("OddsMatcher refresh failed: {error}");
-                    error
-                })?;
-        let row_count = rows.len();
-        self.replace_oddsmatcher_rows(rows, format!("Loaded {row_count} live OddsMatcher row(s)."));
+        self.queue_oddsmatcher_refresh(self.oddsmatcher_query.clone());
         Ok(())
     }
 
     fn refresh_horse_matcher(&mut self) -> Result<()> {
-        let snapshot = self
-            .provider
-            .handle(ProviderRequest::LoadHorseMatcher {
+        self.queue_provider_request(ProviderJob {
+            request: ProviderRequest::LoadHorseMatcher {
                 query: self.horse_matcher_query.clone(),
-            })
-            .map_err(|error| {
-                self.status_message = format!("Horse Matcher refresh failed: {error}");
-                error
-            })?;
-        let market_snapshot = snapshot
-            .horse_matcher
-            .clone()
-            .ok_or_else(|| {
-                color_eyre::eyre::eyre!("worker response did not include horse matcher market data")
-            })
-            .map_err(|error| {
-                self.status_message = format!("Horse Matcher refresh failed: {error}");
-                error
-            })?;
-        let rows = horse_matcher::build_rows(&market_snapshot, &self.horse_matcher_query).map_err(
-            |error| {
-                self.status_message = format!("Horse Matcher refresh failed: {error}");
-                error
             },
-        )?;
-        let row_count = rows.len();
-        self.horse_matcher_snapshot = Some(market_snapshot);
-        self.replace_horse_matcher_rows(
-            rows,
-            format!("Loaded {row_count} internal Horse Matcher row(s)."),
-        );
+            failure_context: String::from("Horse Matcher refresh failed"),
+            event_message: Some(String::from("Horse Matcher refresh completed.")),
+        });
         Ok(())
     }
 
@@ -3544,7 +3860,7 @@ fn default_recorder_provider_factory() -> Box<ProviderFactory> {
                 BetRecorderWorkerClient::new_command(config.command.clone()),
                 worker_config,
             )),
-        )) as Box<dyn ExchangeProvider>
+        )) as Box<dyn ExchangeProvider + Send>
     })
 }
 
@@ -3581,6 +3897,50 @@ fn new_trading_action_request_id(source: TradingActionSource) -> String {
     format!("{source:?}-{millis}").to_lowercase()
 }
 
+fn start_provider_worker(
+    mut provider: Box<dyn ExchangeProvider + Send>,
+) -> (Sender<ProviderJob>, Receiver<ProviderResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<ProviderJob>();
+    let (result_tx, result_rx) = mpsc::channel::<ProviderResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let request = job.request.clone();
+            let result = provider
+                .handle(request.clone())
+                .map_err(|error| error.to_string());
+            if result_tx
+                .send(ProviderResult {
+                    request,
+                    result,
+                    failure_context: job.failure_context,
+                    event_message: job.event_message,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
+}
+
+fn start_oddsmatcher_worker(
+    client: Client,
+) -> (Sender<OddsMatcherJob>, Receiver<OddsMatcherResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<OddsMatcherJob>();
+    let (result_tx, result_rx) = mpsc::channel::<OddsMatcherResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let result = oddsmatcher::fetch_best_matches(&client, &job.query)
+                .map_err(|error| error.to_string());
+            if result_tx.send(OddsMatcherResult { result }).is_err() {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
+}
+
 fn start_owls_sync_worker(client: Client) -> (Sender<OwlsSyncJob>, Receiver<OwlsSyncResult>) {
     let (job_tx, job_rx) = mpsc::channel::<OwlsSyncJob>();
     let (result_tx, result_rx) = mpsc::channel::<OwlsSyncResult>();
@@ -3601,10 +3961,61 @@ fn start_owls_sync_worker(client: Client) -> (Sender<OwlsSyncJob>, Receiver<Owls
     (job_tx, result_rx)
 }
 
+fn provider_job_priority(request: &ProviderRequest) -> u8 {
+    match request {
+        ProviderRequest::ExecuteTradingAction { .. } => 6,
+        ProviderRequest::CashOutTrackedBet { .. } => 5,
+        ProviderRequest::LoadHorseMatcher { .. } => 4,
+        ProviderRequest::SelectVenue(_) => 3,
+        ProviderRequest::LoadDashboard => 2,
+        ProviderRequest::RefreshLive => 1,
+        ProviderRequest::RefreshCached => 0,
+    }
+}
+
+fn provider_queue_message(request: &ProviderRequest) -> String {
+    match request {
+        ProviderRequest::LoadDashboard => String::from("Dashboard load queued."),
+        ProviderRequest::SelectVenue(venue) => {
+            format!("Venue sync queued for {}.", venue.as_str())
+        }
+        ProviderRequest::RefreshCached => String::from("Cached refresh queued."),
+        ProviderRequest::RefreshLive => String::from("Live refresh queued."),
+        ProviderRequest::CashOutTrackedBet { bet_id } => {
+            format!("Cash out queued for {bet_id}.")
+        }
+        ProviderRequest::ExecuteTradingAction { intent } => format!(
+            "Trading action queued for {} {}.",
+            intent.venue.as_str(),
+            intent.selection_name
+        ),
+        ProviderRequest::LoadHorseMatcher { .. } => String::from("Horse Matcher refresh queued."),
+    }
+}
+
+fn start_matchbook_sync_worker() -> (Sender<MatchbookSyncJob>, Receiver<MatchbookSyncResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<MatchbookSyncJob>();
+    let (result_tx, result_rx) = mpsc::channel::<MatchbookSyncResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let state = load_matchbook_account_state().map_err(|error| error.to_string());
+            if result_tx
+                .send(MatchbookSyncResult {
+                    state,
+                    reason: job.reason,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Arc as Rc, Mutex, Mutex as RefCell};
     use std::time::{Duration, Instant};
 
     use crate::domain::{
@@ -3619,8 +4030,8 @@ mod tests {
     use super::{App, Panel, TradingSection, MAX_EVENT_HISTORY};
 
     struct RefreshingProvider {
-        cached_refresh_count: Rc<RefCell<usize>>,
-        live_refresh_count: Rc<RefCell<usize>>,
+        cached_refresh_count: Arc<Mutex<usize>>,
+        live_refresh_count: Arc<Mutex<usize>>,
         load_snapshot: ExchangePanelSnapshot,
         cached_refresh_snapshot: ExchangePanelSnapshot,
         live_refresh_snapshot: ExchangePanelSnapshot,
@@ -3634,11 +4045,11 @@ mod tests {
             match request {
                 ProviderRequest::LoadDashboard => Ok(self.load_snapshot.clone()),
                 ProviderRequest::RefreshCached => {
-                    *self.cached_refresh_count.borrow_mut() += 1;
+                    *self.cached_refresh_count.lock().expect("lock") += 1;
                     Ok(self.cached_refresh_snapshot.clone())
                 }
                 ProviderRequest::RefreshLive => {
-                    *self.live_refresh_count.borrow_mut() += 1;
+                    *self.live_refresh_count.lock().expect("lock") += 1;
                     Ok(self.live_refresh_snapshot.clone())
                 }
                 ProviderRequest::SelectVenue(_)
@@ -3719,7 +4130,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -3728,7 +4139,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -3741,10 +4152,11 @@ mod tests {
         app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]
@@ -3767,7 +4179,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -3776,7 +4188,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
@@ -3791,8 +4203,8 @@ mod tests {
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Initial dashboard");
-        assert_eq!(*cached_refresh_count.borrow(), 0);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]
@@ -3815,7 +4227,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -3824,7 +4236,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -3839,8 +4251,8 @@ mod tests {
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Initial dashboard");
-        assert_eq!(*cached_refresh_count.borrow(), 0);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]
@@ -3863,7 +4275,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -3872,7 +4284,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -3887,11 +4299,12 @@ mod tests {
         app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
         assert!(app.oddsmatcher_rows().is_empty());
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]
@@ -3953,7 +4366,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -3962,7 +4375,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -3975,12 +4388,13 @@ mod tests {
         app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().status_line, "Live betway dashboard");
         assert_eq!(app.snapshot().selected_venue, Some(VenueId::Betway));
         assert_eq!(app.snapshot().other_open_bets.len(), 1);
-        assert_eq!(*cached_refresh_count.borrow(), 0);
-        assert_eq!(*live_refresh_count.borrow(), 1);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 1);
     }
 
     #[test]
@@ -4050,7 +4464,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(move |_| {
                 Box::new(RefreshingProvider {
@@ -4059,7 +4473,7 @@ mod tests {
                     load_snapshot: busy_snapshot.clone(),
                     cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
                     live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -4069,16 +4483,18 @@ mod tests {
         .expect("app");
 
         app.start_recorder().expect("start recorder");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().worker.status, WorkerStatus::Busy);
         assert_eq!(app.last_recorder_refresh_at, None);
 
         app.poll_recorder();
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
         assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]
@@ -4101,7 +4517,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -4110,7 +4526,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -4120,10 +4536,11 @@ mod tests {
         .expect("app");
 
         app.refresh_live().expect("live refresh should succeed");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
         assert_eq!(app.snapshot().status_line, "Live refreshed dashboard");
-        assert_eq!(*cached_refresh_count.borrow(), 0);
-        assert_eq!(*live_refresh_count.borrow(), 1);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 1);
     }
 
     #[test]
@@ -4149,7 +4566,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -4158,7 +4575,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
@@ -4196,7 +4613,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Stub dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                     live_refresh_snapshot: sample_snapshot("Stub dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
@@ -4205,7 +4622,7 @@ mod tests {
                     load_snapshot: sample_snapshot("Recorder dashboard"),
                     cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                     live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }),
             Box::new(FailingSupervisor),
             RecorderConfig::default(),
@@ -4238,8 +4655,12 @@ mod tests {
                 cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 live_refresh_snapshot: sample_snapshot("Stub dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),
@@ -4296,8 +4717,12 @@ mod tests {
                 },
                 live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(RunningSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),
@@ -4306,9 +4731,10 @@ mod tests {
         .expect("app");
 
         app.refresh().expect("refresh should succeed");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
         assert!(app
             .recent_events()
             .iter()
@@ -4345,8 +4771,12 @@ mod tests {
                 cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 live_refresh_snapshot: sample_snapshot("Stub dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),
@@ -4394,8 +4824,12 @@ mod tests {
                 cached_refresh_snapshot: refreshed_snapshot,
                 live_refresh_snapshot: sample_snapshot("Live dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),
@@ -4406,9 +4840,10 @@ mod tests {
         assert!(app.snapshot().historical_positions.is_empty());
 
         app.refresh().expect("refresh should succeed");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
         assert_eq!(app.snapshot().historical_positions.len(), 1);
         assert_eq!(
             app.snapshot().historical_positions[0].event,
@@ -4467,8 +4902,12 @@ mod tests {
                 cached_refresh_snapshot,
                 live_refresh_snapshot: sample_snapshot("Live dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),
@@ -4479,9 +4918,10 @@ mod tests {
         assert_eq!(app.snapshot().historical_positions.len(), 1);
 
         app.refresh().expect("refresh should succeed");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
-        assert_eq!(*cached_refresh_count.borrow(), 1);
-        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
         assert_eq!(app.snapshot().historical_positions.len(), 1);
         assert_eq!(
             app.snapshot().historical_positions[0].event,
@@ -4552,8 +4992,12 @@ mod tests {
                 cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 live_refresh_snapshot: sample_snapshot("Stub dashboard"),
             }),
-            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
-            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
             Box::new(DisabledSupervisor),
             RecorderConfig::default(),
             temp_dir.path().join("recorder.json"),

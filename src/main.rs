@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     };
 
     let should_autostart = matches!(launch_mode, LaunchMode::Stub);
-    let provider: Box<dyn operator_console::provider::ExchangeProvider> = match launch_mode {
+    let provider: Box<dyn operator_console::provider::ExchangeProvider + Send> = match launch_mode {
         LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
         LaunchMode::BetRecorder {
             positions_payload_path,

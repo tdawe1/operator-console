@@ -185,6 +185,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )));
         }
     }
+    if overlay.seed.venue == crate::domain::VenueId::Matchbook {
+        risk_lines.extend(matchbook_context_lines(app, overlay));
+    }
     risk_lines.extend([
         Line::raw(""),
         Line::from(Span::styled(
@@ -239,6 +242,86 @@ fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     area
 }
 
+fn matchbook_context_lines(
+    app: &App,
+    overlay: &crate::app_state::TradingActionOverlayState,
+) -> Vec<Line<'static>> {
+    let Some(state) = app.matchbook_account_state() else {
+        return vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Matchbook API monitor syncing...",
+                Style::default().fg(muted_text()),
+            )),
+        ];
+    };
+
+    let runner_id = overlay
+        .seed
+        .betslip_selection_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let runner_offers = state
+        .current_offers
+        .iter()
+        .filter(|offer| !runner_id.is_empty() && offer.runner_id == runner_id)
+        .collect::<Vec<_>>();
+    let runner_positions = state
+        .positions
+        .iter()
+        .filter(|position| !runner_id.is_empty() && position.runner_id == runner_id)
+        .collect::<Vec<_>>();
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Matchbook ", Style::default().fg(accent_blue())),
+            Span::styled(
+                state.balance_label.clone(),
+                Style::default()
+                    .fg(accent_green())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(format!(
+            "orders {} • bets {} • positions {}",
+            state.summary.open_offer_count,
+            state.summary.current_bet_count,
+            state.summary.position_count
+        )),
+    ];
+
+    if !runner_offers.is_empty() || !runner_positions.is_empty() {
+        lines.push(Line::raw(format!(
+            "runner offers {} • runner positions {}",
+            runner_offers.len(),
+            runner_positions.len()
+        )));
+    }
+    for offer in runner_offers.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "• {} {} @ {} rem {}",
+                offer.side,
+                offer.selection_name,
+                offer
+                    .odds
+                    .map(format_decimal)
+                    .unwrap_or_else(|| String::from("-")),
+                offer
+                    .remaining_stake
+                    .or(offer.stake)
+                    .map(format_decimal)
+                    .unwrap_or_else(|| String::from("-"))
+            ),
+            Style::default().fg(muted_text()),
+        )));
+    }
+    lines
+}
+
 fn price_summary(app: &App) -> String {
     let Some(overlay) = app.trading_action_overlay() else {
         return String::from("-");
@@ -291,6 +374,10 @@ fn accent_cyan() -> Color {
 
 fn accent_gold() -> Color {
     Color::Rgb(255, 205, 96)
+}
+
+fn accent_green() -> Color {
+    Color::Rgb(108, 214, 158)
 }
 
 fn accent_red() -> Color {

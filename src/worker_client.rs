@@ -55,7 +55,7 @@ impl<C> WorkerClientExchangeProvider<C> {
     }
 }
 
-impl<C: WorkerClient> ExchangeProvider for WorkerClientExchangeProvider<C> {
+impl<C: WorkerClient + Send> ExchangeProvider for WorkerClientExchangeProvider<C> {
     fn handle(&mut self, request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
         let worker_request = match request {
             ProviderRequest::LoadDashboard => WorkerRequest::LoadDashboard {

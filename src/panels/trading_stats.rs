@@ -11,6 +11,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::domain::{ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, VenueStatus};
+use crate::exchange_api::MatchbookAccountState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FundingKind {
@@ -38,7 +39,12 @@ struct RunningPnlSummary {
     source: &'static str,
 }
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    matchbook: Option<&MatchbookAccountState>,
+) {
     let total_open_stake: f64 = snapshot.open_positions.iter().map(|row| row.stake).sum();
     let total_liability: f64 = snapshot
         .open_positions
@@ -166,7 +172,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapsho
     );
     render_venue_table(frame, right[0], snapshot);
     render_decision_table(frame, right[1], snapshot);
-    render_tracked_mix_table(frame, right[2], snapshot);
+    render_matchbook_table(frame, right[2], snapshot, matchbook);
 }
 
 fn render_summary_cards(
@@ -541,7 +547,93 @@ fn render_decision_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangeP
     frame.render_widget(table, area);
 }
 
-fn render_tracked_mix_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
+fn render_matchbook_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    matchbook: Option<&MatchbookAccountState>,
+) {
+    if let Some(matchbook) = matchbook {
+        let layout = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).split(area);
+        let summary = Paragraph::new(vec![
+            Line::styled("󰍹 account", Style::default().fg(muted_text())),
+            Line::styled(
+                matchbook.balance_label.clone(),
+                Style::default()
+                    .fg(accent_green())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(format!(
+                "offers {} • bets {} • matched {} • positions {}",
+                matchbook.summary.open_offer_count,
+                matchbook.summary.current_bet_count,
+                matchbook.summary.matched_bet_count,
+                matchbook.summary.position_count
+            )),
+        ])
+        .block(section_block("󰇚 Matchbook API", accent_blue()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(summary, layout[0]);
+
+        let rows = matchbook
+            .current_offers
+            .iter()
+            .take(5)
+            .map(|offer| {
+                Row::new(vec![
+                    Cell::from(offer.selection_name.clone()),
+                    Cell::from(offer.side.clone()),
+                    Cell::from(
+                        offer
+                            .odds
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                    Cell::from(
+                        offer
+                            .remaining_stake
+                            .or(offer.stake)
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                    Cell::from(offer.status.clone()),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            let body = Paragraph::new(vec![
+                Line::raw("No current Matchbook offers."),
+                Line::raw("Open exchange orders will appear here when the API sees them."),
+            ])
+            .block(section_block("󰋼 Matchbook Orders", accent_green()))
+            .wrap(Wrap { trim: true });
+            frame.render_widget(body, layout[1]);
+            return;
+        }
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(42),
+                Constraint::Length(7),
+                Constraint::Length(6),
+                Constraint::Length(7),
+                Constraint::Length(10),
+            ],
+        )
+        .header(
+            Row::new(vec!["Selection", "Side", "Odds", "Stake", "Status"]).style(
+                Style::default()
+                    .fg(accent_green())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(section_block("󰋼 Matchbook Orders", accent_green()))
+        .column_spacing(1);
+        frame.render_widget(table, layout[1]);
+        return;
+    }
+
     let mut counts = BTreeMap::<String, usize>::new();
     for tracked_bet in &snapshot.tracked_bets {
         let source = if !tracked_bet.platform.is_empty() {

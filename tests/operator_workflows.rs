@@ -1,5 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use operator_console::app::{App, Panel, TradingSection};
 use operator_console::domain::{
@@ -9,12 +9,12 @@ use operator_console::domain::{
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 
 struct WorkflowProvider {
-    requests: Rc<RefCell<Vec<ProviderRequest>>>,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
     selected_venue: VenueId,
 }
 
 impl WorkflowProvider {
-    fn new(requests: Rc<RefCell<Vec<ProviderRequest>>>) -> Self {
+    fn new(requests: Arc<Mutex<Vec<ProviderRequest>>>) -> Self {
         Self {
             requests,
             selected_venue: VenueId::Smarkets,
@@ -24,7 +24,7 @@ impl WorkflowProvider {
 
 impl ExchangeProvider for WorkflowProvider {
     fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
-        self.requests.borrow_mut().push(request.clone());
+        self.requests.lock().expect("lock").push(request.clone());
 
         let snapshot = match request {
             ProviderRequest::LoadDashboard => workflow_snapshot(
@@ -84,7 +84,7 @@ impl ExchangeProvider for WorkflowProvider {
 
 #[test]
 fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
-    let requests = Rc::new(RefCell::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let mut app = App::from_provider(WorkflowProvider::new(requests.clone()))
         .expect("workflow provider should initialize");
 
@@ -93,6 +93,7 @@ fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
 
     app.select_next_exchange_row();
     app.select_next_exchange_row();
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.selected_venue(), Some(VenueId::Betway));
     assert_eq!(app.recorder_snapshot_mode(), "live");
@@ -100,25 +101,28 @@ fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
     assert_eq!(app.snapshot().status_line, "Captured betway live tab.");
 
     app.refresh().expect("cached refresh should succeed");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.recorder_snapshot_mode(), "cached");
     assert_eq!(app.snapshot().status_line, "Reused cached betway snapshot.");
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
 
     app.refresh_live().expect("live refresh should succeed");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.recorder_snapshot_mode(), "live");
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Error);
     assert!(app.snapshot().status_line.contains("unavailable"));
 
     app.select_previous_exchange_row();
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.selected_venue(), Some(VenueId::Smarkets));
     assert_eq!(app.recorder_snapshot_mode(), "cached");
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
     assert_eq!(app.snapshot().status_line, "Returned to Smarkets.");
     assert_eq!(
-        requests.borrow().clone(),
+        requests.lock().expect("lock").clone(),
         vec![
             ProviderRequest::LoadDashboard,
             ProviderRequest::SelectVenue(VenueId::Smarkets),

@@ -294,12 +294,15 @@ impl ExchangeProvider for NativeExchangeProvider {
 }
 
 pub struct HybridExchangeProvider {
-    primary: Box<dyn ExchangeProvider>,
-    fallback: Box<dyn ExchangeProvider>,
+    primary: Box<dyn ExchangeProvider + Send>,
+    fallback: Box<dyn ExchangeProvider + Send>,
 }
 
 impl HybridExchangeProvider {
-    pub fn new(primary: Box<dyn ExchangeProvider>, fallback: Box<dyn ExchangeProvider>) -> Self {
+    pub fn new(
+        primary: Box<dyn ExchangeProvider + Send>,
+        fallback: Box<dyn ExchangeProvider + Send>,
+    ) -> Self {
         Self { primary, fallback }
     }
 }

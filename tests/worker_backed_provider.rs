@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
@@ -138,12 +137,12 @@ fn temp_run_dir(prefix: &str) -> PathBuf {
 }
 
 struct RecordingWorkerClient {
-    last_request: Rc<RefCell<Option<WorkerRequest>>>,
+    last_request: Arc<Mutex<Option<WorkerRequest>>>,
 }
 
 impl WorkerClient for RecordingWorkerClient {
     fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse> {
-        *self.last_request.borrow_mut() = Some(request);
+        *self.last_request.lock().expect("lock") = Some(request);
         Ok(WorkerResponse {
             snapshot: ExchangePanelSnapshot {
                 exit_policy: ExitPolicySummary::default(),
@@ -156,7 +155,7 @@ impl WorkerClient for RecordingWorkerClient {
 
 #[test]
 fn worker_backed_provider_maps_cash_out_request() {
-    let last_request = Rc::new(RefCell::new(None));
+    let last_request = Arc::new(Mutex::new(None));
     let client = RecordingWorkerClient {
         last_request: last_request.clone(),
     };
@@ -184,7 +183,7 @@ fn worker_backed_provider_maps_cash_out_request() {
         .expect("cash out request should serialize");
 
     assert_eq!(
-        *last_request.borrow(),
+        *last_request.lock().expect("lock"),
         Some(WorkerRequest::CashOutTrackedBet {
             bet_id: String::from("bet-001"),
         })
@@ -193,7 +192,7 @@ fn worker_backed_provider_maps_cash_out_request() {
 
 #[test]
 fn worker_backed_provider_maps_execute_trading_action_request() {
-    let last_request = Rc::new(RefCell::new(None));
+    let last_request = Arc::new(Mutex::new(None));
     let client = RecordingWorkerClient {
         last_request: last_request.clone(),
     };
@@ -250,14 +249,14 @@ fn worker_backed_provider_maps_execute_trading_action_request() {
         .expect("execute trading action should serialize");
 
     assert_eq!(
-        *last_request.borrow(),
+        *last_request.lock().expect("lock"),
         Some(WorkerRequest::ExecuteTradingAction { intent })
     );
 }
 
 #[test]
 fn worker_backed_provider_maps_load_horse_matcher_request() {
-    let last_request = Rc::new(RefCell::new(None));
+    let last_request = Arc::new(Mutex::new(None));
     let client = RecordingWorkerClient {
         last_request: last_request.clone(),
     };
@@ -286,7 +285,7 @@ fn worker_backed_provider_maps_load_horse_matcher_request() {
         .expect("load horse matcher should serialize");
 
     assert_eq!(
-        *last_request.borrow(),
+        *last_request.lock().expect("lock"),
         Some(WorkerRequest::LoadHorseMatcher { query })
     );
 }

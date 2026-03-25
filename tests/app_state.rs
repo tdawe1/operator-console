@@ -1,5 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use operator_console::app::App;
@@ -12,13 +12,13 @@ use operator_console::trading_actions::TradingActionIntent;
 
 #[derive(Clone)]
 struct StubProvider {
-    snapshots: Rc<RefCell<Vec<ExchangePanelSnapshot>>>,
+    snapshots: Arc<Mutex<Vec<ExchangePanelSnapshot>>>,
 }
 
 impl StubProvider {
     fn new(snapshots: Vec<ExchangePanelSnapshot>) -> Self {
         Self {
-            snapshots: Rc::new(RefCell::new(snapshots)),
+            snapshots: Arc::new(Mutex::new(snapshots)),
         }
     }
 }
@@ -28,27 +28,29 @@ impl ExchangeProvider for StubProvider {
         match request {
             ProviderRequest::LoadDashboard
             | ProviderRequest::RefreshCached
-            | ProviderRequest::RefreshLive => Ok(self.snapshots.borrow_mut().remove(0)),
+            | ProviderRequest::RefreshLive => Ok(self.snapshots.lock().expect("lock").remove(0)),
             ProviderRequest::SelectVenue(_) => unreachable!("selection not used in this test"),
             ProviderRequest::CashOutTrackedBet { .. }
             | ProviderRequest::ExecuteTradingAction { .. }
-            | ProviderRequest::LoadHorseMatcher { .. } => Ok(self.snapshots.borrow_mut().remove(0)),
+            | ProviderRequest::LoadHorseMatcher { .. } => {
+                Ok(self.snapshots.lock().expect("lock").remove(0))
+            }
         }
     }
 }
 
 struct RecordingActionProvider {
-    captured: Rc<RefCell<Option<TradingActionIntent>>>,
-    snapshots: Rc<RefCell<Vec<ExchangePanelSnapshot>>>,
+    captured: Arc<Mutex<Option<TradingActionIntent>>>,
+    snapshots: Arc<Mutex<Vec<ExchangePanelSnapshot>>>,
 }
 
 impl ExchangeProvider for RecordingActionProvider {
     fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
         match request {
-            ProviderRequest::LoadDashboard => Ok(self.snapshots.borrow_mut().remove(0)),
+            ProviderRequest::LoadDashboard => Ok(self.snapshots.lock().expect("lock").remove(0)),
             ProviderRequest::ExecuteTradingAction { intent } => {
-                *self.captured.borrow_mut() = Some(intent);
-                Ok(self.snapshots.borrow_mut().remove(0))
+                *self.captured.lock().expect("lock") = Some(intent);
+                Ok(self.snapshots.lock().expect("lock").remove(0))
             }
             ProviderRequest::RefreshCached
             | ProviderRequest::RefreshLive
@@ -73,6 +75,7 @@ fn app_refresh_replaces_exchange_snapshot() {
     assert_eq!(app.status_message(), "Initial dashboard");
 
     app.refresh().expect("refresh should succeed");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
     assert_eq!(app.snapshot().status_line, "Refreshed dashboard");
     assert_eq!(app.status_message(), "Refreshed dashboard");
     assert_eq!(app.snapshot().venues[0].label, "Smarkets");
@@ -90,6 +93,7 @@ fn app_cash_out_uses_provider_action_and_replaces_snapshot() {
 
     app.cash_out_next_actionable_bet()
         .expect("cash out should succeed");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.snapshot().status_line, "Cash out requested");
     assert_eq!(app.status_message(), "Cash out requested");
@@ -101,14 +105,14 @@ fn app_cash_out_uses_provider_action_and_replaces_snapshot() {
 
 #[test]
 fn app_executes_positions_trading_action_via_provider() {
-    let captured = Rc::new(RefCell::new(None));
+    let captured = Arc::new(Mutex::new(None));
     let initial = sample_snapshot("Initial dashboard");
     let mut executed = sample_snapshot("Action executed");
     executed.worker.detail = String::from("Smarkets review ready");
 
     let mut app = App::from_provider(RecordingActionProvider {
         captured: captured.clone(),
-        snapshots: Rc::new(RefCell::new(vec![initial, executed])),
+        snapshots: Arc::new(Mutex::new(vec![initial, executed])),
     })
     .expect("app should load initial snapshot");
     app.set_trading_section(operator_console::app::TradingSection::Positions);
@@ -117,9 +121,11 @@ fn app_executes_positions_trading_action_via_provider() {
     assert!(app.trading_action_overlay().is_some());
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Enter);
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     let intent = captured
-        .borrow()
+        .lock()
+        .expect("lock")
         .clone()
         .expect("execute request should be captured");
     assert_eq!(intent.selection_name, "Draw");

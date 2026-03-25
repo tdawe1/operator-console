@@ -194,12 +194,12 @@ fn oddsmatcher_app() -> (tempfile::TempDir, App) {
         Box::new(|| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Stub dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(|_| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Recorder dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(DisabledSupervisor),
         RecorderConfig::default(),

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use color_eyre::eyre::eyre;
 
 use operator_console::app::App;
@@ -38,9 +40,8 @@ fn refresh_failure_marks_worker_error_and_preserves_selection() {
     })
     .expect("app should load initial snapshot");
 
-    let error = app.refresh().expect_err("refresh should fail");
-
-    assert!(error.to_string().contains("worker session closed"));
+    app.refresh().expect("refresh should queue");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
     assert_eq!(app.selected_venue(), Some(VenueId::Smarkets));
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Error);
     assert!(app

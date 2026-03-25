@@ -47,7 +47,7 @@ fn live_operator_smoke_exercises_real_recorder_flow() -> Result<()> {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(|config| {
@@ -66,7 +66,7 @@ fn live_operator_smoke_exercises_real_recorder_flow() -> Result<()> {
                     hard_margin_call_profit_floor: None,
                     warn_only_default: config.warn_only_default,
                 },
-            )) as Box<dyn ExchangeProvider>
+            )) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(ProcessRecorderSupervisor::default()),
         recorder_config,

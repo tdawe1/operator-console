@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crossterm::event::KeyCode;
 use operator_console::app::{App, Panel, TradingSection};
@@ -80,7 +81,7 @@ fn recorder_start_and_stop_are_controllable_from_app() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -88,7 +89,7 @@ fn recorder_start_and_stop_are_controllable_from_app() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -105,12 +106,14 @@ fn recorder_start_and_stop_are_controllable_from_app() {
     app.set_active_panel(Panel::Trading);
     app.set_trading_section(TradingSection::Recorder);
     app.start_recorder().expect("start recorder");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
     assert_eq!(app.recorder_status(), &RecorderStatus::Running);
     assert_eq!(app.snapshot().status_line, "Recorder dashboard");
     assert_eq!(started.borrow().len(), 1);
     assert_eq!(started.borrow()[0], recorder_config);
 
     app.stop_recorder().expect("stop recorder");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
     assert_eq!(app.recorder_status(), &RecorderStatus::Disabled);
     assert_eq!(app.snapshot().status_line, "Stub dashboard");
     assert_eq!(*stopped.borrow(), 1);
@@ -133,7 +136,7 @@ fn recorder_config_is_editable_before_starting() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -141,7 +144,7 @@ fn recorder_config_is_editable_before_starting() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -304,12 +307,12 @@ fn recorder_config_can_cycle_field_suggestions() {
         Box::new(|| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Stub dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(|_| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Recorder dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(FakeSupervisor {
             started: Rc::new(RefCell::new(Vec::new())),
@@ -362,7 +365,7 @@ fn recorder_config_edit_restarts_running_recorder() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -370,7 +373,7 @@ fn recorder_config_edit_restarts_running_recorder() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -404,13 +407,14 @@ fn recorder_config_edit_restarts_running_recorder() {
     app.handle_key(KeyCode::Char('1'));
     app.handle_key(KeyCode::Char('0'));
     app.handle_key(KeyCode::Enter);
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.recorder_config().interval_seconds, 10);
     assert_eq!(started.borrow().len(), 2);
     assert_eq!(started.borrow()[1].interval_seconds, 10);
     assert_eq!(*stopped.borrow(), 1);
     assert_eq!(app.recorder_status(), &RecorderStatus::Running);
-    assert!(app.status_message().contains("Restarted recorder"));
+    assert_eq!(app.snapshot().status_line, "Recorder dashboard");
 }
 
 #[test]
@@ -430,7 +434,7 @@ fn recorder_provider_swap_clamps_stale_exchange_selection() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -438,7 +442,7 @@ fn recorder_provider_swap_clamps_stale_exchange_selection() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -487,7 +491,7 @@ fn recorder_start_is_global_and_switches_into_trading_positions() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -495,7 +499,7 @@ fn recorder_start_is_global_and_switches_into_trading_positions() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -535,7 +539,7 @@ fn quitting_app_stops_a_running_recorder() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -543,7 +547,7 @@ fn quitting_app_stops_a_running_recorder() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -578,12 +582,12 @@ fn recorder_autostart_field_is_editable_and_persisted() {
         Box::new(|| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Stub dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(|_| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Recorder dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(FakeSupervisor {
             started: Rc::new(RefCell::new(Vec::new())),
@@ -630,7 +634,7 @@ fn recorder_can_autostart_from_saved_config() {
             move || {
                 Box::new(StaticProvider {
                     snapshot: stub_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new({
@@ -638,7 +642,7 @@ fn recorder_can_autostart_from_saved_config() {
             move |_| {
                 Box::new(StaticProvider {
                     snapshot: recorder_snapshot.clone(),
-                }) as Box<dyn ExchangeProvider>
+                }) as Box<dyn ExchangeProvider + Send>
             }
         }),
         Box::new(FakeSupervisor {
@@ -657,6 +661,7 @@ fn recorder_can_autostart_from_saved_config() {
 
     app.autostart_recorder_if_enabled()
         .expect("autostart recorder");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     assert_eq!(app.recorder_status(), &RecorderStatus::Running);
     assert_eq!(app.snapshot().status_line, "Recorder dashboard");
@@ -676,12 +681,12 @@ fn recorder_reload_outside_recorder_panel_reports_guidance() {
         Box::new(|| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Stub dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(|_| {
             Box::new(StaticProvider {
                 snapshot: sample_snapshot("Recorder dashboard"),
-            }) as Box<dyn ExchangeProvider>
+            }) as Box<dyn ExchangeProvider + Send>
         }),
         Box::new(FakeSupervisor {
             started: Rc::new(RefCell::new(Vec::new())),
