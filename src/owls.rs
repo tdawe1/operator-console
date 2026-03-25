@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
@@ -14,6 +14,14 @@ const DEFAULT_PLAYER: &str = "LeBron James";
 const DEFAULT_PROP_TYPE: &str = "points";
 const DEFAULT_BOOKS: &str = "pinnacle,bet365,betmgm";
 const DEFAULT_BOOK_PROPS_PLAYER: &str = "LeBron";
+const HOT_SYNC_INTERVAL: Duration = Duration::from_secs(3);
+const WARM_SYNC_INTERVAL: Duration = Duration::from_secs(10);
+const COOL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const COLD_SYNC_INTERVAL: Duration = Duration::from_secs(120);
+const BACKGROUND_SYNC_BATCH: usize = 3;
+pub const SUPPORTED_SPORTS: &[&str] = &[
+    "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "epl", "mma", "tennis", "cs2",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwlsEndpointGroup {
@@ -98,24 +106,18 @@ pub struct OwlsDashboard {
     pub sport: String,
     pub status_line: String,
     pub refreshed_at: String,
+    pub last_sync_mode: String,
+    pub sync_checks: usize,
+    pub sync_changes: usize,
+    pub total_polls: usize,
     pub groups: Vec<OwlsGroupSummary>,
     pub endpoints: Vec<OwlsEndpointSummary>,
+    seeds: OwlsSeeds,
 }
 
 impl Default for OwlsDashboard {
     fn default() -> Self {
-        let endpoints = catalog_specs()
-            .iter()
-            .map(OwlsEndpointSummary::from_spec)
-            .collect::<Vec<_>>();
-        let groups = build_group_summaries(&endpoints);
-        Self {
-            sport: String::from(DEFAULT_SPORT),
-            status_line: String::from("Owls catalog loaded. Press r to hydrate the API surface."),
-            refreshed_at: String::new(),
-            groups,
-            endpoints,
-        }
+        dashboard_for_sport(DEFAULT_SPORT)
     }
 }
 
@@ -141,25 +143,35 @@ pub struct OwlsEndpointSummary {
     pub status: String,
     pub count: usize,
     pub updated_at: String,
+    pub poll_count: usize,
+    pub change_count: usize,
     pub detail: String,
     pub preview: Vec<OwlsPreviewRow>,
+    last_checked_at: Option<Instant>,
 }
 
 impl OwlsEndpointSummary {
     fn from_spec(spec: &OwlsEndpointSpec) -> Self {
+        Self::from_spec_for_sport(spec, DEFAULT_SPORT)
+    }
+
+    fn from_spec_for_sport(spec: &OwlsEndpointSpec, sport: &str) -> Self {
         Self {
             id: spec.id,
             group: spec.group,
-            label: String::from(spec.label),
+            label: spec.label_for_sport(sport),
             method: String::from("GET"),
-            path: spec.path.replace("{sport}", DEFAULT_SPORT),
+            path: spec.path.replace("{sport}", sport),
             description: String::from(spec.description),
             query_hint: String::from(spec.query_hint),
             status: String::from("idle"),
             count: 0,
             updated_at: String::new(),
+            poll_count: 0,
+            change_count: 0,
             detail: String::from("Press r to hydrate"),
             preview: Vec::new(),
+            last_checked_at: None,
         }
     }
 }
@@ -181,6 +193,15 @@ struct OwlsEndpointSpec {
     query_hint: &'static str,
 }
 
+impl OwlsEndpointSpec {
+    fn label_for_sport(&self, sport: &str) -> String {
+        match self.id {
+            OwlsEndpointId::ScoresSport => format!("Scores {}", sport.to_uppercase()),
+            _ => String::from(self.label),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct OwlsSeeds {
     history_event_id: Option<String>,
@@ -192,6 +213,29 @@ struct OwlsSeeds {
     cs2_match_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwlsSyncReason {
+    Manual,
+    Background,
+}
+
+impl OwlsSyncReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Background => "monitor",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OwlsSyncOutcome {
+    pub dashboard: OwlsDashboard,
+    pub checked_count: usize,
+    pub changed_count: usize,
+    pub changed: bool,
+}
+
 pub fn build_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -201,15 +245,63 @@ pub fn build_client() -> Result<Client> {
 }
 
 pub fn fetch_dashboard(client: &Client) -> OwlsDashboard {
-    let mut dashboard = OwlsDashboard::default();
+    sync_dashboard(
+        client,
+        &dashboard_for_sport(DEFAULT_SPORT),
+        OwlsSyncReason::Manual,
+        None,
+    )
+    .dashboard
+}
+
+pub fn dashboard_for_sport(sport: &str) -> OwlsDashboard {
+    let normalized_sport = normalize_sport(sport);
+    let endpoints = catalog_specs()
+        .iter()
+        .map(|spec| OwlsEndpointSummary::from_spec_for_sport(spec, &normalized_sport))
+        .collect::<Vec<_>>();
+    let groups = build_group_summaries(&endpoints);
+    OwlsDashboard {
+        sport: normalized_sport,
+        status_line: String::from("Owls catalog loaded. Press r to hydrate the API surface."),
+        refreshed_at: String::new(),
+        last_sync_mode: String::from("idle"),
+        sync_checks: 0,
+        sync_changes: 0,
+        total_polls: 0,
+        groups,
+        endpoints,
+        seeds: OwlsSeeds::default(),
+    }
+}
+
+pub fn sync_dashboard(
+    client: &Client,
+    previous: &OwlsDashboard,
+    reason: OwlsSyncReason,
+    focused: Option<OwlsEndpointId>,
+) -> OwlsSyncOutcome {
+    let mut dashboard = previous.clone();
+    if dashboard.endpoints.is_empty() {
+        dashboard = dashboard_for_sport(&dashboard.sport);
+    }
+    let sport = normalize_sport(&dashboard.sport);
+    dashboard.sport = sport.clone();
 
     let api_key = match load_api_key() {
         Ok(value) => value,
         Err(error) => {
+            let previous_dashboard = dashboard.clone();
             mark_all_endpoints_error(&mut dashboard, &error.to_string());
             dashboard.status_line = format!("Owls unavailable: {error}");
+            dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
-            return dashboard;
+            return OwlsSyncOutcome {
+                changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
+                dashboard,
+                checked_count: 0,
+                changed_count: 0,
+            };
         }
     };
 
@@ -217,469 +309,36 @@ pub fn fetch_dashboard(client: &Client) -> OwlsDashboard {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
+    let due_ids = due_endpoint_ids(&dashboard, reason, focused);
 
-    let history_games = fetch_json(
-        client,
-        &base_url,
-        &api_key,
-        "/api/v1/history/games",
-        &[("sport", DEFAULT_SPORT), ("limit", "1")],
-    );
-    let history_tennis_games = fetch_json(
-        client,
-        &base_url,
-        &api_key,
-        "/api/v1/history/games",
-        &[("sport", "tennis"), ("limit", "1")],
-    );
-    let props = fetch_json(
-        client,
-        &base_url,
-        &api_key,
-        &format!("/api/v1/{DEFAULT_SPORT}/props"),
-        &[
-            ("player", DEFAULT_BOOK_PROPS_PLAYER),
-            ("books", DEFAULT_BOOKS),
-        ],
-    );
-    let kalshi_series = fetch_json(client, &base_url, &api_key, "/api/v1/kalshi/series", &[]);
-    let cs2_matches = fetch_json(
-        client,
-        &base_url,
-        &api_key,
-        "/api/v1/history/cs2/matches",
-        &[("limit", "1")],
-    );
+    if due_ids.is_empty() {
+        dashboard.last_sync_mode = String::from(reason.label());
+        return OwlsSyncOutcome {
+            dashboard,
+            checked_count: 0,
+            changed_count: 0,
+            changed: false,
+        };
+    }
 
-    let mut seeds = OwlsSeeds::default();
-    if let Ok(value) = &history_games {
-        seeds.history_event_id = first_history_event_id(value);
-    }
-    if let Ok(value) = &history_tennis_games {
-        seeds.tennis_event_id = first_history_event_id(value);
-    }
-    if let Ok(value) = &props {
-        let (game_id, player, category) = first_props_seed(value);
-        seeds.props_game_id = game_id;
-        seeds.props_player = player;
-        seeds.props_category = category;
-    }
-    if let Ok(value) = &kalshi_series {
-        seeds.kalshi_series_ticker = first_non_empty_string(
-            value.pointer("/data/0"),
-            &["series_ticker", "ticker", "seriesTicker"],
+    let previous_dashboard = dashboard.clone();
+    let mut checked_count = 0usize;
+    let mut changed_count = 0usize;
+
+    for id in due_ids {
+        checked_count += 1;
+        let summary = fetch_endpoint_summary(
+            client,
+            &base_url,
+            &api_key,
+            &sport,
+            id,
+            &mut dashboard.seeds,
         );
+        if merge_endpoint(&mut dashboard, summary) {
+            changed_count += 1;
+        }
     }
-    if let Ok(value) = &cs2_matches {
-        seeds.cs2_match_id = first_non_empty_string(
-            value
-                .pointer("/data/matches/0")
-                .or_else(|| value.pointer("/data/0")),
-            &["matchId", "id", "slug"],
-        );
-    }
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Odds,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/odds"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
-            ),
-            parse_book_market_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Moneyline,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/moneyline"),
-                &[("books", DEFAULT_BOOKS)],
-            ),
-            parse_book_market_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Spreads,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/spreads"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
-            ),
-            parse_book_market_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Totals,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/totals"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
-            ),
-            parse_book_market_summary,
-        ),
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(OwlsEndpointId::Props, props, parse_props_summary),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::FanDuelProps,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/props/fanduel"),
-                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
-            ),
-            parse_book_props_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::BetMgmProps,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/props/betmgm"),
-                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
-            ),
-            parse_book_props_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Bet365Props,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/props/bet365"),
-                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
-            ),
-            parse_book_props_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        match (
-            seeds.props_game_id.as_deref(),
-            seeds.props_player.as_deref(),
-            seeds.props_category.as_deref(),
-        ) {
-            (Some(game_id), Some(player), Some(category)) => hydrate_result(
-                OwlsEndpointId::PropsHistory,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    &format!("/api/v1/{DEFAULT_SPORT}/props/history"),
-                    &[
-                        ("game_id", game_id),
-                        ("player", player),
-                        ("category", category),
-                        ("hours", "12"),
-                    ],
-                ),
-                parse_props_history_summary,
-            ),
-            _ => waiting_summary(
-                OwlsEndpointId::PropsHistory,
-                "Awaiting a sampled props game, player, and category.",
-            ),
-        },
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::ScoresAll,
-            fetch_json(client, &base_url, &api_key, "/api/v1/scores/live", &[]),
-            parse_all_scores_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::ScoresSport,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/scores/live"),
-                &[],
-            ),
-            parse_scores_summary,
-        ),
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Stats,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/stats"),
-                &[("player", DEFAULT_PLAYER)],
-            ),
-            parse_stats_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Averages,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/stats/averages"),
-                &[("playerName", DEFAULT_PLAYER)],
-            ),
-            parse_averages_summary,
-        ),
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::KalshiMarkets,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/kalshi/{DEFAULT_SPORT}/markets"),
-                &[("limit", "5")],
-            ),
-            parse_prediction_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::KalshiSeries,
-            kalshi_series,
-            parse_prediction_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        match seeds.kalshi_series_ticker.as_deref() {
-            Some(series_ticker) => hydrate_result(
-                OwlsEndpointId::KalshiSeriesMarkets,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    &format!("/api/v1/kalshi/series/{series_ticker}/markets"),
-                    &[("limit", "5")],
-                ),
-                parse_prediction_summary,
-            ),
-            None => waiting_summary(
-                OwlsEndpointId::KalshiSeriesMarkets,
-                "Awaiting a Kalshi series ticker.",
-            ),
-        },
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::PolymarketMarkets,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/polymarket/{DEFAULT_SPORT}/markets"),
-                &[],
-            ),
-            parse_prediction_summary,
-        ),
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::HistoryGames,
-            history_games,
-            parse_history_games_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        match seeds.history_event_id.as_deref() {
-            Some(event_id) => hydrate_result(
-                OwlsEndpointId::HistoryOdds,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    "/api/v1/history/odds",
-                    &[("eventId", event_id), ("limit", "5")],
-                ),
-                parse_history_snapshot_summary,
-            ),
-            None => waiting_summary(
-                OwlsEndpointId::HistoryOdds,
-                "Awaiting a sampled history event id.",
-            ),
-        },
-    );
-    set_endpoint(
-        &mut dashboard,
-        match seeds.history_event_id.as_deref() {
-            Some(event_id) => hydrate_result(
-                OwlsEndpointId::HistoryProps,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    "/api/v1/history/props",
-                    &[
-                        ("eventId", event_id),
-                        ("playerName", DEFAULT_PLAYER),
-                        ("propType", DEFAULT_PROP_TYPE),
-                        ("limit", "5"),
-                    ],
-                ),
-                parse_history_snapshot_summary,
-            ),
-            None => waiting_summary(
-                OwlsEndpointId::HistoryProps,
-                "Awaiting a sampled history event id.",
-            ),
-        },
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::HistoryStats,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                "/api/v1/history/stats",
-                &[
-                    ("playerName", DEFAULT_PLAYER),
-                    ("sport", DEFAULT_SPORT),
-                    ("limit", "5"),
-                ],
-            ),
-            parse_history_stats_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::HistoryAverages,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                "/api/v1/history/stats/averages",
-                &[("playerName", DEFAULT_PLAYER), ("sport", DEFAULT_SPORT)],
-            ),
-            parse_averages_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        match seeds.tennis_event_id.as_deref() {
-            Some(event_id) => hydrate_result(
-                OwlsEndpointId::TennisStats,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    "/api/v1/history/tennis-stats",
-                    &[("eventId", event_id)],
-                ),
-                parse_tennis_stats_summary,
-            ),
-            None => waiting_summary(
-                OwlsEndpointId::TennisStats,
-                "Awaiting a sampled tennis history event id.",
-            ),
-        },
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Cs2Matches,
-            cs2_matches,
-            parse_cs2_matches_summary,
-        ),
-    );
-    set_endpoint(
-        &mut dashboard,
-        match seeds.cs2_match_id.as_deref() {
-            Some(match_id) => hydrate_result(
-                OwlsEndpointId::Cs2Match,
-                fetch_json(
-                    client,
-                    &base_url,
-                    &api_key,
-                    &format!("/api/v1/history/cs2/matches/{match_id}"),
-                    &[],
-                ),
-                parse_cs2_match_summary,
-            ),
-            None => waiting_summary(OwlsEndpointId::Cs2Match, "Awaiting a sampled CS2 match id."),
-        },
-    );
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Cs2Players,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                "/api/v1/history/cs2/players",
-                &[("limit", "5")],
-            ),
-            parse_cs2_players_summary,
-        ),
-    );
-
-    set_endpoint(
-        &mut dashboard,
-        hydrate_result(
-            OwlsEndpointId::Realtime,
-            fetch_json(
-                client,
-                &base_url,
-                &api_key,
-                &format!("/api/v1/{DEFAULT_SPORT}/realtime"),
-                &[],
-            ),
-            parse_realtime_summary,
-        ),
-    );
 
     dashboard.groups = build_group_summaries(&dashboard.endpoints);
     dashboard.refreshed_at = dashboard
@@ -688,27 +347,654 @@ pub fn fetch_dashboard(client: &Client) -> OwlsDashboard {
         .find_map(|endpoint| {
             (!endpoint.updated_at.is_empty()).then_some(endpoint.updated_at.clone())
         })
-        .unwrap_or_default();
-    let ready_count = dashboard
-        .endpoints
-        .iter()
-        .filter(|item| item.status == "ready")
-        .count();
-    let error_count = dashboard
-        .endpoints
-        .iter()
-        .filter(|item| item.status == "error")
-        .count();
-    let waiting_count = dashboard
-        .endpoints
-        .iter()
-        .filter(|item| item.status == "waiting")
-        .count();
-    dashboard.status_line = format!(
-        "Owls REST surface hydrated: {ready_count} ready, {waiting_count} waiting, {error_count} error."
-    );
+        .unwrap_or_else(|| previous_dashboard.refreshed_at.clone());
+    dashboard.last_sync_mode = String::from(reason.label());
+    dashboard.sync_checks = checked_count;
+    dashboard.sync_changes = changed_count;
+    dashboard.total_polls += checked_count;
+    dashboard.status_line = if changed_count == 0 {
+        format!(
+            "Owls monitor steady: checked {checked_count} endpoint{} and found no changes.",
+            if checked_count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Owls {} sync applied {changed_count} endpoint change{} after checking {checked_count}.",
+            reason.label(),
+            if changed_count == 1 { "" } else { "s" }
+        )
+    };
 
-    dashboard
+    OwlsSyncOutcome {
+        changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
+        dashboard,
+        checked_count,
+        changed_count,
+    }
+}
+
+fn due_endpoint_ids(
+    dashboard: &OwlsDashboard,
+    reason: OwlsSyncReason,
+    focused: Option<OwlsEndpointId>,
+) -> Vec<OwlsEndpointId> {
+    if matches!(reason, OwlsSyncReason::Manual) {
+        return dashboard
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id)
+            .collect();
+    }
+
+    let now = Instant::now();
+    let mut due = dashboard
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint_due(endpoint, now, focused))
+        .collect::<Vec<_>>();
+    due.sort_by_key(|endpoint| background_priority(endpoint, focused));
+    due.into_iter()
+        .take(BACKGROUND_SYNC_BATCH)
+        .map(|endpoint| endpoint.id)
+        .collect()
+}
+
+fn endpoint_due(
+    endpoint: &OwlsEndpointSummary,
+    now: Instant,
+    focused: Option<OwlsEndpointId>,
+) -> bool {
+    let Some(last_checked_at) = endpoint.last_checked_at else {
+        return true;
+    };
+    let mut interval = endpoint_interval(endpoint.group);
+    if focused == Some(endpoint.id) {
+        interval = interval.min(HOT_SYNC_INTERVAL);
+    }
+    now.duration_since(last_checked_at) >= interval
+}
+
+fn endpoint_interval(group: OwlsEndpointGroup) -> Duration {
+    match group {
+        OwlsEndpointGroup::Realtime | OwlsEndpointGroup::Scores => HOT_SYNC_INTERVAL,
+        OwlsEndpointGroup::Odds | OwlsEndpointGroup::Props => WARM_SYNC_INTERVAL,
+        OwlsEndpointGroup::Stats | OwlsEndpointGroup::Prediction => COOL_SYNC_INTERVAL,
+        OwlsEndpointGroup::History => COLD_SYNC_INTERVAL,
+    }
+}
+
+fn background_priority(
+    endpoint: &OwlsEndpointSummary,
+    focused: Option<OwlsEndpointId>,
+) -> (usize, usize, usize) {
+    let focus_rank = if focused == Some(endpoint.id) { 0 } else { 1 };
+    let freshness_rank = if endpoint.last_checked_at.is_none() {
+        0
+    } else {
+        1
+    };
+    (focus_rank, freshness_rank, group_rank(endpoint.group))
+}
+
+fn group_rank(group: OwlsEndpointGroup) -> usize {
+    match group {
+        OwlsEndpointGroup::Realtime => 0,
+        OwlsEndpointGroup::Scores => 1,
+        OwlsEndpointGroup::Odds => 2,
+        OwlsEndpointGroup::Props => 3,
+        OwlsEndpointGroup::Stats => 4,
+        OwlsEndpointGroup::Prediction => 5,
+        OwlsEndpointGroup::History => 6,
+    }
+}
+
+fn fetch_endpoint_summary(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    id: OwlsEndpointId,
+    seeds: &mut OwlsSeeds,
+) -> OwlsEndpointSummary {
+    match id {
+        OwlsEndpointId::Odds => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/odds"),
+                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+            ),
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Moneyline => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/moneyline"),
+                &[("books", DEFAULT_BOOKS)],
+            ),
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Spreads => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/spreads"),
+                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+            ),
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Totals => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/totals"),
+                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+            ),
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Props => {
+            let payload = fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props"),
+                &[
+                    ("player", DEFAULT_BOOK_PROPS_PLAYER),
+                    ("books", DEFAULT_BOOKS),
+                ],
+            );
+            if let Ok(value) = &payload {
+                let (game_id, player, category) = first_props_seed(value);
+                seeds.props_game_id = game_id;
+                seeds.props_player = player;
+                seeds.props_category = category;
+            }
+            hydrate_result(id, payload, parse_props_summary)
+        }
+        OwlsEndpointId::FanDuelProps => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/fanduel"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            ),
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::BetMgmProps => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/betmgm"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            ),
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::Bet365Props => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/bet365"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            ),
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::PropsHistory => {
+            ensure_props_seed(client, base_url, api_key, sport, seeds);
+            match (
+                seeds.props_game_id.as_deref(),
+                seeds.props_player.as_deref(),
+                seeds.props_category.as_deref(),
+            ) {
+                (Some(game_id), Some(player), Some(category)) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/{sport}/props/history"),
+                        &[
+                            ("game_id", game_id),
+                            ("player", player),
+                            ("category", category),
+                            ("hours", "12"),
+                        ],
+                    ),
+                    parse_props_history_summary,
+                ),
+                _ => waiting_summary(id, "Awaiting a sampled props game, player, and category."),
+            }
+        }
+        OwlsEndpointId::ScoresAll => hydrate_result(
+            id,
+            fetch_json(client, base_url, api_key, "/api/v1/scores/live", &[]),
+            parse_all_scores_summary,
+        ),
+        OwlsEndpointId::ScoresSport => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/scores/live"),
+                &[],
+            ),
+            parse_scores_summary,
+        ),
+        OwlsEndpointId::Stats => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/stats"),
+                &[("player", DEFAULT_PLAYER)],
+            ),
+            parse_stats_summary,
+        ),
+        OwlsEndpointId::Averages => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/stats/averages"),
+                &[("playerName", DEFAULT_PLAYER)],
+            ),
+            parse_averages_summary,
+        ),
+        OwlsEndpointId::KalshiMarkets => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/kalshi/{sport}/markets"),
+                &[("limit", "5")],
+            ),
+            parse_prediction_summary,
+        ),
+        OwlsEndpointId::KalshiSeries => {
+            let payload = fetch_json(client, base_url, api_key, "/api/v1/kalshi/series", &[]);
+            if let Ok(value) = &payload {
+                seeds.kalshi_series_ticker = first_non_empty_string(
+                    value.pointer("/data/0"),
+                    &["series_ticker", "ticker", "seriesTicker"],
+                );
+            }
+            hydrate_result(id, payload, parse_prediction_summary)
+        }
+        OwlsEndpointId::KalshiSeriesMarkets => {
+            ensure_kalshi_series_seed(client, base_url, api_key, seeds);
+            match seeds.kalshi_series_ticker.as_deref() {
+                Some(series_ticker) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/kalshi/series/{series_ticker}/markets"),
+                        &[("limit", "5")],
+                    ),
+                    parse_prediction_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a Kalshi series ticker."),
+            }
+        }
+        OwlsEndpointId::PolymarketMarkets => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/polymarket/{sport}/markets"),
+                &[],
+            ),
+            parse_prediction_summary,
+        ),
+        OwlsEndpointId::HistoryGames => {
+            let payload = fetch_json(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/games",
+                &[("sport", sport), ("limit", "1")],
+            );
+            if let Ok(value) = &payload {
+                seeds.history_event_id = first_history_event_id(value);
+            }
+            hydrate_result(id, payload, parse_history_games_summary)
+        }
+        OwlsEndpointId::HistoryOdds => {
+            ensure_history_seed(client, base_url, api_key, sport, seeds);
+            match seeds.history_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/odds",
+                        &[("eventId", event_id), ("limit", "5")],
+                    ),
+                    parse_history_snapshot_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled history event id."),
+            }
+        }
+        OwlsEndpointId::HistoryProps => {
+            ensure_history_seed(client, base_url, api_key, sport, seeds);
+            match seeds.history_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/props",
+                        &[
+                            ("eventId", event_id),
+                            ("playerName", DEFAULT_PLAYER),
+                            ("propType", DEFAULT_PROP_TYPE),
+                            ("limit", "5"),
+                        ],
+                    ),
+                    parse_history_snapshot_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled history event id."),
+            }
+        }
+        OwlsEndpointId::HistoryStats => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/stats",
+                &[
+                    ("playerName", DEFAULT_PLAYER),
+                    ("sport", sport),
+                    ("limit", "5"),
+                ],
+            ),
+            parse_history_stats_summary,
+        ),
+        OwlsEndpointId::HistoryAverages => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/stats/averages",
+                &[("playerName", DEFAULT_PLAYER), ("sport", sport)],
+            ),
+            parse_averages_summary,
+        ),
+        OwlsEndpointId::TennisStats => {
+            ensure_tennis_seed(client, base_url, api_key, seeds);
+            match seeds.tennis_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/tennis-stats",
+                        &[("eventId", event_id)],
+                    ),
+                    parse_tennis_stats_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled tennis history event id."),
+            }
+        }
+        OwlsEndpointId::Cs2Matches => {
+            let payload = fetch_json(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/cs2/matches",
+                &[("limit", "1")],
+            );
+            if let Ok(value) = &payload {
+                seeds.cs2_match_id = first_non_empty_string(
+                    value
+                        .pointer("/data/matches/0")
+                        .or_else(|| value.pointer("/data/0")),
+                    &["matchId", "id", "slug"],
+                );
+            }
+            hydrate_result(id, payload, parse_cs2_matches_summary)
+        }
+        OwlsEndpointId::Cs2Match => {
+            ensure_cs2_seed(client, base_url, api_key, seeds);
+            match seeds.cs2_match_id.as_deref() {
+                Some(match_id) => hydrate_result(
+                    id,
+                    fetch_json(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/history/cs2/matches/{match_id}"),
+                        &[],
+                    ),
+                    parse_cs2_match_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled CS2 match id."),
+            }
+        }
+        OwlsEndpointId::Cs2Players => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/cs2/players",
+                &[("limit", "5")],
+            ),
+            parse_cs2_players_summary,
+        ),
+        OwlsEndpointId::Realtime => hydrate_result(
+            id,
+            fetch_json(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/realtime"),
+                &[],
+            ),
+            parse_realtime_summary,
+        ),
+    }
+}
+
+fn ensure_history_seed(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.history_event_id.is_some() {
+        return;
+    }
+    let payload = fetch_json(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/games",
+        &[("sport", sport), ("limit", "1")],
+    );
+    if let Ok(value) = payload {
+        seeds.history_event_id = first_history_event_id(&value);
+    }
+}
+
+fn ensure_tennis_seed(client: &Client, base_url: &str, api_key: &str, seeds: &mut OwlsSeeds) {
+    if seeds.tennis_event_id.is_some() {
+        return;
+    }
+    let payload = fetch_json(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/games",
+        &[("sport", "tennis"), ("limit", "1")],
+    );
+    if let Ok(value) = payload {
+        seeds.tennis_event_id = first_history_event_id(&value);
+    }
+}
+
+fn ensure_props_seed(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.props_game_id.is_some()
+        && seeds.props_player.is_some()
+        && seeds.props_category.is_some()
+    {
+        return;
+    }
+    let payload = fetch_json(
+        client,
+        base_url,
+        api_key,
+        &format!("/api/v1/{sport}/props"),
+        &[
+            ("player", DEFAULT_BOOK_PROPS_PLAYER),
+            ("books", DEFAULT_BOOKS),
+        ],
+    );
+    if let Ok(value) = payload {
+        let (game_id, player, category) = first_props_seed(&value);
+        seeds.props_game_id = game_id;
+        seeds.props_player = player;
+        seeds.props_category = category;
+    }
+}
+
+fn normalize_sport(value: &str) -> String {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() {
+        String::from(DEFAULT_SPORT)
+    } else {
+        trimmed
+    }
+}
+
+fn ensure_kalshi_series_seed(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.kalshi_series_ticker.is_some() {
+        return;
+    }
+    let payload = fetch_json(client, base_url, api_key, "/api/v1/kalshi/series", &[]);
+    if let Ok(value) = payload {
+        seeds.kalshi_series_ticker = first_non_empty_string(
+            value.pointer("/data/0"),
+            &["series_ticker", "ticker", "seriesTicker"],
+        );
+    }
+}
+
+fn ensure_cs2_seed(client: &Client, base_url: &str, api_key: &str, seeds: &mut OwlsSeeds) {
+    if seeds.cs2_match_id.is_some() {
+        return;
+    }
+    let payload = fetch_json(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/cs2/matches",
+        &[("limit", "1")],
+    );
+    if let Ok(value) = payload {
+        seeds.cs2_match_id = first_non_empty_string(
+            value
+                .pointer("/data/matches/0")
+                .or_else(|| value.pointer("/data/0")),
+            &["matchId", "id", "slug"],
+        );
+    }
+}
+
+fn merge_endpoint(dashboard: &mut OwlsDashboard, mut summary: OwlsEndpointSummary) -> bool {
+    let checked_at = Instant::now();
+    if let Some(slot) = dashboard
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == summary.id)
+    {
+        summary.label = slot.label.clone();
+        summary.path = slot.path.clone();
+        let changed = endpoint_semantically_changed(slot, &summary);
+        summary.poll_count = slot.poll_count + 1;
+        summary.change_count = slot.change_count + usize::from(changed);
+        summary.last_checked_at = Some(checked_at);
+        if !changed {
+            summary.preview = slot.preview.clone();
+            summary.detail = slot.detail.clone();
+            summary.count = slot.count;
+            summary.status = slot.status.clone();
+            summary.updated_at = slot.updated_at.clone();
+        }
+        *slot = summary;
+        return changed;
+    }
+    summary.poll_count = 1;
+    summary.change_count = 1;
+    summary.last_checked_at = Some(checked_at);
+    dashboard.endpoints.push(summary);
+    true
+}
+
+fn endpoint_semantically_changed(
+    current: &OwlsEndpointSummary,
+    next: &OwlsEndpointSummary,
+) -> bool {
+    current.status != next.status
+        || current.count != next.count
+        || current.updated_at != next.updated_at
+        || current.detail != next.detail
+        || current.preview.len() != next.preview.len()
+        || current
+            .preview
+            .iter()
+            .zip(next.preview.iter())
+            .any(|(left, right)| {
+                left.label != right.label
+                    || left.detail != right.detail
+                    || left.metric != right.metric
+            })
+}
+
+fn dashboard_semantically_changed(current: &OwlsDashboard, next: &OwlsDashboard) -> bool {
+    current.endpoints.len() != next.endpoints.len()
+        || current
+            .endpoints
+            .iter()
+            .zip(next.endpoints.iter())
+            .any(|(left, right)| endpoint_semantically_changed(left, right))
 }
 
 fn hydrate_result(
@@ -719,16 +1005,6 @@ fn hydrate_result(
     match payload {
         Ok(value) => parser(id, &value),
         Err(error) => error_summary(id, &error.to_string()),
-    }
-}
-
-fn set_endpoint(dashboard: &mut OwlsDashboard, summary: OwlsEndpointSummary) {
-    if let Some(slot) = dashboard
-        .endpoints
-        .iter_mut()
-        .find(|endpoint| endpoint.id == summary.id)
-    {
-        *slot = summary;
     }
 }
 
@@ -1703,5 +1979,110 @@ impl EmptyFallback for String {
             return String::from(fallback);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_due_ids_prioritize_hot_feeds() {
+        let mut dashboard = OwlsDashboard::default();
+        let now = Instant::now();
+        for endpoint in &mut dashboard.endpoints {
+            endpoint.last_checked_at = Some(now);
+        }
+        dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+            .expect("realtime endpoint")
+            .last_checked_at = Some(now - HOT_SYNC_INTERVAL - Duration::from_millis(1));
+        dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::HistoryGames)
+            .expect("history endpoint")
+            .last_checked_at = Some(now - HOT_SYNC_INTERVAL - Duration::from_millis(1));
+
+        let due_ids = due_endpoint_ids(&dashboard, OwlsSyncReason::Background, None);
+
+        assert!(due_ids.contains(&OwlsEndpointId::Realtime));
+        assert!(!due_ids.contains(&OwlsEndpointId::HistoryGames));
+        assert!(due_ids.len() <= BACKGROUND_SYNC_BATCH);
+    }
+
+    #[test]
+    fn focused_endpoint_uses_hot_interval_even_for_cold_groups() {
+        let mut dashboard = OwlsDashboard::default();
+        let history = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::HistoryGames)
+            .expect("history endpoint");
+        history.last_checked_at =
+            Some(Instant::now() - HOT_SYNC_INTERVAL - Duration::from_millis(1));
+
+        let due_ids = due_endpoint_ids(
+            &dashboard,
+            OwlsSyncReason::Background,
+            Some(OwlsEndpointId::HistoryGames),
+        );
+
+        assert!(due_ids.contains(&OwlsEndpointId::HistoryGames));
+    }
+
+    #[test]
+    fn first_background_sync_is_batched_instead_of_loading_everything() {
+        let dashboard = OwlsDashboard::default();
+
+        let due_ids = due_endpoint_ids(&dashboard, OwlsSyncReason::Background, None);
+
+        assert_eq!(due_ids.len(), BACKGROUND_SYNC_BATCH);
+        assert!(due_ids.contains(&OwlsEndpointId::Realtime));
+    }
+
+    #[test]
+    fn merge_endpoint_skips_semantic_noops() {
+        let mut dashboard = OwlsDashboard::default();
+        let first = summary_fixture(OwlsEndpointId::Realtime, "ready", 12, "live");
+        assert!(merge_endpoint(&mut dashboard, first));
+        let slot = dashboard
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+            .expect("realtime endpoint");
+        assert_eq!(slot.poll_count, 1);
+        assert_eq!(slot.change_count, 1);
+
+        let second = summary_fixture(OwlsEndpointId::Realtime, "ready", 12, "live");
+        assert!(!merge_endpoint(&mut dashboard, second));
+        let slot = dashboard
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+            .expect("realtime endpoint");
+        assert_eq!(slot.poll_count, 2);
+        assert_eq!(slot.change_count, 1);
+    }
+
+    fn summary_fixture(
+        id: OwlsEndpointId,
+        status: &str,
+        count: usize,
+        detail: &str,
+    ) -> OwlsEndpointSummary {
+        let mut summary = OwlsEndpointSummary::from_spec(spec_for(id));
+        summary.status = String::from(status);
+        summary.count = count;
+        summary.updated_at = String::from("2026-03-24T11:00:00Z");
+        summary.detail = String::from(detail);
+        summary.preview = vec![OwlsPreviewRow {
+            label: String::from("fixture"),
+            detail: String::from("detail"),
+            metric: String::from("metric"),
+        }];
+        summary
     }
 }

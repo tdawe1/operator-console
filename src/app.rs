@@ -1,20 +1,23 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
 
 pub use crate::app_state::{
     CalculatorEditorState, CalculatorField, CalculatorSourceContext, CalculatorState,
-    ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus, TradingActionField,
-    TradingActionOverlayState, TradingSection,
+    CalculatorTool, MatcherView, ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus,
+    TradingActionField, TradingActionOverlayState, TradingSection,
 };
 use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
@@ -25,7 +28,10 @@ use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
 };
-use crate::owls::{self, OwlsDashboard, OwlsEndpointSummary};
+use crate::owls::{
+    self, OwlsDashboard, OwlsEndpointGroup, OwlsEndpointId, OwlsEndpointSummary, OwlsSyncReason,
+    SUPPORTED_SPORTS,
+};
 use crate::panels::trading_positions::{
     active_position_row_count, next_actionable_cash_out_bet_id, selected_active_position_seed,
 };
@@ -47,6 +53,30 @@ use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider
 type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider>;
 type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider>;
 
+struct OwlsSyncJob {
+    dashboard: OwlsDashboard,
+    reason: OwlsSyncReason,
+    focused: Option<OwlsEndpointId>,
+}
+
+struct OwlsSyncResult {
+    outcome: owls::OwlsSyncOutcome,
+    reason: OwlsSyncReason,
+}
+
+#[derive(Clone, Copy)]
+enum MouseTargetKind {
+    TradingSection(TradingSection),
+    MatcherView(MatcherView),
+    CalculatorTool(CalculatorTool),
+}
+
+#[derive(Clone, Copy)]
+struct MouseTarget {
+    rect: Rect,
+    kind: MouseTargetKind,
+}
+
 pub struct App {
     provider: Box<dyn ExchangeProvider>,
     make_stub_provider: Box<StubFactory>,
@@ -58,8 +88,13 @@ pub struct App {
     recorder_editor: RecorderEditorState,
     recorder_status: RecorderStatus,
     calculator: CalculatorState,
+    calculator_tool: CalculatorTool,
     oddsmatcher_client: Client,
-    owls_client: Client,
+    owls_sync_tx: Sender<OwlsSyncJob>,
+    owls_sync_rx: Receiver<OwlsSyncResult>,
+    owls_sync_in_flight: bool,
+    owls_sync_pending_reason: Option<OwlsSyncReason>,
+    last_owls_sync_dispatch_at: Option<Instant>,
     owls_dashboard: OwlsDashboard,
     owls_endpoint_table_state: TableState,
     oddsmatcher_query_path: PathBuf,
@@ -77,6 +112,7 @@ pub struct App {
     horse_matcher_rows: Vec<OddsMatcherRow>,
     horse_matcher_snapshot: Option<crate::domain::HorseMatcherSnapshot>,
     horse_matcher_table_state: TableState,
+    matcher_view: MatcherView,
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
     trading_section: TradingSection,
@@ -86,11 +122,14 @@ pub struct App {
     historical_position_table_state: TableState,
     positions_focus: PositionsFocus,
     live_view_overlay_visible: bool,
+    markets_overlay_visible: bool,
+    keymap_overlay_visible: bool,
     trading_action_overlay: Option<TradingActionOverlayState>,
     last_recorder_refresh_at: Option<Instant>,
     last_successful_snapshot_at: Option<String>,
     last_recorder_start_failure: Option<String>,
     event_history: VecDeque<String>,
+    mouse_targets: Vec<MouseTarget>,
     running: bool,
     status_message: String,
     status_scroll: u16,
@@ -100,6 +139,7 @@ const MAX_EVENT_HISTORY: usize = 25;
 const RECORDER_REFRESH_INTERVAL_IDLE: Duration = Duration::from_secs(5);
 const RECORDER_REFRESH_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
 const RECORDER_REFRESH_INTERVAL_BOOTSTRAP: Duration = Duration::from_secs(1);
+const OWLS_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Default for App {
     fn default() -> Self {
@@ -222,7 +262,10 @@ impl App {
         oddsmatcher_query_path: PathBuf,
         horse_matcher_query_path: PathBuf,
     ) -> Result<Self> {
-        let snapshot = normalize_snapshot(provider.handle(ProviderRequest::LoadDashboard)?);
+        let snapshot = normalize_snapshot(
+            provider.handle(ProviderRequest::LoadDashboard)?,
+            &recorder_config.disabled_venues,
+        );
         let last_successful_snapshot_at = runtime_updated_at(&snapshot).map(str::to_string);
         let status_message = snapshot.status_line.clone();
         let (oddsmatcher_query, oddsmatcher_query_note) =
@@ -252,6 +295,14 @@ impl App {
         } else {
             PositionsFocus::Active
         };
+        let owls_client = owls::build_client().unwrap_or_else(|_| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        });
+        let (owls_sync_tx, owls_sync_rx) = start_owls_sync_worker(owls_client.clone());
 
         let mut app = Self {
             provider,
@@ -264,6 +315,7 @@ impl App {
             recorder_editor: RecorderEditorState::default(),
             recorder_status: RecorderStatus::Disabled,
             calculator: CalculatorState::default(),
+            calculator_tool: CalculatorTool::Basic,
             oddsmatcher_client: oddsmatcher::build_client().unwrap_or_else(|_| {
                 Client::builder()
                     .connect_timeout(Duration::from_secs(5))
@@ -271,13 +323,11 @@ impl App {
                     .build()
                     .unwrap_or_else(|_| Client::new())
             }),
-            owls_client: owls::build_client().unwrap_or_else(|_| {
-                Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .timeout(Duration::from_secs(15))
-                    .build()
-                    .unwrap_or_else(|_| Client::new())
-            }),
+            owls_sync_tx,
+            owls_sync_rx,
+            owls_sync_in_flight: false,
+            owls_sync_pending_reason: None,
+            last_owls_sync_dispatch_at: None,
             owls_dashboard: {
                 let dashboard = OwlsDashboard::default();
                 dashboard
@@ -302,20 +352,24 @@ impl App {
             horse_matcher_rows: Vec::new(),
             horse_matcher_snapshot: None,
             horse_matcher_table_state: TableState::default(),
+            matcher_view: MatcherView::Odds,
             snapshot,
             active_panel: Panel::Trading,
-            trading_section: TradingSection::Accounts,
+            trading_section: TradingSection::Positions,
             observability_section: ObservabilitySection::Workers,
             exchange_list_state: ListState::default(),
             open_position_table_state,
             historical_position_table_state,
             positions_focus,
             live_view_overlay_visible: false,
+            markets_overlay_visible: false,
+            keymap_overlay_visible: false,
             trading_action_overlay: None,
             last_recorder_refresh_at: None,
             last_successful_snapshot_at,
             last_recorder_start_failure: None,
             event_history: VecDeque::with_capacity(MAX_EVENT_HISTORY),
+            mouse_targets: Vec::new(),
             running: true,
             status_message,
             status_scroll: 0,
@@ -340,10 +394,37 @@ impl App {
         &self.owls_dashboard
     }
 
+    pub fn owls_sport(&self) -> &str {
+        self.owls_dashboard.sport.as_str()
+    }
+
+    pub fn matcher_view(&self) -> MatcherView {
+        self.matcher_view
+    }
+
+    pub fn calculator_tool(&self) -> CalculatorTool {
+        self.calculator_tool
+    }
+
+    pub fn visible_owls_endpoints(&self) -> Vec<&OwlsEndpointSummary> {
+        let groups = self.visible_owls_groups();
+        self.owls_dashboard
+            .endpoints
+            .iter()
+            .filter(|endpoint| groups.contains(&endpoint.group))
+            .collect()
+    }
+
     pub fn selected_owls_endpoint(&self) -> Option<&OwlsEndpointSummary> {
+        let visible = self.visible_owls_endpoints();
         self.owls_endpoint_table_state
             .selected()
-            .and_then(|index| self.owls_dashboard.endpoints.get(index))
+            .and_then(|index| visible.get(index).copied())
+            .or_else(|| visible.first().copied())
+    }
+
+    fn selected_owls_endpoint_id(&self) -> Option<OwlsEndpointId> {
+        self.selected_owls_endpoint().map(|endpoint| endpoint.id)
     }
 
     pub fn owls_endpoint_table_state(&mut self) -> &mut TableState {
@@ -362,6 +443,7 @@ impl App {
         self.active_panel = panel;
         if panel != Panel::Trading {
             self.live_view_overlay_visible = false;
+            self.markets_overlay_visible = false;
             self.trading_action_overlay = None;
         }
     }
@@ -375,13 +457,13 @@ impl App {
         if section != TradingSection::Positions {
             self.live_view_overlay_visible = false;
         }
-        if section != TradingSection::Positions
-            && section != TradingSection::OddsMatcher
-            && section != TradingSection::HorseMatcher
-        {
+        if !self.is_owls_context() {
+            self.markets_overlay_visible = false;
+        }
+        if section != TradingSection::Positions && section != TradingSection::Matcher {
             self.trading_action_overlay = None;
         }
-        if section == TradingSection::Markets {
+        if self.is_owls_context() {
             self.clamp_selected_owls_endpoint();
         }
     }
@@ -391,11 +473,19 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh cache | R recapture live\nenter edit/open | p place action | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "? keymap | q quit | o observability | h/l sections | arrows or j/k nav | tab rotate pane/tool | r refresh cache | R recapture live\nenter edit/open | p place action | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
         self.live_view_overlay_visible
+    }
+
+    pub fn keymap_overlay_visible(&self) -> bool {
+        self.keymap_overlay_visible
+    }
+
+    pub fn markets_overlay_visible(&self) -> bool {
+        self.markets_overlay_visible
     }
 
     pub fn trading_action_overlay(&self) -> Option<&TradingActionOverlayState> {
@@ -407,6 +497,76 @@ impl App {
         {
             self.live_view_overlay_visible = !self.live_view_overlay_visible;
         }
+    }
+
+    pub fn toggle_keymap_overlay(&mut self) {
+        self.keymap_overlay_visible = !self.keymap_overlay_visible;
+    }
+
+    pub fn toggle_markets_overlay(&mut self) {
+        if self.active_panel == Panel::Trading && self.is_owls_context() {
+            self.markets_overlay_visible = !self.markets_overlay_visible;
+        }
+    }
+
+    pub fn cycle_matcher_view(&mut self, forward: bool) {
+        let current = self.matcher_view;
+        let all = &MatcherView::ALL;
+        let index = all
+            .iter()
+            .position(|candidate| *candidate == current)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % all.len()
+        } else if index == 0 {
+            all.len() - 1
+        } else {
+            index - 1
+        };
+        self.matcher_view = all[next];
+        self.status_message = format!("Matcher view set to {}.", self.matcher_view.label());
+        self.status_scroll = 0;
+    }
+
+    pub fn cycle_calculator_tool(&mut self, forward: bool) {
+        let current = self.calculator_tool;
+        let all = &CalculatorTool::ALL;
+        let index = all
+            .iter()
+            .position(|candidate| *candidate == current)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % all.len()
+        } else if index == 0 {
+            all.len() - 1
+        } else {
+            index - 1
+        };
+        self.calculator_tool = all[next];
+        self.status_message = format!("Calculator tool set to {}.", self.calculator_tool.label());
+        self.status_scroll = 0;
+    }
+
+    pub fn cycle_owls_sport(&mut self, forward: bool) {
+        let current_index = SUPPORTED_SPORTS
+            .iter()
+            .position(|sport| *sport == self.owls_dashboard.sport)
+            .unwrap_or(0);
+        let next_index = if forward {
+            (current_index + 1) % SUPPORTED_SPORTS.len()
+        } else if current_index == 0 {
+            SUPPORTED_SPORTS.len() - 1
+        } else {
+            current_index - 1
+        };
+        let sport = SUPPORTED_SPORTS[next_index];
+        self.owls_dashboard = owls::dashboard_for_sport(sport);
+        self.clamp_selected_owls_endpoint();
+        self.markets_overlay_visible = false;
+        self.request_owls_sync(OwlsSyncReason::Manual);
+        self.status_message = format!("Owls sport set to {sport}. Sync queued.");
+        self.status_scroll = 0;
+        self.record_event(format!("Owls sport set to {sport}."));
     }
 
     pub fn selected_exchange_row(&self) -> Option<usize> {
@@ -423,6 +583,31 @@ impl App {
 
     pub fn status_scroll(&self) -> u16 {
         self.status_scroll
+    }
+
+    pub fn clear_mouse_targets(&mut self) {
+        self.mouse_targets.clear();
+    }
+
+    pub fn register_trading_section_target(&mut self, rect: Rect, section: TradingSection) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::TradingSection(section),
+        });
+    }
+
+    pub fn register_matcher_view_target(&mut self, rect: Rect, view: MatcherView) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::MatcherView(view),
+        });
+    }
+
+    pub fn register_calculator_tool_target(&mut self, rect: Rect, tool: CalculatorTool) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::CalculatorTool(tool),
+        });
     }
 
     pub fn selected_open_position_row(&self) -> Option<usize> {
@@ -782,9 +967,12 @@ impl App {
         } else {
             None
         };
+        let venue =
+            exchange_venue_from_bookmaker(&row.lay.bookmaker.code, &row.lay.bookmaker.display_name)
+                .unwrap_or(VenueId::Smarkets);
         let seed = TradingActionSeed {
             source,
-            venue: VenueId::Smarkets,
+            venue,
             source_ref: row.id.clone(),
             event_name: row.event_name.clone(),
             market_name: row.market_name.clone(),
@@ -820,18 +1008,11 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Markets {
+        if self.active_panel == Panel::Trading && self.is_owls_context() {
             return self.refresh_owls_dashboard();
         }
-        if self.active_panel == Panel::Trading
-            && self.trading_section == TradingSection::OddsMatcher
-        {
-            return self.refresh_oddsmatcher();
-        }
-        if self.active_panel == Panel::Trading
-            && self.trading_section == TradingSection::HorseMatcher
-        {
-            return self.refresh_horse_matcher();
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
+            return self.refresh_matcher();
         }
         self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed")?;
         self.record_event(format!(
@@ -842,18 +1023,11 @@ impl App {
     }
 
     pub fn refresh_live(&mut self) -> Result<()> {
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Markets {
+        if self.active_panel == Panel::Trading && self.is_owls_context() {
             return self.refresh_owls_dashboard();
         }
-        if self.active_panel == Panel::Trading
-            && self.trading_section == TradingSection::OddsMatcher
-        {
-            return self.refresh_oddsmatcher();
-        }
-        if self.active_panel == Panel::Trading
-            && self.trading_section == TradingSection::HorseMatcher
-        {
-            return self.refresh_horse_matcher();
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
+            return self.refresh_matcher();
         }
         self.refresh_provider_snapshot(ProviderRequest::RefreshLive, "Live refresh failed")?;
         self.record_event(format!(
@@ -901,14 +1075,10 @@ impl App {
     }
 
     fn refresh_owls_dashboard(&mut self) -> Result<()> {
-        self.owls_dashboard = owls::fetch_dashboard(&self.owls_client);
-        self.clamp_selected_owls_endpoint();
-        self.status_message = self.owls_dashboard.status_line.clone();
+        self.request_owls_sync(OwlsSyncReason::Manual);
+        self.status_message = String::from("Owls sync queued.");
         self.status_scroll = 0;
-        self.record_event(format!(
-            "Owls markets refresh completed for {}.",
-            self.owls_dashboard.sport
-        ));
+        self.record_event("Owls manual sync queued.");
         Ok(())
     }
 
@@ -925,13 +1095,6 @@ impl App {
     }
 
     fn open_trading_action_overlay(&mut self, seed: TradingActionSeed) {
-        if seed.venue != VenueId::Smarkets {
-            self.status_message = format!(
-                "Trading actions are not implemented for {} yet.",
-                seed.venue.as_str()
-            );
-            return;
-        }
         if !seed.supports_side(seed.default_side) {
             self.status_message =
                 String::from("The selected row does not expose an executable quote.");
@@ -1111,9 +1274,11 @@ impl App {
         {
             self.live_view_overlay_visible = false;
         }
+        if self.active_panel != Panel::Trading || !self.is_owls_context() {
+            self.markets_overlay_visible = false;
+        }
         if self.trading_section != TradingSection::Positions
-            && self.trading_section != TradingSection::OddsMatcher
-            && self.trading_section != TradingSection::HorseMatcher
+            && self.trading_section != TradingSection::Matcher
         {
             self.trading_action_overlay = None;
         }
@@ -1133,9 +1298,11 @@ impl App {
         {
             self.live_view_overlay_visible = false;
         }
+        if self.active_panel != Panel::Trading || !self.is_owls_context() {
+            self.markets_overlay_visible = false;
+        }
         if self.trading_section != TradingSection::Positions
-            && self.trading_section != TradingSection::OddsMatcher
-            && self.trading_section != TradingSection::HorseMatcher
+            && self.trading_section != TradingSection::Matcher
         {
             self.trading_action_overlay = None;
         }
@@ -1144,6 +1311,7 @@ impl App {
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while self.running {
             self.poll_recorder();
+            self.poll_owls_dashboard();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(250))? {
@@ -1151,6 +1319,7 @@ impl App {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key_code(key.code)
                     }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse.kind, mouse.column, mouse.row),
                     _ => {}
                 }
             }
@@ -1158,7 +1327,73 @@ impl App {
         Ok(())
     }
 
+    fn dispatch_owls_sync(&mut self, reason: OwlsSyncReason) {
+        let job = OwlsSyncJob {
+            dashboard: self.owls_dashboard.clone(),
+            reason,
+            focused: self.selected_owls_endpoint_id(),
+        };
+        match self.owls_sync_tx.send(job) {
+            Ok(()) => {
+                self.owls_sync_in_flight = true;
+                self.last_owls_sync_dispatch_at = Some(Instant::now());
+            }
+            Err(error) => {
+                self.status_message = format!("Owls sync worker unavailable: {error}");
+                self.status_scroll = 0;
+                self.record_event("Owls sync worker unavailable.");
+            }
+        }
+    }
+
+    fn request_owls_sync(&mut self, reason: OwlsSyncReason) {
+        self.drain_owls_sync_results();
+        if self.owls_sync_in_flight {
+            self.owls_sync_pending_reason = Some(match (self.owls_sync_pending_reason, reason) {
+                (Some(OwlsSyncReason::Manual), _) | (_, OwlsSyncReason::Manual) => {
+                    OwlsSyncReason::Manual
+                }
+                _ => OwlsSyncReason::Background,
+            });
+            return;
+        }
+        self.dispatch_owls_sync(reason);
+    }
+
+    fn drain_owls_sync_results(&mut self) {
+        let mut latest_result = None;
+        while let Ok(result) = self.owls_sync_rx.try_recv() {
+            latest_result = Some(result);
+        }
+        let Some(result) = latest_result else {
+            return;
+        };
+
+        self.owls_sync_in_flight = false;
+        let outcome = result.outcome;
+        self.owls_dashboard = outcome.dashboard;
+        self.clamp_selected_owls_endpoint();
+
+        if outcome.changed || matches!(result.reason, OwlsSyncReason::Manual) {
+            self.status_message = self.owls_dashboard.status_line.clone();
+            self.status_scroll = 0;
+        }
+        if outcome.changed {
+            self.record_event(format!(
+                "Owls {} sync applied {} changes after {} checks.",
+                result.reason.label(),
+                outcome.changed_count,
+                outcome.checked_count
+            ));
+        }
+
+        if let Some(reason) = self.owls_sync_pending_reason.take() {
+            self.dispatch_owls_sync(reason);
+        }
+    }
+
     fn render(&mut self, frame: &mut Frame<'_>) {
+        self.clear_mouse_targets();
         ui::render(frame, self);
     }
 
@@ -1378,10 +1613,27 @@ impl App {
             }
         }
 
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
+            if key_code == KeyCode::Tab {
+                self.cycle_matcher_view(true);
+                return;
+            }
+        }
+
+        if self.is_calculator_context() && key_code == KeyCode::Tab {
+            self.cycle_calculator_tool(true);
+            return;
+        }
+
         match key_code {
+            KeyCode::Char('?') => self.toggle_keymap_overlay(),
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => {
-                if self.live_view_overlay_visible {
+                if self.keymap_overlay_visible {
+                    self.keymap_overlay_visible = false;
+                } else if self.markets_overlay_visible {
+                    self.markets_overlay_visible = false;
+                } else if self.live_view_overlay_visible {
                     self.live_view_overlay_visible = false;
                 } else {
                     self.request_quit();
@@ -1399,14 +1651,13 @@ impl App {
                     self.begin_horse_matcher_edit();
                 } else if self.is_horse_matcher_results_context() {
                     self.load_calculator_from_selected_horse_matcher();
-                } else if self.active_panel == Panel::Trading
-                    && self.trading_section == TradingSection::Markets
-                {
+                } else if self.active_panel == Panel::Trading && self.is_owls_context() {
                     if let Some(endpoint) = self.selected_owls_endpoint() {
                         self.status_message = format!(
                             "{} {} [{}] {}",
                             endpoint.method, endpoint.path, endpoint.status, endpoint.description
                         );
+                        self.markets_overlay_visible = true;
                     }
                 } else if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
@@ -1464,7 +1715,9 @@ impl App {
                 }
             }
             KeyCode::Char('[') => {
-                if self.is_oddsmatcher_filters_context() {
+                if self.is_owls_context() {
+                    self.cycle_owls_sport(false);
+                } else if self.is_oddsmatcher_filters_context() {
                     if let Err(error) = self.cycle_oddsmatcher_suggestion(false) {
                         self.status_message = format!("OddsMatcher suggestion failed: {error}");
                     }
@@ -1479,7 +1732,9 @@ impl App {
                 }
             }
             KeyCode::Char(']') => {
-                if self.is_oddsmatcher_filters_context() {
+                if self.is_owls_context() {
+                    self.cycle_owls_sport(true);
+                } else if self.is_oddsmatcher_filters_context() {
                     if let Err(error) = self.cycle_oddsmatcher_suggestion(true) {
                         self.status_message = format!("OddsMatcher suggestion failed: {error}");
                     }
@@ -1560,23 +1815,11 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => match (self.active_panel, self.trading_section) {
-                (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
-                (Panel::Trading, TradingSection::Markets) => self.select_next_owls_endpoint(),
-                (Panel::Trading, TradingSection::OddsMatcher) => {
-                    if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
-                        self.oddsmatcher_editor.select_next_field();
-                    } else {
-                        self.select_next_oddsmatcher_row();
-                    }
-                }
-                (Panel::Trading, TradingSection::HorseMatcher) => {
-                    if self.horse_matcher_focus == OddsMatcherFocus::Filters {
-                        self.horse_matcher_editor.select_next_field();
-                    } else {
-                        self.select_next_horse_matcher_row();
-                    }
-                }
+                (Panel::Trading, TradingSection::Markets)
+                | (Panel::Trading, TradingSection::Live)
+                | (Panel::Trading, TradingSection::Props) => self.select_next_owls_endpoint(),
+                (Panel::Trading, TradingSection::Matcher) => self.select_next_matcher_row(),
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_next_field()
                 }
@@ -1586,23 +1829,11 @@ impl App {
                 _ => {}
             },
             KeyCode::Up | KeyCode::Char('k') => match (self.active_panel, self.trading_section) {
-                (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_previous_positions_row(),
-                (Panel::Trading, TradingSection::Markets) => self.select_previous_owls_endpoint(),
-                (Panel::Trading, TradingSection::OddsMatcher) => {
-                    if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
-                        self.oddsmatcher_editor.select_previous_field();
-                    } else {
-                        self.select_previous_oddsmatcher_row();
-                    }
-                }
-                (Panel::Trading, TradingSection::HorseMatcher) => {
-                    if self.horse_matcher_focus == OddsMatcherFocus::Filters {
-                        self.horse_matcher_editor.select_previous_field();
-                    } else {
-                        self.select_previous_horse_matcher_row();
-                    }
-                }
+                (Panel::Trading, TradingSection::Markets)
+                | (Panel::Trading, TradingSection::Live)
+                | (Panel::Trading, TradingSection::Props) => self.select_previous_owls_endpoint(),
+                (Panel::Trading, TradingSection::Matcher) => self.select_previous_matcher_row(),
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_previous_field()
                 }
@@ -1643,11 +1874,35 @@ impl App {
     }
 
     fn is_oddsmatcher_context(&self) -> bool {
-        self.active_panel == Panel::Trading && self.trading_section == TradingSection::OddsMatcher
+        self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::Matcher
+            && self.matcher_view == MatcherView::Odds
     }
 
     fn is_horse_matcher_context(&self) -> bool {
-        self.active_panel == Panel::Trading && self.trading_section == TradingSection::HorseMatcher
+        self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::Matcher
+            && self.matcher_view == MatcherView::Horse
+    }
+
+    fn is_owls_context(&self) -> bool {
+        self.active_panel == Panel::Trading
+            && matches!(
+                self.trading_section,
+                TradingSection::Markets | TradingSection::Live | TradingSection::Props
+            )
+    }
+
+    fn visible_owls_groups(&self) -> &'static [OwlsEndpointGroup] {
+        match self.trading_section {
+            TradingSection::Live => &[
+                OwlsEndpointGroup::Realtime,
+                OwlsEndpointGroup::Scores,
+                OwlsEndpointGroup::Odds,
+            ],
+            TradingSection::Props => &[OwlsEndpointGroup::Props, OwlsEndpointGroup::History],
+            _ => &OwlsEndpointGroup::ALL,
+        }
     }
 
     fn is_oddsmatcher_filters_context(&self) -> bool {
@@ -1816,13 +2071,14 @@ impl App {
     }
 
     pub fn select_next_owls_endpoint(&mut self) {
-        if self.owls_dashboard.endpoints.is_empty() {
+        let visible_count = self.visible_owls_endpoints().len();
+        if visible_count == 0 {
             self.owls_endpoint_table_state.select(None);
             return;
         }
 
         let next_index = match self.owls_endpoint_table_state.selected() {
-            Some(index) if index + 1 < self.owls_dashboard.endpoints.len() => index + 1,
+            Some(index) if index + 1 < visible_count => index + 1,
             Some(index) => index,
             None => 0,
         };
@@ -1831,7 +2087,7 @@ impl App {
     }
 
     pub fn select_previous_owls_endpoint(&mut self) {
-        if self.owls_dashboard.endpoints.is_empty() {
+        if self.visible_owls_endpoints().is_empty() {
             self.owls_endpoint_table_state.select(None);
             return;
         }
@@ -1856,6 +2112,46 @@ impl App {
         match self.positions_focus {
             PositionsFocus::Active => self.select_previous_open_position_row(),
             PositionsFocus::Historical => self.select_previous_historical_position_row(),
+        }
+    }
+
+    pub fn select_next_matcher_row(&mut self) {
+        match self.matcher_view {
+            MatcherView::Odds => {
+                if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
+                    self.oddsmatcher_editor.select_next_field();
+                } else {
+                    self.select_next_oddsmatcher_row();
+                }
+            }
+            MatcherView::Horse => {
+                if self.horse_matcher_focus == OddsMatcherFocus::Filters {
+                    self.horse_matcher_editor.select_next_field();
+                } else {
+                    self.select_next_horse_matcher_row();
+                }
+            }
+            MatcherView::Acca => {}
+        }
+    }
+
+    pub fn select_previous_matcher_row(&mut self) {
+        match self.matcher_view {
+            MatcherView::Odds => {
+                if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
+                    self.oddsmatcher_editor.select_previous_field();
+                } else {
+                    self.select_previous_oddsmatcher_row();
+                }
+            }
+            MatcherView::Horse => {
+                if self.horse_matcher_focus == OddsMatcherFocus::Filters {
+                    self.horse_matcher_editor.select_previous_field();
+                } else {
+                    self.select_previous_horse_matcher_row();
+                }
+            }
+            MatcherView::Acca => {}
         }
     }
 
@@ -1981,13 +2277,14 @@ impl App {
     }
 
     fn clamp_selected_owls_endpoint(&mut self) {
-        if self.owls_dashboard.endpoints.is_empty() {
+        let visible_count = self.visible_owls_endpoints().len();
+        if visible_count == 0 {
             self.owls_endpoint_table_state.select(None);
             return;
         }
 
         match self.owls_endpoint_table_state.selected() {
-            Some(index) if index < self.owls_dashboard.endpoints.len() => {}
+            Some(index) if index < visible_count => {}
             _ => self.owls_endpoint_table_state.select(Some(0)),
         }
     }
@@ -2037,8 +2334,57 @@ impl App {
 
         if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
             self.last_recorder_refresh_at = Some(Instant::now());
-            let _ =
-                self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed");
+            let request = self.recorder_auto_refresh_request();
+            let _ = self.refresh_provider_snapshot(request, "Refresh failed");
+        }
+    }
+
+    fn recorder_auto_refresh_request(&self) -> ProviderRequest {
+        match self.selected_venue() {
+            Some(VenueId::Smarkets) | None => ProviderRequest::RefreshCached,
+            Some(_) => ProviderRequest::RefreshLive,
+        }
+    }
+
+    fn poll_owls_dashboard(&mut self) {
+        self.drain_owls_sync_results();
+        if self.active_panel != Panel::Trading || !self.is_owls_context() {
+            return;
+        }
+        if self.owls_sync_in_flight {
+            return;
+        }
+        if self
+            .last_owls_sync_dispatch_at
+            .is_some_and(|last| last.elapsed() < OWLS_SYNC_DISPATCH_INTERVAL)
+        {
+            return;
+        }
+        self.dispatch_owls_sync(OwlsSyncReason::Background);
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        match kind {
+            MouseEventKind::ScrollDown => self.handle_key(KeyCode::Down),
+            MouseEventKind::ScrollUp => self.handle_key(KeyCode::Up),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let selected_target = self.mouse_targets.iter().find(|target| {
+                    column >= target.rect.x
+                        && column < target.rect.x.saturating_add(target.rect.width)
+                        && row >= target.rect.y
+                        && row < target.rect.y.saturating_add(target.rect.height)
+                });
+                if let Some(target) = selected_target {
+                    match target.kind {
+                        MouseTargetKind::TradingSection(section) => {
+                            self.set_trading_section(section)
+                        }
+                        MouseTargetKind::MatcherView(view) => self.matcher_view = view,
+                        MouseTargetKind::CalculatorTool(tool) => self.calculator_tool = tool,
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2073,7 +2419,10 @@ impl App {
         let had_successful_snapshot = self.last_successful_snapshot_at.is_some();
         let previous_reconnect_count = self.worker_reconnect_count();
         let previous_decision_counts = decision_status_counts(&self.snapshot);
-        self.snapshot = normalize_snapshot(snapshot);
+        self.snapshot = normalize_snapshot(
+            preserve_cached_snapshot_state(&self.snapshot, snapshot),
+            &self.recorder_config.disabled_venues,
+        );
         if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
             self.last_successful_snapshot_at = Some(updated_at.to_string());
         }
@@ -2773,6 +3122,18 @@ impl App {
         );
     }
 
+    fn refresh_matcher(&mut self) -> Result<()> {
+        match self.matcher_view {
+            MatcherView::Odds => self.refresh_oddsmatcher(),
+            MatcherView::Horse => self.refresh_horse_matcher(),
+            MatcherView::Acca => {
+                self.status_message =
+                    String::from("Acca Matcher scaffolded; live feed not wired yet.");
+                Ok(())
+            }
+        }
+    }
+
     fn refresh_oddsmatcher(&mut self) -> Result<()> {
         let rows =
             oddsmatcher::fetch_best_matches(&self.oddsmatcher_client, &self.oddsmatcher_query)
@@ -2831,17 +3192,66 @@ impl App {
         }
         if self.active_panel != Panel::Trading
             || (self.trading_section != TradingSection::Positions
-                && self.trading_section != TradingSection::OddsMatcher
-                && self.trading_section != TradingSection::HorseMatcher)
+                && self.trading_section != TradingSection::Matcher)
         {
             self.trading_action_overlay = None;
         }
     }
 }
 
-fn normalize_snapshot(mut snapshot: ExchangePanelSnapshot) -> ExchangePanelSnapshot {
+fn normalize_snapshot(
+    mut snapshot: ExchangePanelSnapshot,
+    disabled_venues: &str,
+) -> ExchangePanelSnapshot {
+    snapshot
+        .venues
+        .retain(|venue| venue_enabled(venue.id, disabled_venues));
+    snapshot
+        .other_open_bets
+        .retain(|bet| !venue_name_disabled(&bet.venue, disabled_venues));
+    if snapshot
+        .selected_venue
+        .is_some_and(|venue| !venue_enabled(venue, disabled_venues))
+    {
+        snapshot.selected_venue = snapshot.venues.first().map(|venue| venue.id);
+    }
     snapshot.historical_positions = merge_historical_positions(&snapshot);
     snapshot
+}
+
+fn preserve_cached_snapshot_state(
+    previous: &ExchangePanelSnapshot,
+    mut next: ExchangePanelSnapshot,
+) -> ExchangePanelSnapshot {
+    let refresh_kind = next
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.refresh_kind.as_str())
+        .unwrap_or_default();
+    if refresh_kind == "cached"
+        && next.historical_positions.is_empty()
+        && !previous.historical_positions.is_empty()
+    {
+        next.historical_positions = previous.historical_positions.clone();
+    }
+    next
+}
+
+fn venue_enabled(venue: VenueId, disabled_venues: &str) -> bool {
+    !parse_disabled_venues(disabled_venues).contains(venue.as_str())
+}
+
+fn venue_name_disabled(value: &str, disabled_venues: &str) -> bool {
+    parse_disabled_venues(disabled_venues).contains(&value.trim().to_ascii_lowercase())
+}
+
+fn parse_disabled_venues(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
 }
 
 fn merge_historical_positions(snapshot: &ExchangePanelSnapshot) -> Vec<OpenPositionRow> {
@@ -3147,12 +3557,48 @@ fn parse_optional_f64(value: &str) -> Option<f64> {
     }
 }
 
+fn exchange_venue_from_bookmaker(code: &str, display_name: &str) -> Option<VenueId> {
+    let normalized_code = code.trim().to_lowercase();
+    let normalized_name = display_name.trim().to_lowercase();
+    if normalized_code.contains("matchbook") || normalized_name.contains("matchbook") {
+        Some(VenueId::Matchbook)
+    } else if normalized_code.contains("betdaq") || normalized_name.contains("betdaq") {
+        Some(VenueId::Betdaq)
+    } else if normalized_code.contains("betfair") || normalized_name.contains("betfair") {
+        Some(VenueId::Betfair)
+    } else if normalized_code.contains("smarkets") || normalized_name.contains("smarkets") {
+        Some(VenueId::Smarkets)
+    } else {
+        None
+    }
+}
+
 fn new_trading_action_request_id(source: TradingActionSource) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     format!("{source:?}-{millis}").to_lowercase()
+}
+
+fn start_owls_sync_worker(client: Client) -> (Sender<OwlsSyncJob>, Receiver<OwlsSyncResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<OwlsSyncJob>();
+    let (result_tx, result_rx) = mpsc::channel::<OwlsSyncResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let outcome = owls::sync_dashboard(&client, &job.dashboard, job.reason, job.focused);
+            if result_tx
+                .send(OwlsSyncResult {
+                    outcome,
+                    reason: job.reason,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
 }
 
 #[cfg(test)]
@@ -3436,7 +3882,7 @@ mod tests {
         .expect("app");
 
         app.set_active_panel(Panel::Trading);
-        app.set_trading_section(TradingSection::OddsMatcher);
+        app.set_trading_section(TradingSection::Matcher);
         app.recorder_status = RecorderStatus::Running;
         app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
@@ -3446,6 +3892,136 @@ mod tests {
         assert!(app.oddsmatcher_rows().is_empty());
         assert_eq!(*cached_refresh_count.borrow(), 1);
         assert_eq!(*live_refresh_count.borrow(), 0);
+    }
+
+    #[test]
+    fn poll_recorder_uses_live_refresh_for_non_smarkets_selected_venue() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut load_snapshot = sample_snapshot("Initial dashboard");
+        load_snapshot.venues.push(VenueSummary {
+            id: VenueId::Betway,
+            label: String::from("betway"),
+            status: VenueStatus::Connected,
+            detail: String::from("live"),
+            event_count: 2,
+            market_count: 2,
+        });
+        load_snapshot.selected_venue = Some(VenueId::Betway);
+
+        let cached_refresh_snapshot = sample_runtime_snapshot(
+            "Cached smarkets dashboard",
+            "2026-03-24T12:00:00Z",
+            false,
+            "cached",
+        );
+        let mut live_refresh_snapshot = sample_runtime_snapshot(
+            "Live betway dashboard",
+            "2026-03-24T12:00:01Z",
+            false,
+            "live_capture",
+        );
+        live_refresh_snapshot.selected_venue = Some(VenueId::Betway);
+        live_refresh_snapshot.venues = load_snapshot.venues.clone();
+        live_refresh_snapshot.other_open_bets = vec![crate::domain::OtherOpenBetRow {
+            venue: String::from("betway"),
+            event: String::from("Arsenal v Everton"),
+            label: String::from("Arsenal"),
+            market: String::from("Match Odds"),
+            side: String::from("back"),
+            odds: 2.4,
+            stake: 10.0,
+            status: String::from("open"),
+            funding_kind: String::new(),
+            current_cashout_value: None,
+            supports_cash_out: false,
+        }];
+
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot,
+                cached_refresh_snapshot,
+                live_refresh_snapshot,
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.recorder_status = RecorderStatus::Running;
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Live betway dashboard");
+        assert_eq!(app.snapshot().selected_venue, Some(VenueId::Betway));
+        assert_eq!(app.snapshot().other_open_bets.len(), 1);
+        assert_eq!(*cached_refresh_count.borrow(), 0);
+        assert_eq!(*live_refresh_count.borrow(), 1);
+    }
+
+    #[test]
+    fn normalize_snapshot_filters_disabled_bet365_surface() {
+        let mut snapshot = sample_snapshot("Initial dashboard");
+        snapshot.venues.push(VenueSummary {
+            id: VenueId::Bet365,
+            label: String::from("bet365"),
+            status: VenueStatus::Connected,
+            detail: String::from("blocked"),
+            event_count: 3,
+            market_count: 2,
+        });
+        snapshot.selected_venue = Some(VenueId::Bet365);
+        snapshot
+            .other_open_bets
+            .push(crate::domain::OtherOpenBetRow {
+                venue: String::from("bet365"),
+                event: String::from("Arsenal v Everton"),
+                label: String::from("Arsenal"),
+                market: String::from("Match Odds"),
+                side: String::from("back"),
+                odds: 2.4,
+                stake: 10.0,
+                status: String::from("open"),
+                funding_kind: String::new(),
+                current_cashout_value: None,
+                supports_cash_out: false,
+            });
+
+        let normalized = super::normalize_snapshot(snapshot, "bet365");
+
+        assert!(normalized
+            .venues
+            .iter()
+            .all(|venue| venue.id != VenueId::Bet365));
+        assert_eq!(normalized.selected_venue, Some(VenueId::Smarkets));
+        assert!(normalized
+            .other_open_bets
+            .iter()
+            .all(|bet| !bet.venue.eq_ignore_ascii_case("bet365")));
     }
 
     #[test]
@@ -3843,6 +4419,75 @@ mod tests {
             app.snapshot().historical_positions[0].live_clock,
             "2026-03-20T15:57:00Z"
         );
+    }
+
+    #[test]
+    fn cached_refresh_preserves_existing_historical_positions_when_history_is_omitted() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut initial_snapshot =
+            sample_runtime_snapshot("Initial dashboard", "2026-03-24T12:00:00Z", false, "cached");
+        initial_snapshot.historical_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal vs Everton"),
+            event_status: String::from("Settled"),
+            event_url: String::new(),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("lost"),
+            market_status: String::from("settled"),
+            is_in_play: false,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: -23.29,
+            pnl_amount: -23.29,
+            overall_pnl_known: false,
+            current_back_odds: Some(3.35),
+            current_implied_probability: Some(1.0 / 3.35),
+            current_implied_percentage: Some(100.0 / 3.35),
+            current_buy_odds: Some(3.35),
+            current_buy_implied_probability: Some(1.0 / 3.35),
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::from("2026-03-22T16:10:26Z"),
+            can_trade_out: false,
+        }];
+        let cached_refresh_snapshot =
+            sample_runtime_snapshot("Cached dashboard", "2026-03-24T12:00:05Z", false, "cached");
+
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: initial_snapshot,
+                cached_refresh_snapshot,
+                live_refresh_snapshot: sample_snapshot("Live dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        assert_eq!(app.snapshot().historical_positions.len(), 1);
+
+        app.refresh().expect("refresh should succeed");
+
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
+        assert_eq!(app.snapshot().historical_positions.len(), 1);
+        assert_eq!(
+            app.snapshot().historical_positions[0].event,
+            "Arsenal vs Everton"
+        );
+        assert_eq!(app.snapshot().historical_positions[0].contract, "Draw");
     }
 
     #[test]

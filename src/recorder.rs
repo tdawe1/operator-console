@@ -26,6 +26,8 @@ pub struct RecorderConfig {
     pub companion_legs_path: Option<PathBuf>,
     #[serde(default = "default_profile_path")]
     pub profile_path: Option<PathBuf>,
+    #[serde(default = "default_disabled_venues")]
+    pub disabled_venues: String,
     pub autostart: bool,
     pub interval_seconds: u64,
     pub commission_rate: String,
@@ -43,6 +45,7 @@ impl Default for RecorderConfig {
             session: String::from("helium-copy"),
             companion_legs_path: None,
             profile_path: default_profile_path(),
+            disabled_venues: default_disabled_venues(),
             autostart: false,
             interval_seconds: 5,
             commission_rate: String::from("0"),
@@ -73,6 +76,10 @@ fn config_root() -> PathBuf {
 
 fn default_profile_path() -> Option<PathBuf> {
     Some(config_root().join("smarkets-automation").join("profile"))
+}
+
+fn default_disabled_venues() -> String {
+    String::from("bet365")
 }
 
 fn default_run_dir() -> PathBuf {
@@ -202,6 +209,7 @@ pub enum RecorderField {
     Session,
     CompanionLegsPath,
     Autostart,
+    DisabledVenues,
     IntervalSeconds,
     CommissionRate,
     TargetProfit,
@@ -212,12 +220,13 @@ pub enum RecorderField {
 }
 
 impl RecorderField {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Command,
         Self::RunDir,
         Self::Session,
         Self::CompanionLegsPath,
         Self::Autostart,
+        Self::DisabledVenues,
         Self::IntervalSeconds,
         Self::CommissionRate,
         Self::TargetProfit,
@@ -234,6 +243,7 @@ impl RecorderField {
             Self::Session => "Session",
             Self::CompanionLegsPath => "Companion Legs",
             Self::Autostart => "Autostart",
+            Self::DisabledVenues => "Disabled Venues",
             Self::IntervalSeconds => "Interval",
             Self::CommissionRate => "Commission",
             Self::TargetProfit => "Target Profit",
@@ -255,6 +265,7 @@ impl RecorderField {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             Self::Autostart => config.autostart.to_string(),
+            Self::DisabledVenues => config.disabled_venues.clone(),
             Self::IntervalSeconds => config.interval_seconds.to_string(),
             Self::CommissionRate => config.commission_rate.clone(),
             Self::TargetProfit => config.target_profit.clone(),
@@ -295,6 +306,7 @@ impl RecorderField {
                     .parse::<bool>()
                     .map_err(|_| eyre!("autostart must be true or false"))?;
             }
+            Self::DisabledVenues => config.disabled_venues = String::from(value),
             Self::IntervalSeconds => {
                 config.interval_seconds = value
                     .parse::<u64>()
@@ -336,6 +348,11 @@ impl RecorderField {
                     .to_string(),
             ],
             Self::Autostart => vec![String::from("false"), String::from("true")],
+            Self::DisabledVenues => vec![
+                String::from("bet365"),
+                String::new(),
+                String::from("bet365,betano"),
+            ],
             Self::IntervalSeconds => {
                 vec![String::from("5"), String::from("10"), String::from("15")]
             }

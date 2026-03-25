@@ -92,7 +92,7 @@ fn live_operator_smoke_exercises_real_recorder_flow() -> Result<()> {
         assert!(!app.status_message().trim().is_empty());
         assert_recorder_evidence(&app)?;
 
-        app.set_trading_section(TradingSection::Accounts);
+        app.set_trading_section(TradingSection::Positions);
         select_first_non_smarkets_venue(&mut app)?;
         let selected_venue = app
             .selected_venue()
@@ -126,6 +126,7 @@ fn live_recorder_config(run_dir: PathBuf) -> RecorderConfig {
         companion_legs_path: env::var_os("SABI_OPERATOR_LIVE_COMPANION_LEGS_PATH")
             .map(PathBuf::from),
         profile_path: env::var_os("SABI_OPERATOR_LIVE_PROFILE_PATH").map(PathBuf::from),
+        disabled_venues: String::from("bet365"),
         autostart: false,
         interval_seconds: env::var("SABI_OPERATOR_LIVE_INTERVAL_SECONDS")
             .ok()

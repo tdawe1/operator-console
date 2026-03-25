@@ -51,13 +51,13 @@ fn trading_section_navigation_cycles_inside_trading_module() {
     let mut app = App::default();
     app.set_active_panel(Panel::Trading);
 
-    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
-
-    app.next_section();
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
 
+    app.next_section();
+    assert_eq!(app.active_trading_section(), TradingSection::Markets);
+
     app.previous_section();
-    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
+    assert_eq!(app.active_trading_section(), TradingSection::Positions);
 }
 
 #[test]
@@ -130,6 +130,21 @@ fn v_toggles_live_view_overlay_in_positions() {
     app.handle_key(KeyCode::Esc);
     assert!(!app.live_view_overlay_visible());
     assert!(app.is_running());
+}
+
+#[test]
+fn enter_opens_markets_overlay_and_escape_closes_it() {
+    let mut app = App::default();
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Markets);
+
+    assert!(!app.markets_overlay_visible());
+
+    app.handle_key(KeyCode::Enter);
+    assert!(app.markets_overlay_visible());
+
+    app.handle_key(KeyCode::Esc);
+    assert!(!app.markets_overlay_visible());
 }
 
 #[test]

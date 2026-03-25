@@ -1,28 +1,85 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::calculator::Output;
+use crate::app_state::CalculatorTool;
 
-pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let layout = Layout::vertical([Constraint::Length(8), Constraint::Min(10)]).split(area);
+pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(8),
+        Constraint::Min(10),
+    ])
+    .split(area);
+    render_tool_tabs(frame, layout[0], app);
     let lower = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(layout[1]);
+        .split(layout[2]);
     let right = Layout::vertical([Constraint::Length(10), Constraint::Min(10)]).split(lower[1]);
 
-    render_summary(frame, layout[0], app);
-    render_inputs(frame, lower[0], app);
-    render_results(frame, right[0], app.calculator_output().as_ref().ok());
-    render_help(frame, right[1], app);
+    render_summary(frame, layout[1], app);
+    match app.calculator_tool() {
+        CalculatorTool::Basic | CalculatorTool::Arb | CalculatorTool::Ev => {
+            render_inputs(frame, lower[0], app);
+            render_results(frame, right[0], app);
+            render_help(frame, right[1], app);
+        }
+        CalculatorTool::EachWay => render_placeholder(
+            frame,
+            layout[2],
+            "Each-Way",
+            "Each-way split staking and place-term modelling is scaffolded. This view will use bookmaker terms plus exchange place markets.",
+        ),
+        CalculatorTool::Acca => render_placeholder(
+            frame,
+            layout[2],
+            "Acca",
+            "Acca modelling is scaffolded. This view will combine multi-leg probability, blended margin, and boosted-return overlays.",
+        ),
+        CalculatorTool::ExtraPlace => render_placeholder(
+            frame,
+            layout[2],
+            "Extra Place",
+            "Extra Place modelling is scaffolded. This view will compare standard terms against enhanced-place offers and layable place books.",
+        ),
+    }
+}
+
+fn render_tool_tabs(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let titles = CalculatorTool::ALL.map(CalculatorTool::label);
+    let selected = CalculatorTool::ALL
+        .iter()
+        .position(|tool| *tool == app.calculator_tool())
+        .unwrap_or(0);
+    let tabs = Tabs::new(titles.to_vec())
+        .select(selected)
+        .block(section_block("Calculator Tools", accent_blue()))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider("│");
+    frame.render_widget(tabs, area);
+    register_tab_targets(area, &titles)
+        .into_iter()
+        .enumerate()
+        .for_each(|(index, rect)| {
+            app.register_calculator_tool_target(rect, CalculatorTool::ALL[index])
+        });
 }
 
 fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let output = app.calculator_output().ok();
     let lines = vec![
         Line::from(vec![
+            metric("Tool", accent_gold()),
+            Span::raw(app.calculator_tool().label()),
+            Span::raw("   "),
             metric("Bet Type", accent_blue()),
             Span::raw(app.calculator_bet_type().label()),
             Span::raw("   "),
@@ -119,8 +176,9 @@ fn render_inputs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(table, area);
 }
 
-fn render_results(frame: &mut Frame<'_>, area: Rect, output: Option<&Output>) {
-    let Some(output) = output else {
+fn render_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let output = app.calculator_output();
+    let Some(output) = output.as_ref().ok() else {
         let body = Paragraph::new("Calculator inputs are invalid.")
             .block(section_block("Results", accent_red()))
             .wrap(Wrap { trim: true });
@@ -128,7 +186,13 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, output: Option<&Output>) {
         return;
     };
 
-    let rows = vec![
+    let title = match app.calculator_tool() {
+        CalculatorTool::Basic => "Basic Results",
+        CalculatorTool::Arb => "Arb Results",
+        CalculatorTool::Ev => "EV Lens",
+        _ => "Results",
+    };
+    let mut rows = vec![
         result_line(
             "Standard",
             &output.standard,
@@ -148,9 +212,17 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, output: Option<&Output>) {
             output.qualifying_profit,
         ),
     ];
+    if app.calculator_tool() == CalculatorTool::Ev {
+        rows.push(Line::raw(format!(
+            "Source EV: {}",
+            app.calculator_source()
+                .map(|source| format!("{:.2}% rating", source.rating))
+                .unwrap_or_else(|| String::from("-"))
+        )));
+    }
 
     let body = Paragraph::new(rows)
-        .block(section_block("Results", accent_green()))
+        .block(section_block(title, accent_green()))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
@@ -163,6 +235,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::raw("Esc cancel field edit"),
         Line::raw("b cycle bet type"),
         Line::raw("m toggle simple/advanced"),
+        Line::raw("Tab cycle calculator tool"),
         Line::raw(String::new()),
     ];
     if let Some(source) = app.calculator_source() {
@@ -190,6 +263,41 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(section_block("Operator Notes", accent_pink()))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
+}
+
+fn render_placeholder(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &str) {
+    let body = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(accent_gold())
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .style(Style::default().bg(panel_background()).fg(text_color()))
+                .border_style(Style::default().fg(border_color())),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn register_tab_targets(area: Rect, titles: &[&str]) -> Vec<Rect> {
+    let mut targets = Vec::new();
+    let mut x = area.x.saturating_add(1);
+    let y = area.y.saturating_add(1);
+    for title in titles {
+        let width = title.len() as u16;
+        targets.push(Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        });
+        x = x.saturating_add(width).saturating_add(2);
+    }
+    targets
 }
 
 fn result_line(

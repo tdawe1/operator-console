@@ -22,6 +22,7 @@ fn help_text_mentions_core_operator_keys() {
     let app = App::default();
     let help = app.help_text();
 
+    assert!(help.contains("?"));
     assert!(help.contains("q"));
     assert!(help.contains("o"));
     assert!(help.contains("r"));
@@ -34,11 +35,11 @@ fn help_text_mentions_core_operator_keys() {
     assert!(help.contains("u"));
     assert!(help.contains("D"));
     assert!(help.contains("j/k"));
-    assert!(help.contains("[/] cycle suggestions"));
+    assert!(help.contains("[/] cycle sport or suggestions"));
 }
 
 #[test]
-fn footer_renders_status_message_visibly() {
+fn status_bar_renders_status_message_visibly() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: sample_snapshot("Recorder start failed: watcher timed out"),
     })
@@ -62,12 +63,13 @@ fn footer_renders_status_message_visibly() {
     }
     let rendered = lines.join("\n");
 
-    assert!(rendered.contains("Recorder start failed: watcher timed out"));
+    assert!(rendered.contains("watcher timed out"));
 }
 
 #[test]
-fn startup_footer_guidance_stays_visible_at_standard_terminal_size() {
+fn keymap_overlay_renders_guidance_when_toggled() {
     let mut app = App::default();
+    app.toggle_keymap_overlay();
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -86,10 +88,12 @@ fn startup_footer_guidance_stays_visible_at_standard_terminal_size() {
         lines.push(line);
     }
     let rendered = lines.join("\n");
+    assert!(rendered.contains("Keymap"));
+    assert!(rendered.contains("? toggle keymap"));
     assert!(rendered.contains("q quit"));
     assert!(rendered.contains("R live"));
-    assert!(rendered.contains("v overlay"));
     assert!(rendered.contains("s start"));
+    assert!(rendered.contains("cycle Owls sport"));
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

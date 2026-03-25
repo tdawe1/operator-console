@@ -15,29 +15,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         frame.area(),
     );
 
-    let positions_owns_footer = matches!(
-        (app.active_panel(), app.active_trading_section()),
-        (Panel::Trading, TradingSection::Positions)
-    );
-    let shell = if positions_owns_footer {
-        Layout::vertical([Constraint::Length(4), Constraint::Min(10)]).split(frame.area())
-    } else {
-        Layout::vertical([
-            Constraint::Length(4),
-            Constraint::Min(10),
-            Constraint::Length(4),
-        ])
-        .split(frame.area())
-    };
+    let shell = Layout::vertical([Constraint::Length(4), Constraint::Min(10)]).split(frame.area());
 
     render_status_bar(frame, shell[0], app);
     render_main(frame, shell[1], app);
 
-    if !positions_owns_footer {
-        render_footer(frame, shell[2], app);
-    }
-
+    panels::trading_markets::render_overlay(frame, frame.area(), app);
     panels::trading_action_overlay::render(frame, frame.area(), app);
+    render_keymap_overlay(frame, frame.area(), app);
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -45,27 +30,12 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     match app.active_panel() {
         Panel::Trading => {
-            render_subnav(
-                frame,
-                layout[0],
-                &TradingSection::ALL.map(TradingSection::label),
-                trading_index(app.active_trading_section()),
-                "󰊠 Trading",
-            );
+            render_trading_subnav(frame, layout[0], app);
             match app.active_trading_section() {
-                TradingSection::Accounts => {
-                    let snapshot = app.snapshot().clone();
-                    panels::exchanges::render(
-                        frame,
-                        layout[1],
-                        &snapshot,
-                        app.exchange_list_state(),
-                    )
-                }
                 TradingSection::Positions => {
                     let snapshot = app.snapshot().clone();
+                    let owls_dashboard = app.owls_dashboard().clone();
                     let status_message = app.status_message().to_string();
-                    let help_text = app.help_text().to_string();
                     let status_scroll = app.status_scroll();
                     let positions_focus = app.positions_focus();
                     let show_live_view_overlay = app.live_view_overlay_visible();
@@ -74,20 +44,19 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         frame,
                         layout[1],
                         &snapshot,
+                        &owls_dashboard,
                         open_state,
                         historical_state,
                         positions_focus,
                         show_live_view_overlay,
                         &status_message,
-                        &help_text,
                         status_scroll,
                     )
                 }
                 TradingSection::Markets => panels::trading_markets::render(frame, layout[1], app),
-                TradingSection::OddsMatcher => panels::oddsmatcher::render(frame, layout[1], app),
-                TradingSection::HorseMatcher => {
-                    panels::horse_matcher::render(frame, layout[1], app)
-                }
+                TradingSection::Live => panels::trading_markets::render(frame, layout[1], app),
+                TradingSection::Props => panels::trading_markets::render(frame, layout[1], app),
+                TradingSection::Matcher => panels::matcher::render(frame, layout[1], app),
                 TradingSection::Stats => {
                     panels::trading_stats::render(frame, layout[1], app.snapshot())
                 }
@@ -113,17 +82,21 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let footer = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("󱂬 ", Style::default().fg(accent_blue())),
-            Span::raw(truncate_line(app.status_message(), 120)),
-        ]),
-        Line::raw("q quit • o obs • r cache • R live • s start • x stop • v overlay • enter • esc"),
-    ])
-    .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(footer, area);
+fn render_trading_subnav(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let titles = TradingSection::ALL.map(TradingSection::label);
+    render_subnav(
+        frame,
+        area,
+        &titles,
+        trading_index(app.active_trading_section()),
+        "󰊠 Trading",
+    );
+    register_tab_targets(area, &titles)
+        .into_iter()
+        .enumerate()
+        .for_each(|(index, rect)| {
+            app.register_trading_section_target(rect, TradingSection::ALL[index]);
+        });
 }
 
 fn render_subnav(frame: &mut Frame<'_>, area: Rect, titles: &[&str], selected: usize, title: &str) {
@@ -145,6 +118,23 @@ fn render_subnav(frame: &mut Frame<'_>, area: Rect, titles: &[&str], selected: u
         )
         .divider("│");
     frame.render_widget(tabs, area);
+}
+
+fn register_tab_targets(area: Rect, titles: &[&str]) -> Vec<Rect> {
+    let mut targets = Vec::new();
+    let mut x = area.x.saturating_add(1);
+    let y = area.y.saturating_add(1);
+    for title in titles {
+        let width = title.len() as u16;
+        targets.push(Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        });
+        x = x.saturating_add(width).saturating_add(2);
+    }
+    targets
 }
 
 fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -223,6 +213,36 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(body, area);
 }
 
+fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.keymap_overlay_visible() {
+        return;
+    }
+
+    let popup = popup_area(area, 68, 54);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(accent_blue())),
+            Span::raw(truncate_line(app.status_message(), 70)),
+        ]),
+        Line::raw(""),
+        Line::raw("? toggle keymap  •  q quit  •  esc close overlay/cancel"),
+        Line::raw("o observability  •  h/l sections  •  arrows or j/k navigate"),
+        Line::raw("tab rotate pane tool/view  •  enter open/edit  •  r cache  •  R live"),
+        Line::raw("[ / ] cycle Owls sport  •  s start recorder  •  x stop recorder"),
+        Line::raw("c cash out first actionable  •  p place action"),
+        Line::raw("v live overlay  •  u reload config  •  D defaults"),
+        Line::raw("b cycle calc type  •  m toggle calc mode"),
+    ];
+    let overlay = Paragraph::new(lines)
+        .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(
+        Block::default().style(Style::default().bg(shell_background())),
+        popup,
+    );
+    frame.render_widget(overlay, popup);
+}
+
 fn shell_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
@@ -232,6 +252,16 @@ fn shell_block(title: &'static str, color: Color) -> Block<'static> {
         .borders(Borders::ALL)
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
+}
+
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical =
+        Layout::vertical([Constraint::Percentage(percent_y)]).flex(ratatui::layout::Flex::Center);
+    let horizontal =
+        Layout::horizontal([Constraint::Percentage(percent_x)]).flex(ratatui::layout::Flex::Center);
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
 }
 
 fn shell_background() -> Color {
@@ -370,11 +400,11 @@ fn recorder_status_color(status: &RecorderStatus) -> Color {
 
 fn trading_index(section: TradingSection) -> usize {
     match section {
-        TradingSection::Accounts => 0,
-        TradingSection::Positions => 1,
-        TradingSection::Markets => 2,
-        TradingSection::OddsMatcher => 3,
-        TradingSection::HorseMatcher => 4,
+        TradingSection::Positions => 0,
+        TradingSection::Markets => 1,
+        TradingSection::Live => 2,
+        TradingSection::Props => 3,
+        TradingSection::Matcher => 4,
         TradingSection::Stats => 5,
         TradingSection::Calculator => 6,
         TradingSection::Recorder => 7,

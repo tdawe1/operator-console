@@ -1,7 +1,10 @@
 use std::env;
+use std::io::{self, stdout};
 use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 use operator_console::app::App;
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
@@ -69,10 +72,20 @@ fn main() -> Result<()> {
     if should_autostart {
         app.autostart_recorder_if_enabled()?;
     }
+    enable_mouse_capture()?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
     ratatui::restore();
+    disable_mouse_capture()?;
     result
+}
+
+fn enable_mouse_capture() -> io::Result<()> {
+    execute!(stdout(), EnableMouseCapture)
+}
+
+fn disable_mouse_capture() -> io::Result<()> {
+    execute!(stdout(), DisableMouseCapture)
 }
 
 fn help_text() -> &'static str {

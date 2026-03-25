@@ -37,22 +37,23 @@ impl RecorderSupervisor for DisabledSupervisor {
 }
 
 #[test]
-fn trading_navigation_reaches_oddsmatcher_section() {
+fn trading_navigation_reaches_matcher_section_with_odds_view() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
 
     app.next_section();
     app.next_section();
     app.next_section();
+    app.next_section();
 
-    assert_eq!(app.active_trading_section(), TradingSection::OddsMatcher);
+    assert_eq!(app.active_trading_section(), TradingSection::Matcher);
 }
 
 #[test]
 fn oddsmatcher_selection_moves_with_arrow_keys() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
     app.replace_oddsmatcher_rows(sample_rows(), String::from("Loaded test rows."));
 
     let first = app
@@ -74,7 +75,7 @@ fn oddsmatcher_selection_moves_with_arrow_keys() {
 fn oddsmatcher_filters_are_editable_from_the_app() {
     let (temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
 
     app.handle_key(KeyCode::Left);
     assert_eq!(app.oddsmatcher_focus(), OddsMatcherFocus::Filters);
@@ -102,7 +103,7 @@ fn oddsmatcher_filters_are_editable_from_the_app() {
 fn oddsmatcher_panel_renders_filter_sidebar() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
 
     let backend = TestBackend::new(160, 36);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -136,7 +137,7 @@ fn oddsmatcher_panel_renders_filter_sidebar() {
 fn oddsmatcher_result_can_seed_calculator() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
     let rows = sample_rows();
     let row = rows[0].clone();
     app.replace_oddsmatcher_rows(rows, String::from("Loaded test rows."));
@@ -157,7 +158,7 @@ fn oddsmatcher_result_can_seed_calculator() {
 fn oddsmatcher_place_hotkey_opens_trading_action_overlay() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
     app.replace_oddsmatcher_rows(sample_rows(), String::from("Loaded test rows."));
 
     app.handle_key(KeyCode::Char('p'));
@@ -174,7 +175,7 @@ fn oddsmatcher_place_hotkey_opens_trading_action_overlay() {
 fn oddsmatcher_refresh_smoke_loads_live_rows() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::OddsMatcher);
+    app.set_trading_section(TradingSection::Matcher);
 
     app.handle_key(KeyCode::Char('r'));
 

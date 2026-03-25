@@ -60,6 +60,7 @@ fn recorder_start_and_stop_are_controllable_from_app() {
         session: String::from("helium-copy"),
         companion_legs_path: None,
         profile_path: Some(PathBuf::from("/tmp/owned-profile")),
+        disabled_venues: String::from("bet365"),
         autostart: false,
         interval_seconds: 5,
         commission_rate: String::from("0"),
@@ -176,6 +177,7 @@ fn recorder_config_is_editable_before_starting() {
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
+    app.handle_key(KeyCode::Down);
     assert_eq!(
         app.recorder_selected_field(),
         RecorderField::IntervalSeconds
@@ -206,6 +208,7 @@ fn recorder_config_can_reload_from_disk_and_reset_to_defaults() {
             session: String::from("saved-session"),
             companion_legs_path: Some(PathBuf::from("/tmp/saved-run/companion-legs.json")),
             profile_path: Some(PathBuf::from("/tmp/saved-profile")),
+            disabled_venues: String::from("bet365"),
             autostart: true,
             interval_seconds: 9,
             commission_rate: String::from("0"),
@@ -266,6 +269,7 @@ fn recorder_config_can_reload_from_disk_and_reset_to_defaults() {
             session: String::from("reloaded-session"),
             companion_legs_path: Some(PathBuf::from("/tmp/reloaded-run/companion-legs.json")),
             profile_path: Some(PathBuf::from("/tmp/reloaded-profile")),
+            disabled_venues: String::from("bet365"),
             autostart: true,
             interval_seconds: 11,
             commission_rate: String::from("0"),
@@ -320,6 +324,7 @@ fn recorder_config_can_cycle_field_suggestions() {
 
     app.set_active_panel(Panel::Trading);
     app.set_trading_section(TradingSection::Recorder);
+    app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
@@ -390,6 +395,7 @@ fn recorder_config_edit_restarts_running_recorder() {
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
     app.handle_key(KeyCode::Down);
+    app.handle_key(KeyCode::Down);
     assert_eq!(
         app.recorder_selected_field(),
         RecorderField::IntervalSeconds
@@ -447,7 +453,7 @@ fn recorder_provider_swap_clamps_stale_exchange_selection() {
     .expect("app");
 
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::Accounts);
+    app.set_trading_section(TradingSection::Positions);
     app.select_next_exchange_row();
     app.select_next_exchange_row();
     app.select_next_exchange_row();
@@ -459,7 +465,7 @@ fn recorder_provider_swap_clamps_stale_exchange_selection() {
 
     assert_eq!(app.selected_exchange_row(), None);
 
-    app.set_trading_section(TradingSection::Accounts);
+    app.set_trading_section(TradingSection::Positions);
     app.select_next_exchange_row();
     assert_eq!(app.selected_exchange_row(), Some(0));
 }

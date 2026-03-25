@@ -38,7 +38,7 @@ impl RecorderSupervisor for DisabledSupervisor {
 }
 
 #[test]
-fn trading_navigation_reaches_horse_matcher_section() {
+fn trading_navigation_reaches_matcher_section_and_can_switch_to_horse_view() {
     let (_temp_dir, mut app) = horse_matcher_app();
     app.set_active_panel(Panel::Trading);
 
@@ -46,15 +46,17 @@ fn trading_navigation_reaches_horse_matcher_section() {
     app.next_section();
     app.next_section();
     app.next_section();
+    app.cycle_matcher_view(true);
 
-    assert_eq!(app.active_trading_section(), TradingSection::HorseMatcher);
+    assert_eq!(app.active_trading_section(), TradingSection::Matcher);
 }
 
 #[test]
 fn horse_matcher_filters_are_editable_from_the_app() {
     let (temp_dir, mut app) = horse_matcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::HorseMatcher);
+    app.set_trading_section(TradingSection::Matcher);
+    app.cycle_matcher_view(true);
 
     app.handle_key(KeyCode::Left);
     assert_eq!(app.horse_matcher_focus(), OddsMatcherFocus::Filters);
@@ -84,7 +86,8 @@ fn horse_matcher_filters_are_editable_from_the_app() {
 fn horse_matcher_result_can_seed_calculator() {
     let (_temp_dir, mut app) = horse_matcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::HorseMatcher);
+    app.set_trading_section(TradingSection::Matcher);
+    app.cycle_matcher_view(true);
     let rows = sample_rows();
     let row = rows[0].clone();
     app.replace_horse_matcher_rows(rows, String::from("Loaded horse rows."));
@@ -100,7 +103,8 @@ fn horse_matcher_result_can_seed_calculator() {
 fn horse_matcher_place_hotkey_opens_trading_action_overlay() {
     let (_temp_dir, mut app) = horse_matcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::HorseMatcher);
+    app.set_trading_section(TradingSection::Matcher);
+    app.cycle_matcher_view(true);
     app.replace_horse_matcher_rows(sample_rows(), String::from("Loaded horse rows."));
 
     app.handle_key(KeyCode::Char('p'));
@@ -119,7 +123,8 @@ fn horse_matcher_place_hotkey_opens_trading_action_overlay() {
 fn horse_matcher_panel_renders_core_sections() {
     let (_temp_dir, mut app) = horse_matcher_app();
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::HorseMatcher);
+    app.set_trading_section(TradingSection::Matcher);
+    app.cycle_matcher_view(true);
     app.replace_horse_matcher_rows(sample_rows(), String::from("Loaded horse rows."));
 
     let backend = TestBackend::new(160, 36);

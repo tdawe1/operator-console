@@ -36,9 +36,9 @@ impl ExchangeProvider for WorkflowProvider {
             ProviderRequest::SelectVenue(venue) => {
                 self.selected_venue = venue;
                 match venue {
-                    VenueId::Bet365 => workflow_snapshot(
-                        "Captured bet365 live tab.",
-                        VenueId::Bet365,
+                    VenueId::Betway => workflow_snapshot(
+                        "Captured betway live tab.",
+                        VenueId::Betway,
                         "live_capture",
                         WorkerStatus::Ready,
                     ),
@@ -52,7 +52,7 @@ impl ExchangeProvider for WorkflowProvider {
             }
             ProviderRequest::RefreshCached => workflow_snapshot(
                 match self.selected_venue {
-                    VenueId::Bet365 => "Reused cached bet365 snapshot.",
+                    VenueId::Betway => "Reused cached betway snapshot.",
                     _ => "Reused cached Smarkets snapshot.",
                 },
                 self.selected_venue,
@@ -61,13 +61,13 @@ impl ExchangeProvider for WorkflowProvider {
             ),
             ProviderRequest::RefreshLive => workflow_snapshot(
                 match self.selected_venue {
-                    VenueId::Bet365 => "bet365 live tab unavailable.",
+                    VenueId::Betway => "betway live tab unavailable.",
                     _ => "Captured live Smarkets snapshot.",
                 },
                 self.selected_venue,
                 "live_capture",
                 match self.selected_venue {
-                    VenueId::Bet365 => WorkerStatus::Error,
+                    VenueId::Betway => WorkerStatus::Error,
                     _ => WorkerStatus::Ready,
                 },
             ),
@@ -89,20 +89,20 @@ fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
         .expect("workflow provider should initialize");
 
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::Accounts);
+    app.set_trading_section(TradingSection::Positions);
 
     app.select_next_exchange_row();
     app.select_next_exchange_row();
 
-    assert_eq!(app.selected_venue(), Some(VenueId::Bet365));
+    assert_eq!(app.selected_venue(), Some(VenueId::Betway));
     assert_eq!(app.recorder_snapshot_mode(), "live");
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
-    assert_eq!(app.snapshot().status_line, "Captured bet365 live tab.");
+    assert_eq!(app.snapshot().status_line, "Captured betway live tab.");
 
     app.refresh().expect("cached refresh should succeed");
 
     assert_eq!(app.recorder_snapshot_mode(), "cached");
-    assert_eq!(app.snapshot().status_line, "Reused cached bet365 snapshot.");
+    assert_eq!(app.snapshot().status_line, "Reused cached betway snapshot.");
     assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
 
     app.refresh_live().expect("live refresh should succeed");
@@ -122,7 +122,7 @@ fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
         vec![
             ProviderRequest::LoadDashboard,
             ProviderRequest::SelectVenue(VenueId::Smarkets),
-            ProviderRequest::SelectVenue(VenueId::Bet365),
+            ProviderRequest::SelectVenue(VenueId::Betway),
             ProviderRequest::RefreshCached,
             ProviderRequest::RefreshLive,
             ProviderRequest::SelectVenue(VenueId::Smarkets),
@@ -152,8 +152,8 @@ fn workflow_snapshot(
                 market_count: 2,
             },
             VenueSummary {
-                id: VenueId::Bet365,
-                label: String::from("bet365"),
+                id: VenueId::Betway,
+                label: String::from("betway"),
                 status: VenueStatus::Connected,
                 detail: String::from("sportsbook ready"),
                 event_count: 1,

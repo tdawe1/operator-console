@@ -24,11 +24,11 @@ impl Panel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingSection {
-    Accounts,
     Positions,
     Markets,
-    OddsMatcher,
-    HorseMatcher,
+    Live,
+    Props,
+    Matcher,
     Stats,
     Calculator,
     Recorder,
@@ -36,11 +36,11 @@ pub enum TradingSection {
 
 impl TradingSection {
     pub const ALL: [Self; 8] = [
-        Self::Accounts,
         Self::Positions,
         Self::Markets,
-        Self::OddsMatcher,
-        Self::HorseMatcher,
+        Self::Live,
+        Self::Props,
+        Self::Matcher,
         Self::Stats,
         Self::Calculator,
         Self::Recorder,
@@ -48,14 +48,65 @@ impl TradingSection {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Accounts => "Accounts",
             Self::Positions => "Positions",
             Self::Markets => "Markets",
-            Self::OddsMatcher => "OddsMatcher",
-            Self::HorseMatcher => "HorseMatcher",
+            Self::Live => "Live",
+            Self::Props => "Props",
+            Self::Matcher => "Matcher",
             Self::Stats => "Stats",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatcherView {
+    Odds,
+    Horse,
+    Acca,
+}
+
+impl MatcherView {
+    pub const ALL: [Self; 3] = [Self::Odds, Self::Horse, Self::Acca];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Odds => "Odds",
+            Self::Horse => "Horse",
+            Self::Acca => "Acca",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalculatorTool {
+    Basic,
+    Arb,
+    EachWay,
+    Acca,
+    Ev,
+    ExtraPlace,
+}
+
+impl CalculatorTool {
+    pub const ALL: [Self; 6] = [
+        Self::Basic,
+        Self::Arb,
+        Self::EachWay,
+        Self::Acca,
+        Self::Ev,
+        Self::ExtraPlace,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic",
+            Self::Arb => "Arb",
+            Self::EachWay => "EW",
+            Self::Acca => "Acca",
+            Self::Ev => "EV",
+            Self::ExtraPlace => "XPlace",
         }
     }
 }

@@ -97,6 +97,7 @@ fn start_recorder_returns_immediately_when_first_snapshot_is_not_ready() {
             session: String::from("helium-copy"),
             companion_legs_path: None,
             profile_path: Some(PathBuf::from("/tmp/owned-profile")),
+            disabled_venues: String::from("bet365"),
             autostart: false,
             interval_seconds: 5,
             commission_rate: String::from("0"),

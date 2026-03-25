@@ -15,6 +15,7 @@ use crate::domain::{
     ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, RecorderEventSummary, TrackedBetRow,
     TrackedLeg, TransportMarkerSummary,
 };
+use crate::owls::{OwlsDashboard, OwlsEndpointId, OwlsPreviewRow};
 use crate::trading_actions::{
     TradingActionSeed, TradingActionSide, TradingActionSource, TradingActionSourceContext,
 };
@@ -23,20 +24,20 @@ pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
     active_table_state: &mut TableState,
     historical_table_state: &mut TableState,
     positions_focus: PositionsFocus,
     show_live_view_overlay: bool,
     status_message: &str,
-    help_text: &str,
     status_scroll: u16,
 ) {
     let active_views = active_position_views(snapshot);
     let exit_recommendations = derived_exit_recommendations(snapshot);
     let selected_active = selected_active_position(&active_views, active_table_state);
     let selected_historical = selected_historical_position(snapshot, historical_table_state);
-    let layout = Layout::vertical([Constraint::Length(10), Constraint::Min(18)]).split(area);
-    let body = Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
+    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(18)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
         .split(layout[1]);
     let (active_height, historical_height) =
         position_section_heights(snapshot, body[0].height.max(14));
@@ -46,9 +47,7 @@ pub fn render(
     ])
     .split(body[0]);
     let right = Layout::vertical([
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(9),
+        Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Min(6),
     ])
@@ -119,20 +118,13 @@ pub fn render(
         empty_row(history_empty, 9),
         Some(historical_table_state),
     );
-    render_table(
+    render_signal_board(
         frame,
         right[0],
-        &format!("󰔟 Exit Recommendations ({})", exit_recommendations.len()),
-        vec![
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Min(16),
-            Constraint::Length(9),
-            Constraint::Length(10),
-        ],
-        exit_rows(&exit_recommendations),
-        empty_row("No exit recommendations are loaded.", 5),
-        None,
+        snapshot,
+        owls_dashboard,
+        &exit_recommendations,
+        selected_active,
     );
     render_table(
         frame,
@@ -157,50 +149,22 @@ pub fn render(
         empty_row("No grouped watch plan is loaded.", 6),
         None,
     );
-    render_table(
-        frame,
-        right[2],
-        &format!("󰋼 Tracked Bets ({})", snapshot.tracked_bets.len()),
-        vec![
-            Constraint::Length(10),
-            Constraint::Percentage(24),
-            Constraint::Percentage(20),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Min(12),
-        ],
-        tracked_rows(snapshot),
-        empty_row("No tracked bets are loaded.", 6),
-        None,
-    );
-    render_table(
-        frame,
-        right[3],
-        &format!("󰇚 Other Open Bets ({})", snapshot.other_open_bets.len()),
-        vec![
-            Constraint::Percentage(32),
-            Constraint::Percentage(26),
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Min(10),
-        ],
-        other_open_bet_rows(snapshot),
-        empty_row("No other open bets are loaded.", 5),
-        None,
-    );
     render_operator_log(
         frame,
-        right[4],
+        right[2],
         snapshot,
         selected_active,
         status_message,
-        help_text,
         positions_focus,
         status_scroll,
     );
 
     if show_live_view_overlay {
-        render_live_view_overlay(frame, area, snapshot, selected_active);
+        if positions_focus == PositionsFocus::Historical {
+            render_historical_view_overlay(frame, area, snapshot, selected_historical);
+        } else {
+            render_live_view_overlay(frame, area, snapshot, selected_active);
+        }
     }
 }
 
@@ -222,7 +186,6 @@ struct DerivedExitRecommendation {
     action: String,
     reason: String,
     worst_case_pnl: f64,
-    cash_out_venue: Option<String>,
 }
 
 pub(crate) fn active_position_row_count(snapshot: &ExchangePanelSnapshot) -> usize {
@@ -449,26 +412,18 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
         .or_else(|| active_hold_outcomes(view).map(|(win, lose)| win.min(lose)))
         .unwrap_or(0.0);
 
-    let (action, reason, cash_out_venue) = if active_exchange_leg(view).is_none() {
-        ("hold", "missing_smarkets_leg", None)
+    let (action, reason) = if active_exchange_leg(view).is_none() {
+        ("hold", "missing_smarkets_leg")
     } else if active_current_back_odds(view).is_none()
         || !view
             .open_position
             .map(|open_position| open_position.can_trade_out)
             .unwrap_or(false)
     {
-        (
-            "hold",
-            "cash_out_unavailable",
-            Some(String::from("smarkets")),
-        )
+        ("hold", "cash_out_unavailable")
     } else if let Some(hard_floor) = view.hard_margin_call_profit_floor {
         if worst_case_pnl >= hard_floor {
-            (
-                "cash_out",
-                "hard_margin_call",
-                Some(String::from("smarkets")),
-            )
+            ("cash_out", "hard_margin_call")
         } else {
             if worst_case_pnl >= view.target_profit {
                 (
@@ -478,7 +433,6 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
                         "cash_out"
                     },
                     "target_profit",
-                    Some(String::from("smarkets")),
                 )
             } else if worst_case_pnl <= -view.stop_loss {
                 (
@@ -488,10 +442,9 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
                         "cash_out"
                     },
                     "stop_loss",
-                    Some(String::from("smarkets")),
                 )
             } else {
-                ("hold", "within_thresholds", Some(String::from("smarkets")))
+                ("hold", "within_thresholds")
             }
         }
     } else if worst_case_pnl >= view.target_profit {
@@ -502,7 +455,6 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
                 "cash_out"
             },
             "target_profit",
-            Some(String::from("smarkets")),
         )
     } else if worst_case_pnl <= -view.stop_loss {
         (
@@ -512,10 +464,9 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
                 "cash_out"
             },
             "stop_loss",
-            Some(String::from("smarkets")),
         )
     } else {
-        ("hold", "within_thresholds", Some(String::from("smarkets")))
+        ("hold", "within_thresholds")
     };
 
     Some(DerivedExitRecommendation {
@@ -523,7 +474,6 @@ fn derived_exit_recommendation(view: ActivePositionView<'_>) -> Option<DerivedEx
         action: action.to_string(),
         reason: reason.to_string(),
         worst_case_pnl,
-        cash_out_venue,
     })
 }
 
@@ -535,17 +485,11 @@ fn render_summary(
     selected_historical: Option<&OpenPositionRow>,
     positions_focus: PositionsFocus,
 ) {
-    let summary = Layout::horizontal([
-        Constraint::Percentage(23),
-        Constraint::Percentage(33),
-        Constraint::Percentage(22),
-        Constraint::Percentage(22),
-    ])
-    .split(area);
+    let summary =
+        Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).split(area);
     let runtime = snapshot.runtime.as_ref();
     let exit_recommendations = derived_exit_recommendations(snapshot);
-    let (standard_funding_count, promo_funding_count, unknown_funding_count) =
-        tracked_bet_funding_counts(snapshot);
+    let (_, promo_funding_count, _) = tracked_bet_funding_counts(snapshot);
     let (realised_pnl, live_pnl, net_pnl, promo_pnl) = positions_pnl_summary(snapshot);
     let (recent_interactions, pending_interactions, issue_interactions) =
         active_interaction_summary(snapshot);
@@ -576,9 +520,9 @@ fn render_summary(
             accent_gold(),
         ),
         (
-            "󰐹 Counts",
+            "󰐹 Scope",
             format!(
-                "pos {} | hist {} | open {} | tracked {}",
+                "{} act | {} hist | {} open | {} tracked",
                 active_position_row_count(snapshot),
                 snapshot.historical_positions.len(),
                 snapshot.other_open_bets.len(),
@@ -589,15 +533,15 @@ fn render_summary(
         (
             "󰥔 State",
             format!(
-                "live {} | susp {} | watch {} | rec {}",
+                "{} live | {} susp | {} rec | {} watch",
                 in_play_count(snapshot),
                 suspended_count(snapshot),
+                exit_recommendations.len(),
                 snapshot
                     .watch
                     .as_ref()
                     .map(|watch| watch.watch_count)
                     .unwrap_or(0),
-                exit_recommendations.len(),
             ),
             accent_pink(),
         ),
@@ -620,35 +564,19 @@ fn render_summary(
             },
         ),
         (
-            "󰤑 Funding",
-            if snapshot.tracked_bets.is_empty() {
-                String::from("no tracked funding")
-            } else {
-                format!(
-                    "std {} | promo {} | unk {}",
-                    standard_funding_count, promo_funding_count, unknown_funding_count
-                )
-            },
-            if promo_funding_count > 0 {
-                accent_gold()
-            } else if unknown_funding_count > 0 {
-                muted_text()
-            } else {
-                accent_green()
-            },
-        ),
-        (
-            "󱂬 Status",
-            if runtime.map(|summary| summary.stale).unwrap_or(false) {
-                format!("STALE | {}", snapshot.status_line)
-            } else {
-                snapshot.status_line.clone()
-            },
-            if runtime.map(|summary| summary.stale).unwrap_or(false) {
-                accent_red()
-            } else {
-                accent_green()
-            },
+            "󰁔 P/L",
+            format!(
+                "real {:+.2} | live {:+.2} | net {:+.2}{}",
+                realised_pnl,
+                live_pnl,
+                net_pnl,
+                if promo_funding_count > 0 {
+                    format!(" | promo {:+.2}", promo_pnl)
+                } else {
+                    String::new()
+                }
+            ),
+            pnl_color(net_pnl),
         ),
     ];
     render_key_value_table(
@@ -741,89 +669,68 @@ fn render_summary(
         selected_rows,
         Constraint::Length(13),
     );
+}
 
-    let control_rows = vec![
+fn render_signal_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+    exit_recommendations: &[DerivedExitRecommendation],
+    selected_active: Option<ActivePositionView<'_>>,
+) {
+    let next_action = exit_recommendations
+        .first()
+        .map(|recommendation| {
+            format!(
+                "{} {} | worst {:+.2}",
+                recommendation.bet_id, recommendation.action, recommendation.worst_case_pnl
+            )
+        })
+        .unwrap_or_else(|| String::from("no exit trigger"));
+    let (recent_interactions, pending_interactions, issue_interactions) =
+        active_interaction_summary(snapshot);
+    let rows = vec![
+        ("󰘳 Next", next_action, accent_gold()),
         (
-            "󰮳 Navigate",
-            format!("↑/↓ or j/k • Tab pane ({})", positions_focus.label()),
-            accent_gold(),
-        ),
-        (
-            "󰔟 Action",
-            String::from("c cash out first actionable bet"),
+            "󱂬 Selected",
+            selected_active
+                .map(active_action_label)
+                .unwrap_or_else(|| String::from("-")),
             accent_green(),
         ),
         (
-            "󰑓 Refresh",
-            String::from("r reload provider snapshot"),
-            accent_cyan(),
-        ),
-        (
-            "󰊠 Scope",
-            format!(
-                "{} active • {} historical",
-                active_position_row_count(snapshot),
-                snapshot.historical_positions.len()
-            ),
+            "󰇚 Sharp",
+            selected_active
+                .map(|view| active_sharp_quote_label(owls_dashboard, view))
+                .unwrap_or_else(|| String::from("-")),
             accent_blue(),
         ),
         (
-            "󰋼 Flow",
+            "󰐊 I/O",
             format!(
-                "{} tracked • {} recs • {} watch",
-                snapshot.tracked_bets.len(),
-                exit_recommendations.len(),
-                snapshot
-                    .watch
-                    .as_ref()
-                    .map(|watch| watch.watch_count)
-                    .unwrap_or(0)
+                "{} recent | {} pending | {} issues",
+                recent_interactions, pending_interactions, issue_interactions
             ),
-            accent_pink(),
-        ),
-        (
-            "󰐊 Legend",
-            String::from("bet/cash + req/subm/err/n-i"),
-            accent_cyan(),
-        ),
-    ];
-    render_key_value_table(
-        frame,
-        summary[2],
-        "󰘳 Controls",
-        control_rows,
-        Constraint::Length(12),
-    );
-
-    let pnl_rows = vec![
-        (
-            "󰜎 Realised",
-            format!("{realised_pnl:+.2}"),
-            pnl_color(realised_pnl),
-        ),
-        ("󱂬 Live", format!("{live_pnl:+.2}"), pnl_color(live_pnl)),
-        ("󰮍 Net", format!("{net_pnl:+.2}"), pnl_color(net_pnl)),
-        (
-            "󰤑 Promo",
-            if promo_funding_count > 0 {
-                format!("{promo_pnl:+.2}")
+            if issue_interactions > 0 {
+                accent_red()
+            } else if pending_interactions > 0 {
+                accent_gold()
             } else {
-                String::from("-")
-            },
-            if promo_funding_count > 0 {
-                pnl_color(promo_pnl)
-            } else {
-                muted_text()
+                accent_cyan()
             },
         ),
+        (
+            "󰋼 Inventory",
+            format!(
+                "{} tracked | {} open",
+                snapshot.tracked_bets.len(),
+                snapshot.other_open_bets.len()
+            ),
+            accent_blue(),
+        ),
     ];
-    render_key_value_table(
-        frame,
-        summary[3],
-        "󰁔 Running P/L",
-        pnl_rows,
-        Constraint::Length(10),
-    );
+    render_key_value_table(frame, area, "󰔟 Signal Board", rows, Constraint::Length(10));
 }
 
 fn render_key_value_table(
@@ -1000,22 +907,6 @@ fn historical_position_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static
                 trade_cell(row),
                 historical_pnl_cell(row),
                 Cell::from(market_price_label(row)),
-            ])
-        })
-        .collect()
-}
-
-fn other_open_bet_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    snapshot
-        .other_open_bets
-        .iter()
-        .map(|row| {
-            Row::new(vec![
-                Cell::from(row.label.clone()),
-                Cell::from(row.market.clone()),
-                Cell::from(row.side.clone()),
-                Cell::from(format!("{:.2}", row.stake)),
-                Cell::from(row.status.clone()),
             ])
         })
         .collect()
@@ -1226,6 +1117,7 @@ fn legacy_watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn tracked_bet_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     if snapshot.tracked_bets.is_empty() {
         return vec![Line::raw("No tracked bets are loaded.")];
@@ -1265,33 +1157,6 @@ fn tracked_bet_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
         )));
     }
     rows
-}
-
-fn tracked_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    snapshot
-        .tracked_bets
-        .iter()
-        .map(|tracked_bet| {
-            Row::new(vec![
-                Cell::from(tracked_bet.bet_id.clone()),
-                Cell::from(
-                    format!("{} {}", tracked_bet.platform, tracked_bet.selection)
-                        .trim()
-                        .to_string(),
-                ),
-                Cell::from(tracked_bet.market.clone()),
-                Cell::from(tracked_bet.status.clone()),
-                Cell::from(tracked_bet_funding_label(tracked_bet)),
-                Cell::from(
-                    tracked_bet
-                        .expected_ev
-                        .gbp
-                        .map(|value| format!("EV {value:.2}"))
-                        .unwrap_or_else(|| tracked_bet_source_summary(tracked_bet)),
-                ),
-            ])
-        })
-        .collect()
 }
 
 fn active_event_label(view: ActivePositionView<'_>) -> String {
@@ -1404,6 +1269,13 @@ fn active_hold_label(view: ActivePositionView<'_>) -> String {
     }
 }
 
+fn active_half_exit_label(view: ActivePositionView<'_>) -> String {
+    match active_half_cashout_outcomes(view) {
+        Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
+        None => String::from("-"),
+    }
+}
+
 fn active_lock_label(view: ActivePositionView<'_>) -> String {
     match active_total_cashout_outcomes(view) {
         Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
@@ -1449,6 +1321,22 @@ fn active_status_label(view: ActivePositionView<'_>) -> String {
         "-"
     };
     format!("book {sportsbook} | lay {exchange}")
+}
+
+fn active_exposure_label(view: ActivePositionView<'_>) -> String {
+    if let Some(open_position) = view.open_position {
+        format!(
+            "book {:.2} | lay {:.2} | liab {:.2}",
+            view.sportsbook_bet.map(|bet| bet.stake).unwrap_or(0.0),
+            open_position.stake,
+            open_position.liability,
+        )
+    } else {
+        format!(
+            "book {:.2}",
+            view.sportsbook_bet.map(|bet| bet.stake).unwrap_or(0.0)
+        )
+    }
 }
 
 fn active_bookie_cashout_label(view: ActivePositionView<'_>) -> String {
@@ -1504,6 +1392,10 @@ fn active_marked_pnl(view: ActivePositionView<'_>) -> f64 {
 
 fn active_current_worst_case(view: ActivePositionView<'_>) -> Option<f64> {
     active_total_cashout_outcomes(view).map(|(win, lose)| win.min(lose))
+}
+
+fn active_half_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
+    active_fractional_cashout_outcomes(view, 0.5)
 }
 
 fn active_current_back_odds(view: ActivePositionView<'_>) -> Option<f64> {
@@ -1569,6 +1461,21 @@ fn active_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
     Some((locked_profit + other_wins, locked_profit + other_loses))
 }
 
+fn active_fractional_cashout_outcomes(
+    view: ActivePositionView<'_>,
+    fraction: f64,
+) -> Option<(f64, f64)> {
+    let (_, entry_odds, lay_stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_current_back_odds(view)?;
+    let hedge_stake = active_full_hedge_back_stake(view)? * fraction.clamp(0.0, 1.0);
+    let exchange_win = settled_leg_pnl("lay", entry_odds, lay_stake, commission_rate, true)
+        + settled_leg_pnl("back", current_back_odds, hedge_stake, 0.0, true);
+    let exchange_lose = settled_leg_pnl("lay", entry_odds, lay_stake, commission_rate, false)
+        + settled_leg_pnl("back", current_back_odds, hedge_stake, 0.0, false);
+    let (other_wins, other_loses) = active_non_exchange_outcomes(view)?;
+    Some((exchange_win + other_wins, exchange_lose + other_loses))
+}
+
 fn active_bookie_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
     let sportsbook_bet = view.sportsbook_bet?;
     let current_cashout_value = sportsbook_bet.current_cashout_value?;
@@ -1590,6 +1497,13 @@ fn active_bookie_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, 
 
 fn active_total_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
     active_cashout_outcomes(view).or_else(|| active_bookie_cashout_outcomes(view))
+}
+
+fn active_full_hedge_back_stake(view: ActivePositionView<'_>) -> Option<f64> {
+    let (_, entry_lay_odds, lay_stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_current_back_odds(view)?;
+    let effective_commission = normalize_commission_rate(commission_rate);
+    Some((lay_stake * (entry_lay_odds - effective_commission)) / current_back_odds)
 }
 
 fn active_non_exchange_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f64)> {
@@ -1772,6 +1686,147 @@ fn lay_trade_out_locked_profit(
     let hedge_back_stake =
         (lay_stake * (entry_lay_odds - effective_commission)) / current_back_odds;
     (lay_stake * (1.0 - effective_commission)) - hedge_back_stake
+}
+
+fn active_price_edge_label(view: ActivePositionView<'_>) -> String {
+    match (
+        active_live_exchange_leg(view).map(|(_, odds, _, _)| odds),
+        active_current_back_odds(view),
+        active_live_exchange_leg(view).map(|(_, odds, _, _)| implied_probability(odds)),
+        active_current_probability(view),
+    ) {
+        (Some(entry_odds), Some(live_odds), Some(entry_prob), Some(live_prob)) => format!(
+            "odds {:+.2} | prob {:+.2}pp",
+            live_odds - entry_odds,
+            (live_prob - entry_prob) * 100.0
+        ),
+        _ => String::from("-"),
+    }
+}
+
+fn active_exit_edge_label(view: ActivePositionView<'_>) -> String {
+    let hold_worst = active_hold_outcomes(view).map(|(win, lose)| win.min(lose));
+    let half_worst = active_half_cashout_outcomes(view).map(|(win, lose)| win.min(lose));
+    let lock_worst = active_total_cashout_outcomes(view).map(|(win, lose)| win.min(lose));
+    match (hold_worst, half_worst, lock_worst) {
+        (Some(hold), Some(half), Some(lock)) => {
+            format!("half {:+.2} | lock {:+.2}", half - hold, lock - hold)
+        }
+        (Some(hold), None, Some(lock)) => format!("lock {:+.2}", lock - hold),
+        _ => String::from("-"),
+    }
+}
+
+fn active_half_exit_stake_label(view: ActivePositionView<'_>) -> String {
+    match (
+        active_full_hedge_back_stake(view),
+        active_half_cashout_outcomes(view),
+    ) {
+        (Some(stake), Some((win, lose))) => {
+            format!("stake {:.2} | {:+.2}/{:+.2}", stake / 2.0, win, lose)
+        }
+        _ => String::from("-"),
+    }
+}
+
+fn active_full_exit_stake_label(view: ActivePositionView<'_>) -> String {
+    match (
+        active_full_hedge_back_stake(view),
+        active_total_cashout_outcomes(view),
+    ) {
+        (Some(stake), Some((win, lose))) => {
+            format!("stake {:.2} | {:+.2}/{:+.2}", stake, win, lose)
+        }
+        _ => String::from("-"),
+    }
+}
+
+fn active_entry_ev_label(view: ActivePositionView<'_>) -> String {
+    let Some(tracked_bet) = view.tracked_bet else {
+        return String::from("-");
+    };
+    match (tracked_bet.expected_ev.gbp, tracked_bet.expected_ev.pct) {
+        (Some(gbp), Some(pct)) => format!("{gbp:+.2} | {pct:+.2}%"),
+        (Some(gbp), None) => format!("{gbp:+.2}"),
+        (None, Some(pct)) => format!("{pct:+.2}%"),
+        (None, None) => String::from("-"),
+    }
+}
+
+fn active_historical_summary_label(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> String {
+    let selection = active_selection_label(view);
+    let market = active_market_name(view);
+    let matches = snapshot
+        .historical_positions
+        .iter()
+        .filter(|row| {
+            text_matches(&selection, &row.contract) && market_matches(&market, &row.market)
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return String::from("no matched history");
+    }
+    let realised = matches
+        .iter()
+        .filter(|row| row.overall_pnl_known)
+        .map(|row| row.pnl_amount)
+        .sum::<f64>();
+    let wins = matches
+        .iter()
+        .filter(|row| row.overall_pnl_known && row.pnl_amount > 0.0)
+        .count();
+    format!("n {} | win {} | pnl {:+.2}", matches.len(), wins, realised)
+}
+
+fn active_sharp_quote_label(
+    owls_dashboard: &OwlsDashboard,
+    view: ActivePositionView<'_>,
+) -> String {
+    let event = active_event_label(view);
+    let selection = active_selection_label(view);
+    let preferred = [
+        OwlsEndpointId::Realtime,
+        OwlsEndpointId::Moneyline,
+        OwlsEndpointId::Odds,
+        OwlsEndpointId::Spreads,
+        OwlsEndpointId::Totals,
+    ];
+    for endpoint_id in preferred {
+        let Some(endpoint) = owls_dashboard
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        else {
+            continue;
+        };
+        if let Some(row) = endpoint.preview.iter().find(|row| {
+            text_matches(&row.label, &event)
+                && (text_matches(&row.metric, &selection)
+                    || text_matches(&row.detail, "pinnacle")
+                    || normalize_key(&selection) == "draw")
+        }) {
+            return compact_sharp_quote(row);
+        }
+        if let Some(row) = endpoint
+            .preview
+            .iter()
+            .find(|row| text_matches(&row.label, &event))
+        {
+            return compact_sharp_quote(row);
+        }
+    }
+    String::from("no Owls match")
+}
+
+fn compact_sharp_quote(row: &OwlsPreviewRow) -> String {
+    format!(
+        "{} | {}",
+        truncate_text(&row.detail, 12),
+        truncate_text(&row.metric, 18)
+    )
 }
 
 fn exit_odds_for_target_profit(
@@ -2168,36 +2223,9 @@ fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'stat
             "{} | {} | worst {:.2}",
             recommendation.bet_id, recommendation.action, recommendation.worst_case_pnl
         )));
-        rows.push(Line::raw(format!(
-            "reason {} | venue {}",
-            recommendation.reason,
-            recommendation
-                .cash_out_venue
-                .clone()
-                .unwrap_or_else(|| String::from("-")),
-        )));
+        rows.push(Line::raw(format!("reason {}", recommendation.reason)));
     }
     rows
-}
-
-fn exit_rows(recommendations: &[DerivedExitRecommendation]) -> Vec<Row<'static>> {
-    recommendations
-        .iter()
-        .map(|recommendation| {
-            Row::new(vec![
-                Cell::from(recommendation.bet_id.clone()),
-                Cell::from(recommendation.action.clone()),
-                Cell::from(recommendation.reason.clone()),
-                pnl_cell(recommendation.worst_case_pnl),
-                Cell::from(
-                    recommendation
-                        .cash_out_venue
-                        .clone()
-                        .unwrap_or_else(|| String::from("-")),
-                ),
-            ])
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -2210,6 +2238,7 @@ fn tracked_source_count(snapshot: &ExchangePanelSnapshot) -> usize {
         .len()
 }
 
+#[cfg(test)]
 fn tracked_bet_source_summary(tracked_bet: &crate::domain::TrackedBetRow) -> String {
     let venues = tracked_bet
         .legs
@@ -2327,7 +2356,6 @@ fn render_operator_log(
     snapshot: &ExchangePanelSnapshot,
     selected_active: Option<ActivePositionView<'_>>,
     status_message: &str,
-    help_text: &str,
     positions_focus: PositionsFocus,
     status_scroll: u16,
 ) {
@@ -2341,15 +2369,9 @@ fn render_operator_log(
         selected_active,
     ))
     .chain(std::iter::once(Line::raw(format!(
-        "󰕮 pane {} • history scrolls when selected • PgUp/PgDn scroll status",
+        "󰕮 pane {}",
         positions_focus.label()
     ))))
-    .chain(
-        help_text
-            .lines()
-            .take(2)
-            .map(|line| Line::raw(line.to_string())),
-    )
     .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
         .block(section_block("󰌌 Operator Feed", accent_blue()))
@@ -2358,13 +2380,124 @@ fn render_operator_log(
     frame.render_widget(paragraph, area);
 }
 
+fn render_historical_view_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    selected_historical: Option<&OpenPositionRow>,
+) {
+    let popup = popup_area(area, 82, 72);
+    frame.render_widget(Clear, popup);
+    let block = section_block("󰋪 History View", accent_pink());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let Some(row) = selected_historical else {
+        let empty = Paragraph::new("No historical position is selected.")
+            .block(section_block("󰄬 Selected History", accent_blue()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(empty, inner);
+        return;
+    };
+
+    let layout = Layout::vertical([Constraint::Length(9), Constraint::Min(8)]).split(inner);
+    let body = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .split(layout[1]);
+
+    render_key_value_table(
+        frame,
+        layout[0],
+        "󰄬 Historical Snapshot",
+        vec![
+            ("󰍹 Event", event_label(row), accent_blue()),
+            ("󰃭 Date", event_date_label(row), accent_green()),
+            ("󰥔 Time", event_time_label(row), accent_cyan()),
+            ("󰆼 Position", position_label(row), accent_gold()),
+            (
+                "󰌑 Trade",
+                format!("{} ({})", trade_label(row), trade_code(row)),
+                trade_color(row),
+            ),
+            (
+                "󱂬 P/L",
+                historical_pnl_label(row),
+                historical_pnl_style(row),
+            ),
+        ],
+        Constraint::Length(12),
+    );
+
+    render_key_value_table(
+        frame,
+        body[0],
+        "󰖌 Position Detail",
+        vec![
+            ("󰇈 Market", row.market.clone(), accent_blue()),
+            ("󰄬 Score", score_label(row), accent_green()),
+            ("󰅐 Phase", phase_label(row), accent_cyan()),
+            (
+                "󰔟 Prices",
+                format!(
+                    "buy {} | sell {}",
+                    format_optional_back_odds(primary_market_buy_odds(row)),
+                    format_optional_back_odds(row.current_sell_odds)
+                ),
+                accent_gold(),
+            ),
+            (
+                "󰈀 Prob",
+                format_optional_probability(primary_market_implied_probability(row)),
+                accent_cyan(),
+            ),
+            (
+                "󰐃 Exposure",
+                format!(
+                    "stake {:.2} | liab {:.2} | value {:.2}",
+                    row.stake, row.liability, row.current_value
+                ),
+                accent_pink(),
+            ),
+        ],
+        Constraint::Length(12),
+    );
+
+    let related = snapshot
+        .historical_positions
+        .iter()
+        .filter(|candidate| {
+            text_matches(&candidate.contract, &row.contract)
+                && market_matches(&candidate.market, &row.market)
+        })
+        .take(10)
+        .map(|candidate| {
+            Line::raw(format!(
+                "{} {} {} {}",
+                truncate_text(&event_label(candidate), 28),
+                event_date_label(candidate),
+                trade_code(candidate),
+                historical_pnl_label(candidate)
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let history_lines = if related.is_empty() {
+        vec![Line::raw("No comparable historical rows.")]
+    } else {
+        related
+    };
+    let history = Paragraph::new(history_lines)
+        .block(section_block("󰋪 Comparable History", accent_blue()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(history, body[1]);
+}
+
 fn render_live_view_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
     selected_active: Option<ActivePositionView<'_>>,
 ) {
-    let popup = popup_area(area, 84, 78);
+    let popup = popup_area(area, 90, 82);
     frame.render_widget(Clear, popup);
     let block = section_block("󰕮 Live View", accent_cyan());
     let inner = block.inner(popup);
@@ -2379,13 +2512,19 @@ fn render_live_view_overlay(
     };
 
     let layout = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(5),
         Constraint::Length(14),
-        Constraint::Min(10),
+        Constraint::Min(12),
     ])
     .split(inner);
-    let middle = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(layout[1]);
+    let middle = Layout::horizontal([
+        Constraint::Percentage(38),
+        Constraint::Percentage(30),
+        Constraint::Percentage(32),
+    ])
+    .split(layout[1]);
+    let bottom = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(layout[2]);
     let selected_transport = selected_transport_marker(snapshot, view);
     let selected_recorder = selected_recorder_event(snapshot, view, selected_transport);
 
@@ -2406,6 +2545,12 @@ fn render_live_view_overlay(
             Span::raw("   "),
             Span::styled("Lock ", Style::default().fg(muted_text())),
             Span::styled(active_lock_label(view), Style::default().fg(accent_green())),
+            Span::raw("   "),
+            Span::styled("Half ", Style::default().fg(muted_text())),
+            Span::styled(
+                active_half_exit_label(view),
+                Style::default().fg(accent_pink()),
+            ),
             Span::raw("   "),
             Span::styled("Book cash ", Style::default().fg(muted_text())),
             Span::styled(
@@ -2459,25 +2604,46 @@ fn render_live_view_overlay(
                 ),
                 accent_green(),
             ),
+            ("󰖌 Exposure", active_exposure_label(view), accent_pink()),
+        ],
+        Constraint::Length(12),
+    );
+    render_key_value_table(
+        frame,
+        middle[2],
+        "󰆑 Opportunity Lens",
+        vec![
+            ("󰈀 Price Edge", active_price_edge_label(view), accent_cyan()),
+            ("󰔟 Exit Edge", active_exit_edge_label(view), accent_green()),
             (
-                "󰐊 Last I/O",
-                selected_transport
-                    .map(compact_transport_label)
-                    .unwrap_or_else(|| String::from("no correlated marker")),
+                "󰐃 Half Exit",
+                active_half_exit_stake_label(view),
                 accent_gold(),
             ),
             (
-                "󰛿 Recorder",
-                selected_recorder
-                    .map(compact_recorder_label)
-                    .unwrap_or_else(|| String::from("no correlated event")),
-                accent_cyan(),
+                "󰔠 Full Exit",
+                active_full_exit_stake_label(view),
+                accent_gold(),
+            ),
+            ("󰖟 Entry EV", active_entry_ev_label(view), accent_pink()),
+            (
+                "󰋪 History",
+                active_historical_summary_label(snapshot, view),
+                accent_blue(),
             ),
         ],
         Constraint::Length(12),
     );
 
-    render_live_decision_matrix(frame, layout[2], view);
+    render_live_decision_matrix(frame, bottom[0], view);
+    render_live_execution_feed(
+        frame,
+        bottom[1],
+        snapshot,
+        view,
+        selected_transport,
+        selected_recorder,
+    );
 }
 
 fn render_live_odds_chart(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
@@ -2505,6 +2671,7 @@ fn render_live_odds_chart(frame: &mut Frame<'_>, area: Rect, view: ActivePositio
 
 fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
     let hold = active_hold_outcomes(view);
+    let half = active_half_cashout_outcomes(view);
     let lock = active_total_cashout_outcomes(view);
     let rows = vec![
         Row::new(vec![
@@ -2514,12 +2681,11 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                lock.map(|(win, _)| format!("{win:+.2}"))
+                half.map(|(win, _)| format!("{win:+.2}"))
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                hold.zip(lock)
-                    .map(|((hold_win, _), (lock_win, _))| format!("{:+.2}", lock_win - hold_win))
+                lock.map(|(win, _)| format!("{win:+.2}"))
                     .unwrap_or_else(|| String::from("-")),
             ),
         ]),
@@ -2530,14 +2696,11 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                lock.map(|(_, lose)| format!("{lose:+.2}"))
+                half.map(|(_, lose)| format!("{lose:+.2}"))
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                hold.zip(lock)
-                    .map(|((_, hold_lose), (_, lock_lose))| {
-                        format!("{:+.2}", lock_lose - hold_lose)
-                    })
+                lock.map(|(_, lose)| format!("{lose:+.2}"))
                     .unwrap_or_else(|| String::from("-")),
             ),
         ]),
@@ -2548,14 +2711,11 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                lock.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
+                half.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
                     .unwrap_or_else(|| String::from("-")),
             ),
             Cell::from(
-                hold.zip(lock)
-                    .map(|((hold_win, hold_lose), (lock_win, lock_lose))| {
-                        format!("{:+.2}", lock_win.min(lock_lose) - hold_win.min(hold_lose))
-                    })
+                lock.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
                     .unwrap_or_else(|| String::from("-")),
             ),
         ]),
@@ -2570,7 +2730,7 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
         ],
     )
     .header(
-        Row::new(vec!["Scenario", "Hold", "Lock", "Delta"])
+        Row::new(vec!["Scenario", "Hold", "Half", "Lock"])
             .style(
                 Style::default()
                     .fg(Color::Black)
@@ -2582,6 +2742,41 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
     .block(section_block("󰄵 Decision Matrix", accent_blue()))
     .column_spacing(1);
     frame.render_widget(table, area);
+}
+
+fn render_live_execution_feed(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    selected_transport: Option<&TransportMarkerSummary>,
+    selected_recorder: Option<&RecorderEventSummary>,
+) {
+    let mut lines = vec![Line::raw(format!(
+        "transport {}",
+        selected_transport
+            .map(compact_transport_label)
+            .unwrap_or_else(|| String::from("no correlated marker"))
+    ))];
+    if let Some(event) = selected_transport.filter(|event| !event.detail.is_empty()) {
+        lines.push(Line::raw(truncate_text(&event.detail, 56)));
+    }
+    lines.push(Line::raw(format!(
+        "recorder {}",
+        selected_recorder
+            .map(compact_recorder_label)
+            .unwrap_or_else(|| String::from("no correlated event"))
+    )));
+    if let Some(event) = selected_recorder.filter(|event| !event.detail.is_empty()) {
+        lines.push(Line::raw(truncate_text(&event.detail, 56)));
+    }
+    lines.push(Line::raw(String::new()));
+    lines.extend(selected_position_interaction_lines(snapshot, Some(view)));
+
+    let paragraph = Paragraph::new(lines)
+        .block(section_block("󰐊 Execution Trail", accent_blue()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
 }
 
 fn live_odds_points(view: ActivePositionView<'_>) -> Vec<(f64, f64)> {
@@ -3889,7 +4084,7 @@ mod tests {
 
         assert!(rendered.contains("Target 5.00 | Stop 5.00 | Hard floor - | Warn default true"));
         assert!(rendered.contains("bet-001 | hold | worst 1.27"));
-        assert!(rendered.contains("reason within_thresholds | venue smarkets"));
+        assert!(rendered.contains("reason within_thresholds"));
     }
 
     #[test]
@@ -3974,6 +4169,60 @@ mod tests {
         assert!(rendered.contains("live 5.00 | profit 11.41 | stop 2.57"));
         assert!(rendered.contains("prob entry 29.85% | live 20.00% | profit 8.77% | stop 38.89%"));
         assert!(rendered.contains("hold -21.05/+7.91 | lock +5.51/+1.27 | action watch"));
+    }
+
+    #[test]
+    fn half_cashout_outcomes_reduce_downside_without_flattening_upside() {
+        let mut snapshot = sample_snapshot();
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal v Everton"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::from(
+                "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/arsenal-vs-everton/44919693/",
+            ),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: 6.64,
+            pnl_amount: 3.27,
+            overall_pnl_known: true,
+            current_back_odds: Some(5.0),
+            current_implied_probability: Some(0.2),
+            current_implied_percentage: Some(20.0),
+            current_buy_odds: Some(5.0),
+            current_buy_implied_probability: Some(0.2),
+            current_sell_odds: Some(5.1),
+            current_sell_implied_probability: Some(1.0 / 5.1),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
+        }];
+
+        let view = super::active_position_views(&snapshot)
+            .into_iter()
+            .next()
+            .expect("paired active view");
+        let hold = super::active_hold_outcomes(view).expect("hold");
+        let half = super::active_half_cashout_outcomes(view).expect("half");
+        let lock = super::active_total_cashout_outcomes(view).expect("lock");
+
+        assert!((hold.0 + 21.05).abs() < 0.02);
+        assert!((hold.1 - 7.91).abs() < 0.02);
+        assert!((half.0 + 7.77).abs() < 0.02);
+        assert!((half.1 - 4.59).abs() < 0.02);
+        assert!((lock.0 - 5.51).abs() < 0.02);
+        assert!((lock.1 - 1.27).abs() < 0.02);
+        assert!(half.0 > hold.0);
+        assert!(half.0 < lock.0);
+        assert!(half.1 < hold.1);
+        assert!(half.1 > lock.1);
     }
 
     fn sample_snapshot() -> ExchangePanelSnapshot {

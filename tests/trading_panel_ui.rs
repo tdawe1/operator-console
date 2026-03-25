@@ -21,13 +21,15 @@ impl ExchangeProvider for StaticProvider {
 }
 
 #[test]
-fn accounts_panel_renders_multi_venue_board() {
-    let rendered = render_section(TradingSection::Accounts);
+fn positions_panel_renders_actionable_boards() {
+    let rendered = render_section(TradingSection::Positions);
 
-    assert!(rendered.contains("Venue Board"));
-    assert!(rendered.contains("Live Feed Preview"));
-    assert!(rendered.contains("Bet365"));
-    assert!(rendered.contains("Connected Venues"));
+    assert!(rendered.contains("Active Positions"));
+    assert!(rendered.contains("Historical Positions"));
+    assert!(rendered.contains("Signal Board"));
+    assert!(rendered.contains("Sharp"));
+    assert!(rendered.contains("Watch Plan"));
+    assert!(rendered.contains("Operator Feed"));
 }
 
 #[test]
@@ -45,11 +47,21 @@ fn stats_panel_renders_operating_ratios_and_mix_tables() {
 fn markets_panel_renders_api_surface_board() {
     let rendered = render_section(TradingSection::Markets);
 
-    assert!(rendered.contains("Owls Surface"));
+    assert!(rendered.contains("Owls Markets"));
     assert!(rendered.contains("Endpoint Board"));
-    assert!(rendered.contains("Endpoint Detail"));
     assert!(rendered.contains("/api/v1/nba/odds"));
-    assert!(rendered.contains("Realtime"));
+    assert!(rendered.contains("Preview"));
+}
+
+#[test]
+fn live_and_props_panels_render_dedicated_owls_views() {
+    let live = render_section(TradingSection::Live);
+    let props = render_section(TradingSection::Props);
+
+    assert!(live.contains("Owls Live"));
+    assert!(live.contains("Live Board"));
+    assert!(props.contains("Owls Props"));
+    assert!(props.contains("Props Board"));
 }
 
 #[test]
@@ -67,7 +79,7 @@ fn recorder_panel_renders_capture_pipeline_and_evidence() {
 fn positions_live_view_overlay_renders_cashout_and_matrix() {
     let mut snapshot = sample_snapshot();
     snapshot.other_open_bets = vec![OtherOpenBetRow {
-        venue: String::from("bet365"),
+        venue: String::from("betway"),
         event: String::from("Arsenal v Everton"),
         label: String::from("Arsenal"),
         market: String::from("Match Odds"),
@@ -112,10 +124,72 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
     let rendered = lines.join("\n");
 
     assert!(rendered.contains("Live View"));
-    assert!(rendered.contains("Cash / Lay"));
+    assert!(rendered.contains("Opportunity Lens"));
     assert!(rendered.contains("Decision Matrix"));
+    assert!(rendered.contains("Half"));
+    assert!(rendered.contains("Execution Trail"));
     assert!(rendered.contains("cash_out bet-1"));
     assert!(rendered.contains("16.16"));
+}
+
+#[test]
+fn historical_positions_overlay_renders_selected_history_detail() {
+    let mut snapshot = sample_snapshot();
+    snapshot.historical_positions = vec![OpenPositionRow {
+        event: String::from("Aston Villa v Chelsea"),
+        event_status: String::from("Settled"),
+        event_url: String::new(),
+        contract: String::from("jorrel hato (chelsea) - Player To Receive A Card"),
+        market: String::from("Player Cards"),
+        status: String::from("settled"),
+        market_status: String::from("settled"),
+        is_in_play: false,
+        price: 4.50,
+        stake: 2.0,
+        liability: 0.0,
+        current_value: 0.0,
+        pnl_amount: -2.0,
+        overall_pnl_known: true,
+        current_back_odds: Some(4.5),
+        current_implied_probability: Some(1.0 / 4.5),
+        current_implied_percentage: Some(100.0 / 4.5),
+        current_buy_odds: Some(4.5),
+        current_buy_implied_probability: Some(1.0 / 4.5),
+        current_sell_odds: None,
+        current_sell_implied_probability: None,
+        current_score: String::new(),
+        current_score_home: None,
+        current_score_away: None,
+        live_clock: String::from("13:49"),
+        can_trade_out: false,
+    }];
+
+    let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
+    app.set_trading_section(TradingSection::Positions);
+    app.handle_key(crossterm::event::KeyCode::Tab);
+    app.toggle_live_view_overlay();
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| operator_console::ui::render(frame, &mut app))
+        .expect("draw ui");
+
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    let mut lines = Vec::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        lines.push(line);
+    }
+    let rendered = lines.join("\n");
+
+    assert!(rendered.contains("History View"));
+    assert!(rendered.contains("Comparable History"));
+    assert!(rendered.contains("Aston Villa v Chelsea"));
 }
 
 #[test]
@@ -167,7 +241,6 @@ fn positions_panel_renders_selected_interaction_evidence() {
 
     assert!(rendered.contains("I/O"));
     assert!(rendered.contains("bet subm"));
-    assert!(rendered.contains("bet/cash"));
     assert!(rendered.contains("selected ref bet-1"));
     assert!(rendered.contains("place_bet"));
     assert!(rendered.contains("req-77"));

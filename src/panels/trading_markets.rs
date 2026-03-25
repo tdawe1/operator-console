@@ -1,40 +1,51 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, TradingSection};
 use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let layout = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(13),
-        Constraint::Length(7),
-    ])
-    .split(area);
-    let top = Layout::horizontal([
-        Constraint::Percentage(34),
-        Constraint::Percentage(36),
-        Constraint::Percentage(30),
-    ])
-    .split(layout[0]);
-    let body = Layout::horizontal([Constraint::Percentage(61), Constraint::Percentage(39)])
+    let layout = Layout::vertical([Constraint::Length(4), Constraint::Min(13)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(layout[1]);
-    let detail = Layout::vertical([Constraint::Length(9), Constraint::Min(4)]).split(body[1]);
 
     let selected = app.selected_owls_endpoint().cloned();
-    render_overview(frame, top[0], app);
-    render_group_strip(frame, top[1], app);
-    render_selection_brief(frame, top[2], selected.as_ref());
+    render_overview(frame, layout[0], app, selected.as_ref());
     render_endpoint_table(frame, body[0], app);
-    render_selection_detail(frame, detail[0], selected.as_ref());
-    render_preview(frame, detail[1], selected.as_ref());
-    render_runbook(frame, layout[2], app, selected.as_ref());
+    render_preview(
+        frame,
+        body[1],
+        app.active_trading_section(),
+        selected.as_ref(),
+    );
 }
 
-fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.markets_overlay_visible() || !is_owls_section(app.active_trading_section()) {
+        return;
+    }
+
+    let popup = popup_area(area, 86, 78);
+    frame.render_widget(Clear, popup);
+    let block = section_block(section_title(app.active_trading_section()), accent_gold());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let layout = Layout::vertical([Constraint::Length(9), Constraint::Min(10)]).split(inner);
+    let selected = app.selected_owls_endpoint();
+    render_selection_detail(frame, layout[0], selected);
+    render_preview(frame, layout[1], app.active_trading_section(), selected);
+}
+
+fn render_overview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    selected: Option<&OwlsEndpointSummary>,
+) {
     let owls = app.owls_dashboard();
     let ready = owls
         .endpoints
@@ -52,87 +63,72 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .filter(|endpoint| endpoint.status == "error")
         .count();
 
+    let selected_line = selected
+        .map(|endpoint| {
+            format!(
+                "{} {} [{}] rows {} polls {} Δ{}",
+                endpoint.method,
+                endpoint.path,
+                endpoint.status,
+                endpoint.count,
+                endpoint.poll_count,
+                endpoint.change_count
+            )
+        })
+        .unwrap_or_else(|| String::from("No endpoint selected."));
     let body = Paragraph::new(vec![
         Line::from(vec![
             badge("Sport", owls.sport.as_str(), accent_blue()),
             Span::raw("  "),
             badge(
                 "Ready",
-                &format!("{ready}/{}", owls.endpoints.len()),
+                &format!("{ready}/{}", app.visible_owls_endpoints().len()),
                 accent_green(),
             ),
             Span::raw("  "),
             badge("Wait", &waiting.to_string(), accent_gold()),
             Span::raw("  "),
             badge("Err", &errors.to_string(), accent_red()),
-        ]),
-        Line::raw(truncate(&owls.status_line, 80)),
-    ])
-    .block(section_block("Owls Surface", accent_blue()))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
-}
-
-fn render_group_strip(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-
-    for (index, group) in app.owls_dashboard().groups.iter().enumerate() {
-        current.push(group_chip(group));
-        if index == 2 {
-            lines.push(Line::from(current));
-            current = Vec::new();
-        } else {
-            current.push(Span::raw(" "));
-        }
-    }
-    if !current.is_empty() {
-        lines.push(Line::from(current));
-    }
-
-    let body = Paragraph::new(lines)
-        .block(section_block("Coverage", accent_cyan()))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
-}
-
-fn render_selection_brief(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    selected: Option<&OwlsEndpointSummary>,
-) {
-    let (title, path, status) = match selected {
-        Some(endpoint) => (
-            endpoint.label.as_str(),
-            endpoint.path.as_str(),
-            endpoint.status.as_str(),
-        ),
-        None => ("No endpoint", "-", "idle"),
-    };
-
-    let body = Paragraph::new(vec![
-        Line::styled(
-            truncate(title, 30),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::from(vec![
-            badge("State", status, status_color(status)),
             Span::raw("  "),
-            Span::styled(truncate(path, 42), Style::default().fg(muted_text())),
+            badge("Chk", &owls.sync_checks.to_string(), accent_cyan()),
+            Span::raw("  "),
+            badge("Δ", &owls.sync_changes.to_string(), accent_pink()),
+        ]),
+        Line::from(vec![
+            Span::styled("Sync ", Style::default().fg(accent_cyan())),
+            Span::raw(format!(
+                "{} • polls {}",
+                owls.last_sync_mode, owls.total_polls
+            )),
+            Span::raw("  "),
+            Span::styled("View ", Style::default().fg(accent_green())),
+            Span::raw(section_title(app.active_trading_section())),
+            Span::raw("  "),
+            Span::styled("Coverage ", Style::default().fg(accent_gold())),
+            Span::raw(group_summary_line(
+                &owls.groups,
+                app.active_trading_section(),
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Sel ", Style::default().fg(accent_green())),
+            Span::raw(truncate(&selected_line, 94)),
+            Span::raw("  "),
+            Span::styled("[ ] sport", Style::default().fg(accent_pink())),
         ]),
     ])
-    .block(section_block("Selection", accent_gold()))
+    .block(section_block(
+        section_title(app.active_trading_section()),
+        accent_blue(),
+    ))
     .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 
 fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let rows = app
-        .owls_dashboard()
-        .endpoints
-        .iter()
+        .visible_owls_endpoints()
+        .into_iter()
         .map(|endpoint| {
             Row::new(vec![
                 Cell::from(endpoint.group.short()),
@@ -143,8 +139,8 @@ fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(endpoint.count.to_string()),
-                Cell::from(truncate(&endpoint.path, 32)).style(Style::default().fg(muted_text())),
-                Cell::from(truncate(&endpoint.detail, 22)),
+                Cell::from(truncate(&endpoint.path, 28)).style(Style::default().fg(muted_text())),
+                Cell::from(truncate(&endpoint.detail, 18)),
             ])
         })
         .collect::<Vec<_>>();
@@ -156,7 +152,7 @@ fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Constraint::Length(18),
             Constraint::Length(8),
             Constraint::Length(6),
-            Constraint::Length(34),
+            Constraint::Length(30),
             Constraint::Min(12),
         ],
     )
@@ -174,7 +170,10 @@ fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .add_modifier(Modifier::BOLD),
     )
     .column_spacing(1)
-    .block(section_block("Endpoint Board", accent_cyan()));
+    .block(section_block(
+        board_title(app.active_trading_section()),
+        accent_cyan(),
+    ));
     frame.render_stateful_widget(table, area, app.owls_endpoint_table_state());
 }
 
@@ -197,6 +196,10 @@ fn render_selection_detail(
             Span::raw("  "),
             badge("Rows", &endpoint.count.to_string(), accent_green()),
             Span::raw("  "),
+            badge("Poll", &endpoint.poll_count.to_string(), accent_cyan()),
+            Span::raw("  "),
+            badge("Δ", &endpoint.change_count.to_string(), accent_pink()),
+            Span::raw("  "),
             badge(
                 "Updated",
                 &endpoint.updated_at.as_str().if_empty("-"),
@@ -208,16 +211,16 @@ fn render_selection_detail(
             Span::raw(format!("{} {}", endpoint.method, endpoint.path)),
         ]),
         Line::from(vec![
-            Span::styled("About ", Style::default().fg(accent_cyan())),
-            Span::raw(endpoint.description.clone()),
-        ]),
-        Line::from(vec![
             Span::styled("Filters ", Style::default().fg(accent_cyan())),
             Span::raw(endpoint.query_hint.clone()),
         ]),
         Line::from(vec![
             Span::styled("Detail ", Style::default().fg(accent_cyan())),
-            Span::raw(endpoint.detail.clone()),
+            Span::raw(truncate(&endpoint.detail, 84)),
+        ]),
+        Line::from(vec![
+            Span::styled("About ", Style::default().fg(accent_cyan())),
+            Span::raw(truncate(&endpoint.description, 82)),
         ]),
     ];
 
@@ -227,22 +230,27 @@ fn render_selection_detail(
     frame.render_widget(body, area);
 }
 
-fn render_preview(frame: &mut Frame<'_>, area: Rect, selected: Option<&OwlsEndpointSummary>) {
+fn render_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    section: TradingSection,
+    selected: Option<&OwlsEndpointSummary>,
+) {
     let mut lines = Vec::new();
 
     match selected {
         Some(endpoint) if !endpoint.preview.is_empty() => {
-            for row in endpoint.preview.iter().take(6) {
+            for row in endpoint.preview.iter().take(10) {
                 lines.push(Line::styled(
-                    truncate(&row.label, 34),
+                    truncate(&row.label, 40),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ));
                 lines.push(Line::raw(format!(
                     "{} | {}",
-                    truncate(&row.detail, 28),
-                    truncate(&row.metric, 22)
+                    truncate(&row.detail, 32),
+                    truncate(&row.metric, 24)
                 )));
             }
         }
@@ -254,65 +262,75 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, selected: Option<&OwlsEndpo
     }
 
     let body = Paragraph::new(lines)
-        .block(section_block("Preview", accent_pink()))
+        .block(section_block(preview_title(section), accent_pink()))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 
-fn render_runbook(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    selected: Option<&OwlsEndpointSummary>,
-) {
-    let snapshot = app.snapshot();
-    let selected_label = selected
-        .map(|endpoint| endpoint.label.as_str())
-        .unwrap_or("none");
-    let body = Paragraph::new(vec![
-        Line::from(vec![
-            metric("Route", accent_blue()),
-            Span::raw(selected_label),
-            Span::raw("  "),
-            metric("Provider", accent_cyan()),
-            Span::raw(truncate(&snapshot.status_line, 34)),
-            Span::raw("  "),
-            metric("Venue", accent_green()),
-            Span::raw(
-                snapshot
-                    .selected_venue
-                    .map(|venue| venue.as_str())
-                    .unwrap_or("-"),
-            ),
-        ]),
-        Line::from(vec![
-            metric("Use", accent_gold()),
-            Span::raw("j/k select  enter inspect  r/R hydrate"),
-            Span::raw("  "),
-            metric("Goal", accent_pink()),
-            Span::raw("API-first board"),
-        ]),
-    ])
-    .block(section_block("Runbook", accent_pink()))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical =
+        Layout::vertical([Constraint::Percentage(percent_y)]).flex(ratatui::layout::Flex::Center);
+    let horizontal =
+        Layout::horizontal([Constraint::Percentage(percent_x)]).flex(ratatui::layout::Flex::Center);
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
 }
 
-fn group_chip(group: &OwlsGroupSummary) -> Span<'static> {
-    Span::styled(
-        format!(
-            "{} {} {}/{} !{} ?{}",
-            group.group.short(),
-            group.label,
-            group.ready,
-            group.total,
-            group.error,
-            group.waiting
+fn group_summary_line(groups: &[OwlsGroupSummary], section: TradingSection) -> String {
+    groups
+        .iter()
+        .filter(|group| section_group_matches(section, group.group))
+        .map(|group| format!("{} {}/{}", group.group.short(), group.ready, group.total))
+        .collect::<Vec<_>>()
+        .join(" • ")
+}
+
+fn section_group_matches(section: TradingSection, group: OwlsEndpointGroup) -> bool {
+    match section {
+        TradingSection::Live => matches!(
+            group,
+            OwlsEndpointGroup::Realtime | OwlsEndpointGroup::Scores | OwlsEndpointGroup::Odds
         ),
-        Style::default()
-            .fg(group_color(group.group))
-            .add_modifier(Modifier::BOLD),
+        TradingSection::Props => {
+            matches!(group, OwlsEndpointGroup::Props | OwlsEndpointGroup::History)
+        }
+        _ => true,
+    }
+}
+
+fn is_owls_section(section: TradingSection) -> bool {
+    matches!(
+        section,
+        TradingSection::Markets | TradingSection::Live | TradingSection::Props
     )
+}
+
+fn section_title(section: TradingSection) -> &'static str {
+    match section {
+        TradingSection::Markets => "Owls Markets",
+        TradingSection::Live => "Owls Live",
+        TradingSection::Props => "Owls Props",
+        _ => "Owls",
+    }
+}
+
+fn board_title(section: TradingSection) -> &'static str {
+    match section {
+        TradingSection::Markets => "Endpoint Board",
+        TradingSection::Live => "Live Board",
+        TradingSection::Props => "Props Board",
+        _ => "Board",
+    }
+}
+
+fn preview_title(section: TradingSection) -> &'static str {
+    match section {
+        TradingSection::Markets => "Preview",
+        TradingSection::Live => "Feed Preview",
+        TradingSection::Props => "Prop Preview",
+        _ => "Preview",
+    }
 }
 
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
@@ -329,10 +347,6 @@ fn badge(label: &str, value: &str, color: Color) -> Span<'static> {
         format!("{label}:{value}"),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
-}
-
-fn metric(label: &str, color: Color) -> Span<'static> {
-    Span::styled(format!("{label} "), Style::default().fg(color))
 }
 
 fn status_color(status: &str) -> Color {

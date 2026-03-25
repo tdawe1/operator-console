@@ -14,6 +14,7 @@ fn recorder_config_round_trips_through_disk() {
         session: String::from("helium-live"),
         companion_legs_path: Some(PathBuf::from("/tmp/sabi-live/companion-legs.json")),
         profile_path: Some(PathBuf::from("/tmp/owned-profile")),
+        disabled_venues: String::from("bet365"),
         autostart: true,
         interval_seconds: 7,
         commission_rate: String::from("0"),
