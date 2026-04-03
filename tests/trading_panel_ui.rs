@@ -1,10 +1,12 @@
+use std::time::Instant;
+
 use color_eyre::Result;
 use operator_console::app::{App, TradingSection};
 use operator_console::domain::{
-    AccountStats, DecisionSummary, ExchangePanelSnapshot, ExitRecommendation, OpenPositionRow,
-    OtherOpenBetRow, RecorderEventSummary, RuntimeSummary, TrackedBetRow, TrackedLeg,
-    TransportMarkerSummary, VenueId, VenueStatus, VenueSummary, WatchRow, WatchSnapshot,
-    WorkerStatus, WorkerSummary,
+    AccountStats, DecisionSummary, ExchangePanelSnapshot, ExitRecommendation, ExternalLiveEventRow,
+    ExternalQuoteRow, OpenPositionRow, OtherOpenBetRow, RecorderEventSummary, RuntimeSummary,
+    TrackedBetRow, TrackedLeg, TransportMarkerSummary, VenueId, VenueStatus, VenueSummary,
+    WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
 };
 use operator_console::owls::{self, OwlsEndpointId, OwlsPreviewRow};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
@@ -63,6 +65,20 @@ fn live_and_props_panels_render_dedicated_owls_views() {
     assert!(live.contains("Live Board"));
     assert!(props.contains("Owls Props"));
     assert!(props.contains("Props Board"));
+}
+
+#[test]
+fn intel_panel_renders_feature_tabs_and_health_boards() {
+    let rendered = render_section(TradingSection::Intel);
+
+    assert!(rendered.contains("Intel Markets"));
+    assert!(rendered.contains("Arbitrages"));
+    assert!(rendered.contains("Plus EV"));
+    assert!(rendered.contains("Opportunity Board"));
+    assert!(rendered.contains("Detail Rail"));
+    assert!(rendered.contains("Source Health"));
+    assert!(rendered.contains("OddsEntry"));
+    assert!(rendered.contains("FairOdds"));
 }
 
 #[test]
@@ -297,17 +313,148 @@ fn positions_panel_renders_selected_interaction_evidence() {
     assert!(rendered.contains("req-77"));
 }
 
-fn render_section(section: TradingSection) -> String {
-    let mut app = App::from_provider(StaticProvider {
+#[test]
+#[ignore = "diagnostic render-cost probe for large live overlay data"]
+fn diagnostic_live_overlay_render_cost_scales_with_snapshot_size() {
+    let mut small_app = App::from_provider(StaticProvider {
         snapshot: sample_snapshot(),
     })
     .expect("app");
-    app.set_trading_section(section);
+    small_app.set_trading_section(TradingSection::Positions);
+    let small_baseline_elapsed = render_elapsed_ms(&mut small_app);
+    small_app.toggle_live_view_overlay();
+    let small_overlay_elapsed = render_elapsed_ms(&mut small_app);
 
+    let mut snapshot = sample_snapshot();
+    let active_row = snapshot
+        .open_positions
+        .first()
+        .cloned()
+        .expect("sample snapshot should include an active row");
+
+    snapshot.historical_positions = (0..12_000)
+        .map(|index| OpenPositionRow {
+            event: format!("Arsenal v Everton history {index}"),
+            contract: active_row.contract.clone(),
+            market: active_row.market.clone(),
+            pnl_amount: if index % 3 == 0 { 1.25 } else { -0.75 },
+            overall_pnl_known: true,
+            ..active_row.clone()
+        })
+        .collect();
+    snapshot.external_quotes = (0..18_000)
+        .map(|index| ExternalQuoteRow {
+            provider: if index % 2 == 0 {
+                String::from("owls")
+            } else {
+                String::from("snapshot")
+            },
+            venue: match index % 4 {
+                0 => String::from("smarkets"),
+                1 => String::from("matchbook"),
+                2 => String::from("betfair"),
+                _ => String::from("betdaq"),
+            },
+            event: active_row.event.clone(),
+            market: active_row.market.clone(),
+            selection: active_row.contract.clone(),
+            side: if index % 2 == 0 {
+                String::from("back")
+            } else {
+                String::from("lay")
+            },
+            price: Some(2.0 + ((index % 120) as f64 / 100.0)),
+            liquidity: Some(25.0 + (index % 500) as f64),
+            is_sharp: index % 11 == 0,
+            updated_at: String::from("2026-03-26T12:00:00Z"),
+            status: String::from("ready"),
+            ..ExternalQuoteRow::default()
+        })
+        .collect();
+    snapshot.external_live_events = (0..8_000)
+        .map(|index| ExternalLiveEventRow {
+            provider: String::from("owls"),
+            sport: String::from("soccer"),
+            event: if index + 1 == 8_000 {
+                active_row.event.clone()
+            } else {
+                format!("Other fixture {index}")
+            },
+            home_team: format!("Home {index}"),
+            away_team: format!("Away {index}"),
+            home_score: Some((index % 4) as i64),
+            away_score: Some(((index + 1) % 4) as i64),
+            status_state: String::from("in"),
+            status_detail: format!("{}'", 10 + (index % 80)),
+            display_clock: (10 + (index % 80)).to_string(),
+            ..ExternalLiveEventRow::default()
+        })
+        .collect();
+    snapshot.transport_events = (0..4_000)
+        .map(|index| TransportMarkerSummary {
+            captured_at: String::from("2026-03-26T12:00:00Z"),
+            kind: String::from("interaction_marker"),
+            action: String::from("cash_out"),
+            phase: String::from("response"),
+            request_id: format!("req-{index}"),
+            reference_id: if index + 1 == 4_000 {
+                String::from("bet-1")
+            } else {
+                format!("other-{index}")
+            },
+            summary: String::from("response cash_out"),
+            detail: String::from("cash out response"),
+        })
+        .collect();
+    snapshot.recorder_events = (0..4_000)
+        .map(|index| RecorderEventSummary {
+            captured_at: String::from("2026-03-26T12:00:00Z"),
+            kind: String::from("operator_interaction"),
+            source: String::from("operator_console"),
+            page: String::from("worker_request"),
+            action: String::from("cash_out"),
+            status: String::from("response:submitted"),
+            request_id: if index + 1 == 4_000 {
+                String::from("req-3999")
+            } else {
+                format!("other-{index}")
+            },
+            reference_id: if index + 1 == 4_000 {
+                String::from("bet-1")
+            } else {
+                format!("other-{index}")
+            },
+            summary: String::from("cash out submitted"),
+            detail: String::from("worker submitted cash out"),
+        })
+        .collect();
+
+    let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
+    app.set_trading_section(TradingSection::Positions);
+
+    let large_baseline_elapsed = render_elapsed_ms(&mut app);
+    app.toggle_live_view_overlay();
+    let large_overlay_elapsed = render_elapsed_ms(&mut app);
+    let rendered = render_app(&mut app);
+
+    eprintln!(
+        "diagnostic live overlay render: small baseline={}ms small overlay={}ms large baseline={}ms large overlay={}ms",
+        small_baseline_elapsed,
+        small_overlay_elapsed,
+        large_baseline_elapsed,
+        large_overlay_elapsed
+    );
+
+    assert!(rendered.contains("Live View"));
+    assert!(large_overlay_elapsed >= small_overlay_elapsed);
+    assert!(large_baseline_elapsed >= small_baseline_elapsed);
+}
+
+fn render_app(app: &mut App) -> String {
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
-        .draw(|frame| operator_console::ui::render(frame, &mut app))
+        .draw(|frame| operator_console::ui::render(frame, app))
         .expect("draw ui");
 
     let buffer = terminal.backend().buffer().clone();
@@ -321,6 +468,22 @@ fn render_section(section: TradingSection) -> String {
         lines.push(line);
     }
     lines.join("\n")
+}
+
+fn render_elapsed_ms(app: &mut App) -> u128 {
+    let started = Instant::now();
+    let _ = render_app(app);
+    started.elapsed().as_millis()
+}
+
+fn render_section(section: TradingSection) -> String {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: sample_snapshot(),
+    })
+    .expect("app");
+    app.set_trading_section(section);
+
+    render_app(&mut app)
 }
 
 fn sample_snapshot() -> ExchangePanelSnapshot {

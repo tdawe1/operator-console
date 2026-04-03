@@ -240,6 +240,7 @@ impl HorseMatcherField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct HorseMatcherEditorState {
     selected_field_index: usize,
     pub editing: bool,
@@ -247,16 +248,6 @@ pub struct HorseMatcherEditorState {
     pub replace_on_input: bool,
 }
 
-impl Default for HorseMatcherEditorState {
-    fn default() -> Self {
-        Self {
-            selected_field_index: 0,
-            editing: false,
-            buffer: String::new(),
-            replace_on_input: false,
-        }
-    }
-}
 
 impl HorseMatcherEditorState {
     pub fn selected_field(&self) -> HorseMatcherField {

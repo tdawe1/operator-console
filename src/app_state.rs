@@ -28,6 +28,7 @@ pub enum TradingSection {
     Markets,
     Live,
     Props,
+    Intel,
     Matcher,
     Stats,
     Alerts,
@@ -36,11 +37,12 @@ pub enum TradingSection {
 }
 
 impl TradingSection {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Positions,
         Self::Markets,
         Self::Live,
         Self::Props,
+        Self::Intel,
         Self::Matcher,
         Self::Stats,
         Self::Alerts,
@@ -54,12 +56,103 @@ impl TradingSection {
             Self::Markets => "Markets",
             Self::Live => "Live",
             Self::Props => "Props",
+            Self::Intel => "Intel",
             Self::Matcher => "Matcher",
             Self::Stats => "Stats",
             Self::Alerts => "Alerts",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntelView {
+    Markets,
+    Arbitrages,
+    PlusEv,
+    Event,
+    Drops,
+    Value,
+}
+
+impl IntelView {
+    pub const ALL: [Self; 6] = [
+        Self::Markets,
+        Self::Arbitrages,
+        Self::PlusEv,
+        Self::Event,
+        Self::Drops,
+        Self::Value,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Markets => "Markets",
+            Self::Arbitrages => "Arbitrages",
+            Self::PlusEv => "Plus EV",
+            Self::Event => "Event",
+            Self::Drops => "Drops",
+            Self::Value => "Value",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntelSource {
+    OddsEntry,
+    FairOdds,
+}
+
+impl IntelSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OddsEntry => "OddsEntry",
+            Self::FairOdds => "FairOdds",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IntelSourceStatus {
+    pub source: IntelSource,
+    pub health: String,
+    pub freshness: String,
+    pub transport: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntelRow {
+    pub id: String,
+    pub source: IntelSource,
+    pub event: String,
+    pub competition: String,
+    pub market: String,
+    pub selection: String,
+    pub bookmaker: String,
+    pub exchange: String,
+    pub back_odds: f64,
+    pub lay_odds: Option<f64>,
+    pub fair_odds: Option<f64>,
+    pub edge_pct: Option<f64>,
+    pub arb_pct: Option<f64>,
+    pub liquidity: Option<f64>,
+    pub status: String,
+    pub updated_at: String,
+    pub route: String,
+    pub deep_link_url: String,
+    pub note: String,
+}
+
+impl IntelRow {
+    pub fn can_seed_calculator(&self) -> bool {
+        self.lay_odds.is_some()
+    }
+
+    pub fn can_open_action(&self) -> bool {
+        self.lay_odds.is_some()
+            && (!self.route.trim().is_empty() || !self.deep_link_url.trim().is_empty())
     }
 }
 
@@ -255,21 +348,13 @@ impl CalculatorEditorState {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct CalculatorState {
     pub input: CalculatorInput,
     pub editor: CalculatorEditorState,
     pub source: Option<CalculatorSourceContext>,
 }
 
-impl Default for CalculatorState {
-    fn default() -> Self {
-        Self {
-            input: CalculatorInput::default(),
-            editor: CalculatorEditorState::default(),
-            source: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct CalculatorSourceContext {

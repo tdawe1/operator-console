@@ -2,6 +2,7 @@ pub mod alerts;
 pub mod calculator;
 pub mod exchanges;
 pub mod horse_matcher;
+pub mod intel;
 pub mod matcher;
 pub mod observability;
 pub mod oddsmatcher;

@@ -41,10 +41,9 @@ fn trading_navigation_reaches_matcher_section_with_odds_view() {
     let (_temp_dir, mut app) = oddsmatcher_app();
     app.set_active_panel(Panel::Trading);
 
-    app.next_section();
-    app.next_section();
-    app.next_section();
-    app.next_section();
+    while app.active_trading_section() != TradingSection::Matcher {
+        app.next_section();
+    }
 
     assert_eq!(app.active_trading_section(), TradingSection::Matcher);
 }

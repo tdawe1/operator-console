@@ -19,6 +19,7 @@ pub enum TradingActionKind {
 pub enum TradingActionSource {
     OddsMatcher,
     HorseMatcher,
+    MarketIntel,
     Positions,
 }
 

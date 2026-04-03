@@ -5,7 +5,12 @@ use operator_console::domain::{
     ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, VenueId, VenueStatus, VenueSummary,
     WorkerStatus, WorkerSummary,
 };
+use operator_console::market_intel::{
+    MarketIntelDashboard, MarketIntelSourceId, MarketOpportunityRow, MarketQuoteComparisonRow,
+    OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
+};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use std::time::Duration;
 
 struct StaticProvider {
     snapshot: ExchangePanelSnapshot,
@@ -14,6 +19,109 @@ struct StaticProvider {
 impl ExchangeProvider for StaticProvider {
     fn handle(&mut self, _request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
         Ok(self.snapshot.clone())
+    }
+}
+
+fn sample_market_intel_dashboard() -> MarketIntelDashboard {
+    let executable_market = MarketOpportunityRow {
+        source: MarketIntelSourceId::Oddsentry,
+        kind: OpportunityKind::Market,
+        id: String::from("intel-executable"),
+        sport: String::from("Soccer"),
+        competition_name: String::from("Premier League"),
+        event_id: String::from("event-1"),
+        event_name: String::from("Arsenal v Everton"),
+        market_name: String::from("Match Odds"),
+        selection_name: String::from("Arsenal"),
+        venue: String::from("bet365"),
+        secondary_venue: String::from("smarkets"),
+        event_url: String::from("https://oddsentry.example/events/arsenal-everton"),
+        deep_link_url: String::from("https://smarkets.example/events/arsenal-everton"),
+        quotes: vec![
+            MarketQuoteComparisonRow {
+                source: MarketIntelSourceId::Oddsentry,
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal v Everton"),
+                market_name: String::from("Match Odds"),
+                selection_name: String::from("Arsenal"),
+                venue: String::from("bet365"),
+                price: Some(2.42),
+                fair_price: Some(2.26),
+                event_url: String::from("https://oddsentry.example/events/arsenal-everton"),
+                deep_link_url: String::from("https://bet365.example/events/arsenal-everton"),
+                updated_at: String::from("2026-04-03T11:24:00Z"),
+                ..MarketQuoteComparisonRow::default()
+            },
+            MarketQuoteComparisonRow {
+                source: MarketIntelSourceId::Oddsentry,
+                event_id: String::from("event-1"),
+                event_name: String::from("Arsenal v Everton"),
+                market_name: String::from("Match Odds"),
+                selection_name: String::from("Arsenal"),
+                venue: String::from("smarkets"),
+                side: String::from("lay"),
+                price: Some(2.30),
+                event_url: String::from("https://oddsentry.example/events/arsenal-everton"),
+                deep_link_url: String::from("https://smarkets.example/events/arsenal-everton"),
+                updated_at: String::from("2026-04-03T11:24:00Z"),
+                ..MarketQuoteComparisonRow::default()
+            },
+        ],
+        notes: vec![String::from("routeable")],
+        ..MarketOpportunityRow::default()
+    };
+
+    let missing_lay_value = MarketOpportunityRow {
+        source: MarketIntelSourceId::FairOdds,
+        kind: OpportunityKind::Value,
+        id: String::from("intel-missing-lay"),
+        sport: String::from("Basketball"),
+        competition_name: String::from("NBA"),
+        event_id: String::from("event-2"),
+        event_name: String::from("Mavericks v Suns"),
+        market_name: String::from("Moneyline"),
+        selection_name: String::from("Mavericks"),
+        venue: String::from("fanduel"),
+        event_url: String::from("https://fairodds.example/value/mavericks-suns"),
+        quotes: vec![MarketQuoteComparisonRow {
+            source: MarketIntelSourceId::FairOdds,
+            event_id: String::from("event-2"),
+            event_name: String::from("Mavericks v Suns"),
+            market_name: String::from("Moneyline"),
+            selection_name: String::from("Mavericks"),
+            venue: String::from("fanduel"),
+            price: Some(2.34),
+            fair_price: Some(2.15),
+            event_url: String::from("https://fairodds.example/value/mavericks-suns"),
+            updated_at: String::from("2026-04-03T11:24:30Z"),
+            ..MarketQuoteComparisonRow::default()
+        }],
+        notes: vec![String::from("missing lay")],
+        ..MarketOpportunityRow::default()
+    };
+
+    MarketIntelDashboard {
+        refreshed_at: String::from("2026-04-03T11:24:30Z"),
+        status_line: String::from("test dashboard"),
+        sources: vec![
+            SourceHealth {
+                source: MarketIntelSourceId::Oddsentry,
+                mode: SourceLoadMode::Live,
+                status: SourceHealthStatus::Ready,
+                detail: String::from("live"),
+                refreshed_at: String::from("2026-04-03T11:24:30Z"),
+            },
+            SourceHealth {
+                source: MarketIntelSourceId::FairOdds,
+                mode: SourceLoadMode::Fixture,
+                status: SourceHealthStatus::Ready,
+                detail: String::from("fixture"),
+                refreshed_at: String::from("2026-04-03T11:24:30Z"),
+            },
+        ],
+        markets: vec![executable_market],
+        value: vec![missing_lay_value],
+        ..MarketIntelDashboard::default()
     }
 }
 
@@ -220,6 +328,89 @@ fn markets_navigation_uses_owls_endpoint_selection() {
 
     assert_ne!(first_label, second_label);
     assert_eq!(app.selected_open_position_row(), Some(0));
+}
+
+#[test]
+fn intel_tab_cycles_feature_views() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Intel);
+
+    assert_eq!(app.intel_view().label(), "Markets");
+
+    app.handle_key(KeyCode::Tab);
+    assert_eq!(app.intel_view().label(), "Arbitrages");
+}
+
+#[test]
+fn intel_enter_preloads_calculator_and_p_opens_action_overlay() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+    app.set_market_intel_dashboard_for_test(sample_market_intel_dashboard());
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Intel);
+    let selected_row_id = app.selected_intel_row().expect("selected Intel row").id;
+
+    app.handle_key(KeyCode::Enter);
+    assert_eq!(app.active_trading_section(), TradingSection::Calculator);
+    assert!(app.calculator_source().is_some());
+
+    app.set_trading_section(TradingSection::Intel);
+    app.handle_key(KeyCode::Char('p'));
+    let overlay = app
+        .trading_action_overlay()
+        .expect("intel p should open trading action overlay");
+    assert_eq!(overlay.seed.source_ref, selected_row_id);
+}
+
+#[test]
+fn intel_action_overlay_uses_sell_only_exchange_quote() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+    app.set_market_intel_dashboard_for_test(sample_market_intel_dashboard());
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Intel);
+
+    app.handle_key(KeyCode::Char('p'));
+
+    let overlay = app
+        .trading_action_overlay()
+        .expect("intel p should open trading action overlay");
+    assert_eq!(overlay.seed.buy_price, None);
+    assert!(overlay.seed.sell_price.is_some());
+    assert!(!overlay.can_cycle_side());
+}
+
+#[test]
+fn intel_enter_does_not_fabricate_lay_quote_when_data_is_missing() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+    app.set_market_intel_dashboard_for_test(sample_market_intel_dashboard());
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Intel);
+
+    for _ in 0..5 {
+        app.handle_key(KeyCode::Tab);
+    }
+    assert_eq!(app.intel_view().label(), "Value");
+
+    app.handle_key(KeyCode::Enter);
+
+    assert_eq!(app.active_trading_section(), TradingSection::Intel);
+    assert!(app.calculator_source().is_none());
+    assert!(app.status_message().contains("no lay quote"));
 }
 
 fn positions_snapshot() -> ExchangePanelSnapshot {

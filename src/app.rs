@@ -21,8 +21,9 @@ use crate::alerts::{
 };
 pub use crate::app_state::{
     CalculatorEditorState, CalculatorField, CalculatorSourceContext, CalculatorState,
-    CalculatorTool, MatcherView, ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus,
-    TradingActionField, TradingActionOverlayState, TradingSection,
+    CalculatorTool, IntelRow, IntelSource, IntelSourceStatus, IntelView, MatcherView,
+    ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus, TradingActionField,
+    TradingActionOverlayState, TradingSection,
 };
 use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
@@ -38,6 +39,7 @@ use crate::manual_positions::{
     self, load_entries_or_default, save_entries, ManualPositionEntry, ManualPositionField,
     ManualPositionOverlayState,
 };
+use crate::market_intel::{self, MarketIntelDashboard, MarketOpportunityRow};
 use crate::market_normalization::{
     event_matches, market_matches, normalize_key, selection_matches,
     selection_matches_with_context, text_matches,
@@ -143,8 +145,33 @@ pub(crate) struct OddsMatcherResult {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum MarketIntelSyncReason {
+    Manual,
+    Background,
+}
+
+impl MarketIntelSyncReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Background => "monitor",
+        }
+    }
+}
+
+pub(crate) struct MarketIntelJob {
+    pub(crate) reason: MarketIntelSyncReason,
+}
+
+pub(crate) struct MarketIntelResult {
+    pub(crate) dashboard: std::result::Result<MarketIntelDashboard, String>,
+    pub(crate) reason: MarketIntelSyncReason,
+}
+
+#[derive(Clone, Copy)]
 enum MouseTargetKind {
     TradingSection(TradingSection),
+    IntelView(IntelView),
     MatcherView(MatcherView),
     CalculatorTool(CalculatorTool),
 }
@@ -189,6 +216,12 @@ pub struct App {
     oddsmatcher_rx: Receiver<OddsMatcherResult>,
     oddsmatcher_in_flight: bool,
     oddsmatcher_pending_query: Option<GetBestMatchesVariables>,
+    market_intel_tx: Sender<MarketIntelJob>,
+    market_intel_rx: Receiver<MarketIntelResult>,
+    market_intel_in_flight: bool,
+    market_intel_resource_state: ResourceState<MarketIntelDashboard>,
+    market_intel_pending_reason: Option<MarketIntelSyncReason>,
+    last_market_intel_dispatch_at: Option<Instant>,
     owls_sync_tx: tokio::sync::mpsc::UnboundedSender<OwlsSyncJob>,
     owls_sync_rx: tokio::sync::mpsc::UnboundedReceiver<OwlsSyncResult>,
     owls_sync_in_flight: bool,
@@ -219,6 +252,8 @@ pub struct App {
     horse_matcher_rows: Vec<OddsMatcherRow>,
     horse_matcher_snapshot: Option<crate::domain::HorseMatcherSnapshot>,
     horse_matcher_table_state: TableState,
+    intel_view: IntelView,
+    intel_table_state: TableState,
     matcher_view: MatcherView,
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
@@ -250,6 +285,7 @@ const RECORDER_REFRESH_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
 const RECORDER_REFRESH_INTERVAL_BOOTSTRAP: Duration = Duration::from_secs(1);
 const OWLS_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const MATCHBOOK_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(4);
+const MARKET_INTEL_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(20);
 const RECORDER_STARTUP_ALERT_MUTE: Duration = Duration::from_secs(15);
 const MAX_NOTIFICATIONS: usize = 50;
 const RESOURCE_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
@@ -471,6 +507,12 @@ impl App {
             oddsmatcher_rx: runtime.oddsmatcher_rx,
             oddsmatcher_in_flight: false,
             oddsmatcher_pending_query: None,
+            market_intel_tx: runtime.market_intel_tx,
+            market_intel_rx: runtime.market_intel_rx,
+            market_intel_in_flight: false,
+            market_intel_resource_state: ResourceState::idle(),
+            market_intel_pending_reason: None,
+            last_market_intel_dispatch_at: None,
             owls_sync_tx: runtime.owls_sync_tx,
             owls_sync_rx: runtime.owls_sync_rx,
             owls_sync_in_flight: false,
@@ -485,8 +527,8 @@ impl App {
             last_matchbook_sync_dispatch_at: None,
             matchbook_account_state: None,
             owls_dashboard: {
-                let dashboard = OwlsDashboard::default();
-                dashboard
+                
+                OwlsDashboard::default()
             },
             owls_endpoint_table_state: {
                 let mut state = TableState::default();
@@ -508,6 +550,12 @@ impl App {
             horse_matcher_rows: Vec::new(),
             horse_matcher_snapshot: None,
             horse_matcher_table_state: TableState::default(),
+            intel_view: IntelView::Markets,
+            intel_table_state: {
+                let mut state = TableState::default();
+                state.select(Some(0));
+                state
+            },
             matcher_view: MatcherView::Odds,
             snapshot,
             active_panel: Panel::Trading,
@@ -533,6 +581,7 @@ impl App {
             recorder_startup_alerts_muted_until: None,
         };
         app.refresh_snapshot_enrichment();
+        app.request_market_intel_sync(MarketIntelSyncReason::Background);
         app.record_event(format!(
             "Loaded initial dashboard from {}.",
             app.snapshot
@@ -557,6 +606,18 @@ impl App {
         self.matchbook_account_state.as_ref()
     }
 
+    pub fn market_intel_dashboard(&self) -> Option<&MarketIntelDashboard> {
+        self.market_intel_resource_state.last_good()
+    }
+
+    pub fn market_intel_phase(&self) -> &str {
+        self.market_intel_resource_state.phase().as_str()
+    }
+
+    pub fn market_intel_last_error(&self) -> Option<&str> {
+        self.market_intel_resource_state.last_error()
+    }
+
     fn refresh_snapshot_enrichment(&mut self) {
         let base_snapshot = self
             .provider_resource_state
@@ -573,10 +634,12 @@ impl App {
             .last_good()
             .cloned()
             .or_else(|| self.matchbook_account_state.clone());
+        let market_intel_dashboard = self.market_intel_resource_state.last_good().cloned();
         self.snapshot = project_snapshot(
             &base_snapshot,
             &owls_dashboard,
             matchbook_account_state.as_ref(),
+            market_intel_dashboard.as_ref(),
         );
     }
 
@@ -590,6 +653,49 @@ impl App {
 
     pub fn calculator_tool(&self) -> CalculatorTool {
         self.calculator_tool
+    }
+
+    pub fn intel_view(&self) -> IntelView {
+        self.intel_view
+    }
+
+    pub fn intel_rows(&self) -> Vec<IntelRow> {
+        intel_rows_for_view(self.intel_view, self.market_intel_dashboard())
+    }
+
+    pub fn selected_intel_row(&self) -> Option<IntelRow> {
+        let rows = self.intel_rows();
+        self.intel_table_state
+            .selected()
+            .and_then(|index| rows.get(index).cloned())
+            .or_else(|| rows.first().cloned())
+    }
+
+    pub fn intel_table_state(&mut self) -> &mut TableState {
+        &mut self.intel_table_state
+    }
+
+    pub fn intel_source_statuses(&self) -> Vec<IntelSourceStatus> {
+        intel_source_statuses_for_view(self.intel_view, self.market_intel_dashboard())
+    }
+
+    pub fn intel_ready_sources(&self) -> usize {
+        self.intel_source_statuses()
+            .into_iter()
+            .filter(|status| status.health == "ready" || status.health == "fixture")
+            .count()
+    }
+
+    pub fn intel_freshness_label(&self) -> String {
+        let has_fixture = self
+            .intel_source_statuses()
+            .into_iter()
+            .any(|status| status.freshness == "fixture");
+        if has_fixture {
+            String::from("fixture")
+        } else {
+            String::from("live")
+        }
     }
 
     pub fn visible_owls_endpoints(&self) -> Vec<&OwlsEndpointSummary> {
@@ -650,11 +756,17 @@ impl App {
         if !self.is_owls_context() {
             self.markets_overlay_visible = false;
         }
-        if section != TradingSection::Positions && section != TradingSection::Matcher {
+        if !matches!(
+            section,
+            TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
+        ) {
             self.trading_action_overlay = None;
         }
         if self.is_owls_context() {
             self.clamp_selected_owls_endpoint();
+        }
+        if section == TradingSection::Intel {
+            self.clamp_selected_intel_row();
         }
     }
 
@@ -756,6 +868,26 @@ impl App {
         }
     }
 
+    pub fn cycle_intel_view(&mut self, forward: bool) {
+        let current = self.intel_view;
+        let all = &IntelView::ALL;
+        let index = all
+            .iter()
+            .position(|candidate| *candidate == current)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % all.len()
+        } else if index == 0 {
+            all.len() - 1
+        } else {
+            index - 1
+        };
+        self.intel_view = all[next];
+        self.clamp_selected_intel_row();
+        self.status_message = format!("Intel view set to {}.", self.intel_view.label());
+        self.status_scroll = 0;
+    }
+
     pub fn cycle_matcher_view(&mut self, forward: bool) {
         let current = self.matcher_view;
         let all = &MatcherView::ALL;
@@ -835,10 +967,12 @@ impl App {
         loop {
             self.drain_provider_results();
             self.drain_oddsmatcher_results();
+            self.drain_market_intel_results();
             self.drain_owls_sync_results();
             self.drain_matchbook_sync_results();
             if !self.provider_resource_state.is_loading()
                 && !self.oddsmatcher_in_flight
+                && !self.market_intel_resource_state.is_loading()
                 && !self.owls_resource_state.is_loading()
                 && !self.matchbook_resource_state.is_loading()
             {
@@ -864,6 +998,11 @@ impl App {
     #[cfg(debug_assertions)]
     pub fn poll_matchbook_account_for_test(&mut self) {
         self.poll_matchbook_account();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn poll_market_intel_for_test(&mut self) {
+        self.poll_market_intel();
     }
 
     #[cfg(debug_assertions)]
@@ -897,6 +1036,13 @@ impl App {
         self.owls_dashboard = dashboard;
         self.owls_resource_state
             .finish_ok(self.owls_dashboard.clone());
+        self.refresh_snapshot_enrichment();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_market_intel_dashboard_for_test(&mut self, dashboard: MarketIntelDashboard) {
+        self.market_intel_resource_state.finish_ok(dashboard);
+        self.clamp_selected_intel_row();
         self.refresh_snapshot_enrichment();
     }
 
@@ -954,6 +1100,13 @@ impl App {
         self.mouse_targets.push(MouseTarget {
             rect,
             kind: MouseTargetKind::TradingSection(section),
+        });
+    }
+
+    pub fn register_intel_view_target(&mut self, rect: Rect, view: IntelView) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::IntelView(view),
         });
     }
 
@@ -1399,6 +1552,9 @@ impl App {
         if self.active_panel == Panel::Trading && self.is_owls_context() {
             return self.refresh_owls_dashboard();
         }
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel {
+            return self.refresh_intel(false);
+        }
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
             return self.refresh_matcher();
         }
@@ -1419,6 +1575,9 @@ impl App {
     pub fn refresh_live(&mut self) -> Result<()> {
         if self.active_panel == Panel::Trading && self.is_owls_context() {
             return self.refresh_owls_dashboard();
+        }
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel {
+            return self.refresh_intel(true);
         }
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
             return self.refresh_matcher();
@@ -1472,6 +1631,22 @@ impl App {
         self.status_message = String::from("Owls sync queued.");
         self.status_scroll = 0;
         self.record_event("Owls manual sync queued.");
+        Ok(())
+    }
+
+    fn refresh_intel(&mut self, live: bool) -> Result<()> {
+        let reason = if live {
+            MarketIntelSyncReason::Manual
+        } else {
+            MarketIntelSyncReason::Manual
+        };
+        self.request_market_intel_sync(reason);
+        self.status_message = format!("Intel {} refresh queued.", self.intel_view.label());
+        self.status_scroll = 0;
+        self.record_event(format!(
+            "Intel {} refresh queued.",
+            if live { "live" } else { "cached" }
+        ));
         Ok(())
     }
 
@@ -1552,6 +1727,15 @@ impl App {
         self.matchbook_sync_tx = matchbook_sync_tx;
         self.matchbook_sync_rx = matchbook_sync_rx;
         self.matchbook_sync_in_flight = false;
+    }
+
+    fn restart_market_intel_worker(&mut self) {
+        info!("restart market intel worker");
+        let (market_intel_tx, market_intel_rx) =
+            AppRuntimeChannels::start_market_intel(&self.runtime_host);
+        self.market_intel_tx = market_intel_tx;
+        self.market_intel_rx = market_intel_rx;
+        self.market_intel_in_flight = false;
     }
 
     fn current_provider_for_watchdog(&self) -> Box<dyn ExchangeProvider + Send> {
@@ -1800,6 +1984,85 @@ impl App {
 
         if let Some(reason) = self.matchbook_sync_pending_reason.take() {
             self.dispatch_matchbook_sync(reason);
+        }
+    }
+
+    fn request_market_intel_sync(&mut self, reason: MarketIntelSyncReason) {
+        debug!(
+            reason = reason.label(),
+            in_flight = self.market_intel_in_flight,
+            "request market intel sync"
+        );
+        self.drain_market_intel_results();
+        if self.market_intel_resource_state.is_loading() {
+            self.market_intel_pending_reason =
+                Some(match (self.market_intel_pending_reason, reason) {
+                    (Some(MarketIntelSyncReason::Manual), _)
+                    | (_, MarketIntelSyncReason::Manual) => MarketIntelSyncReason::Manual,
+                    _ => MarketIntelSyncReason::Background,
+                });
+            return;
+        }
+        self.dispatch_market_intel_sync(reason);
+    }
+
+    fn dispatch_market_intel_sync(&mut self, reason: MarketIntelSyncReason) {
+        match self.market_intel_tx.send(MarketIntelJob { reason }) {
+            Ok(()) => {
+                self.market_intel_in_flight = true;
+                self.market_intel_resource_state.begin_refresh_now();
+                self.last_market_intel_dispatch_at = Some(Instant::now());
+            }
+            Err(error) => {
+                self.status_message = format!("Market intel worker unavailable: {error}");
+                self.status_scroll = 0;
+                self.record_event("Market intel worker unavailable.");
+            }
+        }
+    }
+
+    fn drain_market_intel_results(&mut self) {
+        let mut latest_result = None;
+        while let Ok(result) = self.market_intel_rx.try_recv() {
+            latest_result = Some(result);
+        }
+        let Some(result) = latest_result else {
+            return;
+        };
+
+        debug!(
+            reason = result.reason.label(),
+            success = result.dashboard.is_ok(),
+            "drain market intel result"
+        );
+        self.market_intel_in_flight = false;
+        match result.dashboard {
+            Ok(dashboard) => {
+                self.market_intel_resource_state
+                    .finish_ok(dashboard.clone());
+                self.refresh_snapshot_enrichment();
+                if matches!(result.reason, MarketIntelSyncReason::Manual) {
+                    self.status_message = dashboard.status_line.clone();
+                    self.status_scroll = 0;
+                }
+                self.clamp_selected_intel_row();
+                self.record_event(format!(
+                    "Market intel {} sync applied.",
+                    result.reason.label()
+                ));
+            }
+            Err(error) => {
+                self.market_intel_resource_state.finish_error(error.clone());
+                if matches!(result.reason, MarketIntelSyncReason::Manual) {
+                    self.status_message = format!("Market intel sync failed: {error}");
+                    self.status_scroll = 0;
+                }
+                self.record_event(format!("Market intel sync failed: {error}"));
+            }
+        }
+
+        if let Some(reason) = self.market_intel_pending_reason.take() {
+            self.dispatch_market_intel_sync(reason);
         }
     }
 
@@ -2113,9 +2376,10 @@ impl App {
         if self.active_panel != Panel::Trading || !self.is_owls_context() {
             self.markets_overlay_visible = false;
         }
-        if self.trading_section != TradingSection::Positions
-            && self.trading_section != TradingSection::Matcher
-        {
+        if !matches!(
+            self.trading_section,
+            TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
+        ) {
             self.trading_action_overlay = None;
         }
     }
@@ -2137,18 +2401,23 @@ impl App {
         if self.active_panel != Panel::Trading || !self.is_owls_context() {
             self.markets_overlay_visible = false;
         }
-        if self.trading_section != TradingSection::Positions
-            && self.trading_section != TradingSection::Matcher
-        {
+        if !matches!(
+            self.trading_section,
+            TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
+        ) {
             self.trading_action_overlay = None;
         }
     }
 
-    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        <B as ratatui::backend::Backend>::Error: std::marker::Send + std::marker::Sync + 'static,
+    {
         while self.running {
             self.poll_recorder();
             self.drain_provider_results();
             self.drain_oddsmatcher_results();
+            self.poll_market_intel();
             self.poll_owls_dashboard();
             self.poll_matchbook_account();
             terminal.draw(|frame| self.render(frame))?;
@@ -2624,12 +2893,17 @@ impl App {
             }
         }
 
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher {
-            if key_code == KeyCode::Tab {
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher
+            && key_code == KeyCode::Tab {
                 self.cycle_matcher_view(true);
                 return;
             }
-        }
+
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel
+            && key_code == KeyCode::Tab {
+                self.cycle_intel_view(true);
+                return;
+            }
 
         if self.is_calculator_context() && key_code == KeyCode::Tab {
             self.cycle_calculator_tool(true);
@@ -2661,6 +2935,8 @@ impl App {
                     self.begin_horse_matcher_edit();
                 } else if self.is_horse_matcher_results_context() {
                     self.load_calculator_from_selected_horse_matcher();
+                } else if self.is_intel_context() {
+                    self.load_calculator_from_selected_intel();
                 } else if self.active_panel == Panel::Trading && self.is_owls_context() {
                     if let Some(endpoint) = self.selected_owls_endpoint() {
                         self.status_message = format!(
@@ -2705,6 +2981,8 @@ impl App {
                     self.open_trading_action_overlay_from_oddsmatcher();
                 } else if self.is_horse_matcher_results_context() {
                     self.open_trading_action_overlay_from_horse_matcher();
+                } else if self.is_intel_context() {
+                    self.open_trading_action_overlay_from_intel();
                 } else if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
                     && self.positions_focus == PositionsFocus::Active
@@ -2855,6 +3133,7 @@ impl App {
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
                 | (Panel::Trading, TradingSection::Props) => self.select_next_owls_endpoint(),
+                (Panel::Trading, TradingSection::Intel) => self.select_next_intel_row(),
                 (Panel::Trading, TradingSection::Matcher) => self.select_next_matcher_row(),
                 (Panel::Trading, TradingSection::Alerts) => self.alerts_editor.select_next_field(),
                 (Panel::Trading, TradingSection::Calculator) => {
@@ -2870,6 +3149,7 @@ impl App {
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
                 | (Panel::Trading, TradingSection::Props) => self.select_previous_owls_endpoint(),
+                (Panel::Trading, TradingSection::Intel) => self.select_previous_intel_row(),
                 (Panel::Trading, TradingSection::Matcher) => self.select_previous_matcher_row(),
                 (Panel::Trading, TradingSection::Alerts) => {
                     self.alerts_editor.select_previous_field()
@@ -2931,6 +3211,10 @@ impl App {
         self.active_panel == Panel::Trading
             && self.trading_section == TradingSection::Matcher
             && self.matcher_view == MatcherView::Horse
+    }
+
+    fn is_intel_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel
     }
 
     fn is_owls_context(&self) -> bool {
@@ -3043,6 +3327,19 @@ impl App {
         }
     }
 
+    fn clamp_selected_intel_row(&mut self) {
+        let row_count = self.intel_rows().len();
+        if row_count == 0 {
+            self.intel_table_state.select(None);
+            return;
+        }
+
+        match self.intel_table_state.selected() {
+            Some(index) if index < row_count => {}
+            _ => self.intel_table_state.select(Some(0)),
+        }
+    }
+
     fn clamp_selected_horse_matcher_row(&mut self) {
         if self.horse_matcher_rows.is_empty() {
             self.horse_matcher_table_state.select(None);
@@ -3147,6 +3444,37 @@ impl App {
         };
 
         self.owls_endpoint_table_state.select(Some(previous_index));
+    }
+
+    pub fn select_next_intel_row(&mut self) {
+        let row_count = self.intel_rows().len();
+        if row_count == 0 {
+            self.intel_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.intel_table_state.selected() {
+            Some(index) if index + 1 < row_count => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.intel_table_state.select(Some(next_index));
+    }
+
+    pub fn select_previous_intel_row(&mut self) {
+        if self.intel_rows().is_empty() {
+            self.intel_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.intel_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.intel_table_state.select(Some(previous_index));
     }
 
     pub fn select_next_positions_row(&mut self) {
@@ -3425,6 +3753,21 @@ impl App {
         self.dispatch_owls_sync(OwlsSyncReason::Background);
     }
 
+    fn poll_market_intel(&mut self) {
+        self.drain_market_intel_results();
+        self.expire_stuck_market_intel_placeholder();
+        if self.active_panel != Panel::Trading || self.market_intel_resource_state.is_loading() {
+            return;
+        }
+        if self
+            .last_market_intel_dispatch_at
+            .is_some_and(|last| last.elapsed() < MARKET_INTEL_SYNC_DISPATCH_INTERVAL)
+        {
+            return;
+        }
+        self.dispatch_market_intel_sync(MarketIntelSyncReason::Background);
+    }
+
     fn poll_matchbook_account(&mut self) {
         self.drain_matchbook_sync_results();
         self.expire_stuck_matchbook_sync_placeholder();
@@ -3463,6 +3806,10 @@ impl App {
                     match target.kind {
                         MouseTargetKind::TradingSection(section) => {
                             self.set_trading_section(section)
+                        }
+                        MouseTargetKind::IntelView(view) => {
+                            self.intel_view = view;
+                            self.clamp_selected_intel_row();
                         }
                         MouseTargetKind::MatcherView(view) => self.matcher_view = view,
                         MouseTargetKind::CalculatorTool(tool) => self.calculator_tool = tool,
@@ -3635,6 +3982,7 @@ impl App {
         self.status_scroll = 0;
         self.clamp_selected_exchange_row();
         self.clamp_selected_open_position_row();
+        self.clamp_selected_intel_row();
         self.clamp_selected_oddsmatcher_row();
         self.clamp_selected_horse_matcher_row();
         if active_position_row_count(&self.snapshot) == 0 {
@@ -3654,7 +4002,11 @@ impl App {
         self.owls_resource_state
             .finish_ok(self.owls_dashboard.clone());
         self.clamp_selected_owls_endpoint();
-        self.request_owls_sync(OwlsSyncReason::Manual);
+        if self.is_owls_context()
+            || (self.trading_section == TradingSection::Positions && self.live_view_overlay_visible)
+        {
+            self.request_owls_sync(OwlsSyncReason::Manual);
+        }
         self.record_event(format!(
             "Owls sport auto-set to {inferred_sport} from snapshot context."
         ));
@@ -3762,6 +4114,20 @@ impl App {
         self.last_matchbook_sync_dispatch_at = Some(Instant::now());
         self.restart_matchbook_sync_worker();
         self.record_event("Matchbook sync timed out; marking state stale.");
+    }
+
+    fn expire_stuck_market_intel_placeholder(&mut self) {
+        if !self.market_intel_resource_state.expire_if_overdue(
+            RESOURCE_WATCHDOG_TIMEOUT,
+            "market intel sync watchdog expired",
+        ) {
+            return;
+        }
+
+        self.market_intel_in_flight = false;
+        self.last_market_intel_dispatch_at = Some(Instant::now());
+        self.restart_market_intel_worker();
+        self.record_event("Market intel sync timed out; marking state stale.");
     }
 
     fn load_alerts_from_disk(&mut self, path: PathBuf) -> Result<()> {
@@ -4535,6 +4901,88 @@ impl App {
         self.load_calculator_from_matcher_row(row, "Horse Matcher");
     }
 
+    fn load_calculator_from_selected_intel(&mut self) {
+        let Some(row) = self.selected_intel_row() else {
+            self.status_message = String::from("No Intel row is selected.");
+            return;
+        };
+
+        let Some(lay_odds) = row.lay_odds else {
+            self.status_message = String::from(
+                "The selected Intel row has no lay quote, so the calculator was not loaded.",
+            );
+            return;
+        };
+
+        self.calculator.input.back_odds = row.back_odds;
+        self.calculator.input.lay_odds = lay_odds;
+        self.calculator.source = Some(CalculatorSourceContext {
+            event_name: row.event.clone(),
+            selection_name: row.selection.clone(),
+            competition_name: row.competition.clone(),
+            rating: row.edge_pct.unwrap_or(row.arb_pct.unwrap_or(0.0)),
+            bookmaker_name: row.bookmaker.clone(),
+            exchange_name: row.exchange.clone(),
+        });
+        self.trading_section = TradingSection::Calculator;
+        self.status_message = format!(
+            "Loaded calculator from Intel {}: {} @ {:.2} / {:.2}.",
+            row.source.label(),
+            row.selection,
+            row.back_odds,
+            lay_odds
+        );
+    }
+
+    fn open_trading_action_overlay_from_intel(&mut self) {
+        let Some(row) = self.selected_intel_row() else {
+            self.status_message = String::from("No Intel row is selected.");
+            return;
+        };
+        if !row.can_open_action() {
+            self.status_message =
+                String::from("The selected Intel row does not expose an executable quote.");
+            return;
+        }
+
+        let Some(venue) = exchange_venue_from_bookmaker("", &row.exchange) else {
+            self.status_message =
+                String::from("The selected Intel row does not map to a supported exchange venue.");
+            return;
+        };
+        let seed = TradingActionSeed {
+            source: TradingActionSource::MarketIntel,
+            venue,
+            source_ref: row.id.clone(),
+            event_name: row.event.clone(),
+            market_name: row.market.clone(),
+            selection_name: row.selection.clone(),
+            event_url: Some(row.route.clone()).filter(|value| !value.trim().is_empty()),
+            deep_link_url: Some(row.deep_link_url.clone()).filter(|value| !value.trim().is_empty()),
+            betslip_event_id: None,
+            betslip_market_id: None,
+            betslip_selection_id: None,
+            buy_price: None,
+            sell_price: row.lay_odds,
+            default_side: TradingActionSide::Sell,
+            default_stake: row
+                .liquidity
+                .map(|liquidity| liquidity.min(25.0))
+                .or(Some(10.0)),
+            source_context: TradingActionSourceContext {
+                market_status: row.status.clone(),
+                ..TradingActionSourceContext::default()
+            },
+            notes: vec![
+                format!("intel_source:{}", row.source.label().to_lowercase()),
+                format!("bookmaker:{}", row.bookmaker),
+                row.note.clone(),
+            ],
+        };
+
+        self.open_trading_action_overlay(seed);
+    }
+
     fn load_calculator_from_matcher_row(&mut self, row: OddsMatcherRow, source_name: &str) {
         self.calculator.input.back_odds = row.back.odds;
         self.calculator.input.lay_odds = row.lay.odds;
@@ -4591,8 +5039,10 @@ impl App {
             self.live_view_overlay_visible = false;
         }
         if self.active_panel != Panel::Trading
-            || (self.trading_section != TradingSection::Positions
-                && self.trading_section != TradingSection::Matcher)
+            || !matches!(
+                self.trading_section,
+                TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
+            )
         {
             self.trading_action_overlay = None;
         }
@@ -4611,9 +5061,14 @@ pub(crate) fn populate_snapshot_enrichment(
     snapshot: &mut ExchangePanelSnapshot,
     owls_dashboard: &OwlsDashboard,
     matchbook_account_state: Option<&MatchbookAccountState>,
+    market_intel_dashboard: Option<&MarketIntelDashboard>,
 ) {
-    snapshot.external_quotes =
-        build_external_quote_rows(snapshot, owls_dashboard, matchbook_account_state);
+    snapshot.external_quotes = build_external_quote_rows(
+        snapshot,
+        owls_dashboard,
+        matchbook_account_state,
+        market_intel_dashboard,
+    );
     snapshot.external_live_events = build_external_live_event_rows(snapshot, owls_dashboard);
     apply_external_live_context(snapshot);
 }
@@ -4622,6 +5077,7 @@ fn build_external_quote_rows(
     snapshot: &ExchangePanelSnapshot,
     owls_dashboard: &OwlsDashboard,
     matchbook_account_state: Option<&MatchbookAccountState>,
+    market_intel_dashboard: Option<&MarketIntelDashboard>,
 ) -> Vec<ExternalQuoteRow> {
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
@@ -4789,6 +5245,12 @@ fn build_external_quote_rows(
                     },
                 );
             }
+        }
+    }
+
+    if let Some(dashboard) = market_intel_dashboard {
+        for quote in market_intel::project_external_quote_rows(snapshot, dashboard) {
+            push_external_quote_row(&mut rows, &mut seen, quote);
         }
     }
 
@@ -5756,6 +6218,194 @@ fn exchange_venue_from_bookmaker(code: &str, display_name: &str) -> Option<Venue
     }
 }
 
+fn intel_source_statuses_for_view(
+    view: IntelView,
+    dashboard: Option<&MarketIntelDashboard>,
+) -> Vec<IntelSourceStatus> {
+    let Some(dashboard) = dashboard else {
+        return vec![
+            IntelSourceStatus {
+                source: IntelSource::OddsEntry,
+                health: String::from("loading"),
+                freshness: String::from("pending"),
+                transport: String::from("worker"),
+                detail: format!("{} dashboard is still loading.", view.label()),
+            },
+            IntelSourceStatus {
+                source: IntelSource::FairOdds,
+                health: String::from("loading"),
+                freshness: String::from("pending"),
+                transport: String::from("worker"),
+                detail: String::from("Fixture-backed FairOdds parity slice is loading."),
+            },
+        ];
+    };
+
+    dashboard
+        .sources
+        .iter()
+        .map(|status| IntelSourceStatus {
+            source: intel_source_from_market_intel(status.source),
+            health: match (status.mode, status.status) {
+                (crate::market_intel::SourceLoadMode::Fixture, _) => String::from("fixture"),
+                (_, value) => value.as_str().to_string(),
+            },
+            freshness: if status.refreshed_at.trim().is_empty() {
+                status.mode.as_str().to_string()
+            } else {
+                status.refreshed_at.clone()
+            },
+            transport: match status.mode {
+                crate::market_intel::SourceLoadMode::Live => String::from("REST"),
+                crate::market_intel::SourceLoadMode::Fixture => String::from("fixture"),
+            },
+            detail: status.detail.clone(),
+        })
+        .collect()
+}
+
+fn intel_rows_for_view(view: IntelView, dashboard: Option<&MarketIntelDashboard>) -> Vec<IntelRow> {
+    let Some(dashboard) = dashboard else {
+        return Vec::new();
+    };
+
+    match view {
+        IntelView::Markets => dashboard
+            .markets
+            .iter()
+            .map(intel_row_from_opportunity)
+            .collect(),
+        IntelView::Arbitrages => dashboard
+            .arbitrages
+            .iter()
+            .map(intel_row_from_opportunity)
+            .collect(),
+        IntelView::PlusEv => dashboard
+            .plus_ev
+            .iter()
+            .map(intel_row_from_opportunity)
+            .collect(),
+        IntelView::Event => dashboard
+            .event_detail
+            .as_ref()
+            .map(intel_rows_from_event_detail)
+            .unwrap_or_default(),
+        IntelView::Drops => dashboard
+            .drops
+            .iter()
+            .map(intel_row_from_opportunity)
+            .collect(),
+        IntelView::Value => dashboard
+            .value
+            .iter()
+            .map(intel_row_from_opportunity)
+            .collect(),
+    }
+}
+
+fn intel_source_from_market_intel(source: crate::market_intel::MarketIntelSourceId) -> IntelSource {
+    match source {
+        crate::market_intel::MarketIntelSourceId::Oddsentry => IntelSource::OddsEntry,
+        crate::market_intel::MarketIntelSourceId::FairOdds => IntelSource::FairOdds,
+    }
+}
+
+fn intel_rows_from_event_detail(detail: &crate::market_intel::MarketEventDetail) -> Vec<IntelRow> {
+    detail
+        .quotes
+        .iter()
+        .enumerate()
+        .map(|(index, quote)| IntelRow {
+            id: format!("event:{}:{}", detail.event_id, index),
+            source: intel_source_from_market_intel(detail.source),
+            event: detail.event_name.clone(),
+            competition: if detail.sport.trim().is_empty() {
+                detail.source.label().to_string()
+            } else {
+                detail.sport.clone()
+            },
+            market: quote.market_name.clone(),
+            selection: quote.selection_name.clone(),
+            bookmaker: quote.venue.clone(),
+            exchange: quote.venue.clone(),
+            back_odds: quote.price.unwrap_or_default(),
+            lay_odds: quote.fair_price,
+            fair_odds: quote.fair_price,
+            edge_pct: None,
+            arb_pct: None,
+            liquidity: quote.liquidity,
+            status: if quote.is_live {
+                String::from("live")
+            } else {
+                String::from("ready")
+            },
+            updated_at: quote.updated_at.clone(),
+            route: quote.event_url.clone(),
+            deep_link_url: quote.deep_link_url.clone(),
+            note: quote.notes.join(" | "),
+        })
+        .collect()
+}
+
+fn intel_row_from_opportunity(row: &MarketOpportunityRow) -> IntelRow {
+    let primary = row.primary_quote();
+    let secondary = row.secondary_quote();
+    let back_odds = primary
+        .and_then(|quote| quote.price)
+        .or(row.price)
+        .unwrap_or_default();
+
+    IntelRow {
+        id: row.id.clone(),
+        source: intel_source_from_market_intel(row.source),
+        event: row.event_name.clone(),
+        competition: if row.competition_name.trim().is_empty() {
+            row.sport.clone()
+        } else {
+            row.competition_name.clone()
+        },
+        market: row.market_name.clone(),
+        selection: if row.selection_name.trim().is_empty() {
+            primary
+                .map(|quote| quote.selection_name.clone())
+                .unwrap_or_default()
+        } else {
+            row.selection_name.clone()
+        },
+        bookmaker: primary
+            .map(|quote| quote.venue.clone())
+            .unwrap_or_else(|| row.venue.clone()),
+        exchange: secondary
+            .map(|quote| quote.venue.clone())
+            .unwrap_or_else(|| row.secondary_venue.clone()),
+        back_odds,
+        lay_odds: secondary
+            .and_then(|quote| quote.price)
+            .or(row.secondary_price),
+        fair_odds: primary
+            .and_then(|quote| quote.fair_price)
+            .or(row.fair_price),
+        edge_pct: row.edge_percent,
+        arb_pct: row.arbitrage_margin,
+        liquidity: primary.and_then(|quote| quote.liquidity).or(row.liquidity),
+        status: if row.is_live {
+            String::from("live")
+        } else if primary.is_some() {
+            String::from("ready")
+        } else {
+            String::from("idle")
+        },
+        updated_at: row.updated_at.clone(),
+        route: primary
+            .map(|quote| quote.event_url.clone())
+            .unwrap_or_else(|| row.event_url.clone()),
+        deep_link_url: primary
+            .map(|quote| quote.deep_link_url.clone())
+            .unwrap_or_else(|| row.deep_link_url.clone()),
+        note: row.notes.join(" | "),
+    }
+}
+
 fn new_trading_action_request_id(source: TradingActionSource) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5774,6 +6424,26 @@ pub(crate) fn start_oddsmatcher_worker(
             let result = oddsmatcher::fetch_best_matches(&client, &job.query)
                 .map_err(|error| error.to_string());
             if result_tx.send(OddsMatcherResult { result }).is_err() {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
+}
+
+pub(crate) fn start_market_intel_worker() -> (Sender<MarketIntelJob>, Receiver<MarketIntelResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<MarketIntelJob>();
+    let (result_tx, result_rx) = mpsc::channel::<MarketIntelResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let dashboard = market_intel::load_dashboard().map_err(|error| error.to_string());
+            if result_tx
+                .send(MarketIntelResult {
+                    dashboard,
+                    reason: job.reason,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -7642,7 +8312,7 @@ mod tests {
             }];
         }
 
-        populate_snapshot_enrichment(&mut snapshot, &dashboard, None);
+        populate_snapshot_enrichment(&mut snapshot, &dashboard, None, None);
 
         assert!(snapshot.external_quotes.iter().any(|quote| {
             quote.provider == "owls"

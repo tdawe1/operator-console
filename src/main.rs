@@ -11,11 +11,13 @@ use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
 };
 use operator_console::stub_provider::StubExchangeProvider;
+use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+    let _ = init_tracing();
 
     let launch_mode = match LaunchMode::parse(env::args().skip(1)) {
         Ok(mode) => mode,

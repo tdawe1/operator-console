@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
@@ -137,7 +139,7 @@ pub struct OwlsGroupSummary {
     pub waiting: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OwlsEndpointSummary {
     pub id: OwlsEndpointId,
     pub group: OwlsEndpointGroup,
@@ -162,6 +164,52 @@ pub struct OwlsEndpointSummary {
     pub quotes: Vec<OwlsMarketQuote>,
     pub live_scores: Vec<OwlsLiveScoreEvent>,
     last_checked_at: Option<Instant>,
+}
+
+#[cfg(test)]
+static OWLS_ENDPOINT_SUMMARY_CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl Clone for OwlsEndpointSummary {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        OWLS_ENDPOINT_SUMMARY_CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        Self {
+            id: self.id,
+            group: self.group,
+            label: self.label.clone(),
+            method: self.method.clone(),
+            path: self.path.clone(),
+            description: self.description.clone(),
+            query_hint: self.query_hint.clone(),
+            status: self.status.clone(),
+            count: self.count,
+            updated_at: self.updated_at.clone(),
+            poll_count: self.poll_count,
+            change_count: self.change_count,
+            detail: self.detail.clone(),
+            preview: self.preview.clone(),
+            requested_books: self.requested_books.clone(),
+            available_books: self.available_books.clone(),
+            books_returned: self.books_returned.clone(),
+            freshness_age_seconds: self.freshness_age_seconds,
+            freshness_stale: self.freshness_stale,
+            freshness_threshold_seconds: self.freshness_threshold_seconds,
+            quotes: self.quotes.clone(),
+            live_scores: self.live_scores.clone(),
+            last_checked_at: self.last_checked_at,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_endpoint_summary_clone_count_for_test() {
+    OWLS_ENDPOINT_SUMMARY_CLONE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn endpoint_summary_clone_count_for_test() -> usize {
+    OWLS_ENDPOINT_SUMMARY_CLONE_COUNT.load(Ordering::Relaxed)
 }
 
 impl OwlsEndpointSummary {

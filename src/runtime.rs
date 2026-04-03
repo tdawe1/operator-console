@@ -12,8 +12,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::app::{
-    start_oddsmatcher_worker, MatchbookSyncJob, MatchbookSyncResult, OddsMatcherJob,
-    OddsMatcherResult, OwlsSyncJob, OwlsSyncResult, ProviderJob, ProviderResult,
+    start_market_intel_worker, start_oddsmatcher_worker, MarketIntelJob, MarketIntelResult,
+    MatchbookSyncJob, MatchbookSyncResult, OddsMatcherJob, OddsMatcherResult, OwlsSyncJob,
+    OwlsSyncResult, ProviderJob, ProviderResult,
 };
 use crate::provider::ExchangeProvider;
 
@@ -54,6 +55,8 @@ pub(crate) struct AppRuntimeChannels {
     pub(crate) provider_rx: UnboundedReceiver<ProviderResult>,
     pub(crate) oddsmatcher_tx: Sender<OddsMatcherJob>,
     pub(crate) oddsmatcher_rx: Receiver<OddsMatcherResult>,
+    pub(crate) market_intel_tx: Sender<MarketIntelJob>,
+    pub(crate) market_intel_rx: Receiver<MarketIntelResult>,
     pub(crate) owls_sync_tx: UnboundedSender<OwlsSyncJob>,
     pub(crate) owls_sync_rx: UnboundedReceiver<OwlsSyncResult>,
     pub(crate) matchbook_sync_tx: UnboundedSender<MatchbookSyncJob>,
@@ -70,6 +73,7 @@ impl AppRuntimeChannels {
         debug!("starting current worker runtime channels");
         let (provider_tx, provider_rx) = Self::start_provider(host, provider);
         let (oddsmatcher_tx, oddsmatcher_rx) = Self::start_oddsmatcher(host, oddsmatcher_client);
+        let (market_intel_tx, market_intel_rx) = Self::start_market_intel(host);
         let (owls_sync_tx, owls_sync_rx) = Self::start_owls(host, owls_client);
         let (matchbook_sync_tx, matchbook_sync_rx) = Self::start_matchbook(host);
 
@@ -78,6 +82,8 @@ impl AppRuntimeChannels {
             provider_rx,
             oddsmatcher_tx,
             oddsmatcher_rx,
+            market_intel_tx,
+            market_intel_rx,
             owls_sync_tx,
             owls_sync_rx,
             matchbook_sync_tx,
@@ -131,6 +137,12 @@ impl AppRuntimeChannels {
         client: Client,
     ) -> (Sender<OddsMatcherJob>, Receiver<OddsMatcherResult>) {
         start_oddsmatcher_worker(client)
+    }
+
+    pub(crate) fn start_market_intel(
+        _host: &AppRuntimeHost,
+    ) -> (Sender<MarketIntelJob>, Receiver<MarketIntelResult>) {
+        start_market_intel_worker()
     }
 
     pub(crate) fn start_owls(

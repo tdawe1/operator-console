@@ -3105,7 +3105,7 @@ fn render_live_best_odds_board(
             (
                 "󰘷 Current Best",
                 overlay_best_exit
-                    .map(|quote| overlay_exchange_quote_label(quote))
+                    .map(overlay_exchange_quote_label)
                     .unwrap_or_else(|| String::from("-")),
                 accent_cyan(),
             ),

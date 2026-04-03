@@ -64,6 +64,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 TradingSection::Markets => panels::trading_markets::render(frame, layout[1], app),
                 TradingSection::Live => panels::trading_markets::render(frame, layout[1], app),
                 TradingSection::Props => panels::trading_markets::render(frame, layout[1], app),
+                TradingSection::Intel => panels::intel::render(frame, layout[1], app),
                 TradingSection::Matcher => panels::matcher::render(frame, layout[1], app),
                 TradingSection::Stats => panels::trading_stats::render(
                     frame,
@@ -158,6 +159,8 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .filter(|endpoint| endpoint.status == "ready")
         .count();
     let owls_total = app.owls_dashboard().endpoints.len();
+    let intel_total = app.intel_source_statuses().len();
+    let intel_ready = app.intel_ready_sources();
 
     let body = Paragraph::new(vec![
         Line::from(vec![
@@ -217,6 +220,15 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "󰇚 Owls",
                 &format!("{owls_ready}/{owls_total}"),
                 accent_blue(),
+            ),
+            Span::raw("  "),
+            badge_line(
+                "󰛨 Intel",
+                &format!(
+                    "{intel_ready}/{intel_total} {}",
+                    app.intel_freshness_label()
+                ),
+                accent_pink(),
             ),
             Span::raw("  "),
             badge_line(
@@ -445,7 +457,7 @@ fn accent_gold() -> Color {
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(244, 143, 177)
+    Color::Rgb(255, 140, 205)
 }
 
 fn accent_red() -> Color {
@@ -548,11 +560,12 @@ fn trading_index(section: TradingSection) -> usize {
         TradingSection::Markets => 1,
         TradingSection::Live => 2,
         TradingSection::Props => 3,
-        TradingSection::Matcher => 4,
-        TradingSection::Stats => 5,
-        TradingSection::Alerts => 6,
-        TradingSection::Calculator => 7,
-        TradingSection::Recorder => 8,
+        TradingSection::Intel => 4,
+        TradingSection::Matcher => 5,
+        TradingSection::Stats => 6,
+        TradingSection::Alerts => 7,
+        TradingSection::Calculator => 8,
+        TradingSection::Recorder => 9,
     }
 }
 
@@ -563,5 +576,130 @@ fn observability_index(section: ObservabilitySection) -> usize {
         ObservabilitySection::Configs => 2,
         ObservabilitySection::Logs => 3,
         ObservabilitySection::Health => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use color_eyre::Result;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::render;
+    use crate::app::{App, TradingSection};
+    use crate::domain::ExchangePanelSnapshot;
+    use crate::owls::{
+        self, OwlsEndpointId, OwlsLiveIncident, OwlsLiveScoreEvent, OwlsLiveStat, OwlsPlayerRating,
+        OwlsPreviewRow,
+    };
+    use crate::provider::{ExchangeProvider, ProviderRequest};
+
+    struct StaticProvider;
+
+    impl ExchangeProvider for StaticProvider {
+        fn handle(&mut self, _request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
+            Ok(ExchangePanelSnapshot::default())
+        }
+    }
+
+    #[test]
+    fn live_panel_render_does_not_clone_selected_endpoint() {
+        let mut app = App::from_provider(StaticProvider).expect("app");
+        app.set_trading_section(TradingSection::Live);
+        app.set_owls_dashboard_for_test(large_soccer_dashboard());
+
+        let selected_index = app
+            .visible_owls_endpoints()
+            .iter()
+            .position(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
+            .expect("scores endpoint visible");
+        app.owls_endpoint_table_state().select(Some(selected_index));
+
+        owls::reset_endpoint_summary_clone_count_for_test();
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw ui");
+
+        assert_eq!(owls::endpoint_summary_clone_count_for_test(), 0);
+    }
+
+    fn large_soccer_dashboard() -> owls::OwlsDashboard {
+        let mut dashboard = owls::dashboard_for_sport("soccer");
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.count = 512;
+            endpoint.detail = String::from("live feed soccer");
+            endpoint.preview = vec![OwlsPreviewRow {
+                label: String::from("Malta at Luxembourg"),
+                detail: String::from("72'"),
+                metric: String::from("2-1"),
+            }];
+            endpoint.live_scores = (0..512)
+                .map(|index| OwlsLiveScoreEvent {
+                    sport: String::from("soccer"),
+                    event_id: format!("soccer:event-{index}"),
+                    name: format!("Away {index} at Home {index}"),
+                    home_team: format!("Home {index}"),
+                    away_team: format!("Away {index}"),
+                    home_score: Some((index % 4) as i64),
+                    away_score: Some(((index + 1) % 4) as i64),
+                    status_state: String::from("in"),
+                    status_detail: format!("{}'", 10 + (index % 80)),
+                    display_clock: (10 + (index % 80)).to_string(),
+                    source_match_id: format!("source-{index}"),
+                    last_updated: String::from("2026-03-26T12:00:00Z"),
+                    stats: vec![
+                        OwlsLiveStat {
+                            key: String::from("possession"),
+                            label: String::from("Possession"),
+                            home_value: String::from("54"),
+                            away_value: String::from("46"),
+                        },
+                        OwlsLiveStat {
+                            key: String::from("expectedGoals"),
+                            label: String::from("xG"),
+                            home_value: String::from("1.2"),
+                            away_value: String::from("0.8"),
+                        },
+                    ],
+                    incidents: vec![
+                        OwlsLiveIncident {
+                            minute: Some(22),
+                            incident_type: String::from("goal"),
+                            team_side: String::from("home"),
+                            player_name: format!("Player {index}"),
+                            detail: String::from("assist Teammate"),
+                        },
+                        OwlsLiveIncident {
+                            minute: Some(61),
+                            incident_type: String::from("yellow"),
+                            team_side: String::from("away"),
+                            player_name: format!("Defender {index}"),
+                            detail: String::new(),
+                        },
+                    ],
+                    player_ratings: vec![
+                        OwlsPlayerRating {
+                            player_name: format!("Midfielder {index}"),
+                            team_side: String::from("home"),
+                            rating: Some(7.6),
+                        },
+                        OwlsPlayerRating {
+                            player_name: format!("Forward {index}"),
+                            team_side: String::from("away"),
+                            rating: Some(7.2),
+                        },
+                    ],
+                })
+                .collect();
+        }
+        dashboard
     }
 }

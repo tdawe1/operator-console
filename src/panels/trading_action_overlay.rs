@@ -42,6 +42,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             value(match overlay.seed.source {
                 crate::trading_actions::TradingActionSource::OddsMatcher => "OddsMatcher",
                 crate::trading_actions::TradingActionSource::HorseMatcher => "HorseMatcher",
+                crate::trading_actions::TradingActionSource::MarketIntel => "Market Intel",
                 crate::trading_actions::TradingActionSource::Positions => "Positions",
             }),
             Span::raw("   "),

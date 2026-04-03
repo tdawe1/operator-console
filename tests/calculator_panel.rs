@@ -8,12 +8,9 @@ fn calculator_section_is_reachable_from_trading_navigation() {
     let mut app = App::default();
     app.set_active_panel(Panel::Trading);
 
-    app.next_section();
-    app.next_section();
-    app.next_section();
-    app.next_section();
-    app.next_section();
-    app.next_section();
+    while app.active_trading_section() != TradingSection::Calculator {
+        app.next_section();
+    }
 
     assert_eq!(app.active_trading_section(), TradingSection::Calculator);
 }

@@ -48,9 +48,9 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 accent(config.sound_effects),
             ),
             Span::raw("  "),
-            summary_item("unread", &unread.to_string(), accent_blue()),
+            summary_item("unread", unread.to_string(), accent_blue()),
             Span::raw("  "),
-            summary_item("recent", &recent.to_string(), accent_gold()),
+            summary_item("recent", recent.to_string(), accent_gold()),
         ]),
         Line::from(vec![
             Span::styled("config ", Style::default().fg(muted_text())),

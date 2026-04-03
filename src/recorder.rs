@@ -379,6 +379,7 @@ impl RecorderField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct RecorderEditorState {
     pub selected_field_index: usize,
     pub editing: bool,
@@ -386,16 +387,6 @@ pub struct RecorderEditorState {
     pub replace_on_input: bool,
 }
 
-impl Default for RecorderEditorState {
-    fn default() -> Self {
-        Self {
-            selected_field_index: 0,
-            editing: false,
-            buffer: String::new(),
-            replace_on_input: false,
-        }
-    }
-}
 
 impl RecorderEditorState {
     pub fn selected_field(&self) -> RecorderField {
@@ -421,21 +412,13 @@ pub trait RecorderSupervisor {
     fn poll_status(&mut self) -> RecorderStatus;
 }
 
+#[derive(Default)]
 pub struct ProcessRecorderSupervisor {
     child: Option<Child>,
     attached_pid: Option<u32>,
     attached_run_dir: Option<PathBuf>,
 }
 
-impl Default for ProcessRecorderSupervisor {
-    fn default() -> Self {
-        Self {
-            child: None,
-            attached_pid: None,
-            attached_run_dir: None,
-        }
-    }
-}
 
 impl RecorderSupervisor for ProcessRecorderSupervisor {
     fn start(&mut self, config: &RecorderConfig) -> Result<()> {

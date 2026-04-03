@@ -375,6 +375,7 @@ impl OddsMatcherField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct OddsMatcherEditorState {
     selected_field_index: usize,
     pub editing: bool,
@@ -382,16 +383,6 @@ pub struct OddsMatcherEditorState {
     pub replace_on_input: bool,
 }
 
-impl Default for OddsMatcherEditorState {
-    fn default() -> Self {
-        Self {
-            selected_field_index: 0,
-            editing: false,
-            buffer: String::new(),
-            replace_on_input: false,
-        }
-    }
-}
 
 impl OddsMatcherEditorState {
     pub fn selected_field(&self) -> OddsMatcherField {
@@ -717,6 +708,57 @@ fn truncate_for_error(value: &str, limit: usize) -> String {
     } else {
         let truncated = value.chars().take(limit).collect::<String>();
         format!("{truncated}...")
+    }
+}
+
+fn deserialize_f64_from_string_or_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => value
+            .parse::<f64>()
+            .map_err(|_| D::Error::custom(format!("invalid numeric string: {value}"))),
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .ok_or_else(|| D::Error::custom("invalid numeric value")),
+        _ => Err(D::Error::custom("expected string or number")),
+    }
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn deserialize_optional_f64_from_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("invalid numeric string: {value}"))),
+        Some(serde_json::Value::Number(value)) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| D::Error::custom("invalid numeric value")),
+        Some(_) => Err(D::Error::custom("expected string or number")),
     }
 }
 
@@ -1160,56 +1202,5 @@ mod tests {
             GetBestMatchesVariables::default().updated_within_seconds
         );
         assert!(note.contains("Repaired rating type"));
-    }
-}
-
-fn deserialize_f64_from_string_or_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::String(value) => value
-            .parse::<f64>()
-            .map_err(|_| D::Error::custom(format!("invalid numeric string: {value}"))),
-        serde_json::Value::Number(value) => value
-            .as_f64()
-            .ok_or_else(|| D::Error::custom("invalid numeric value")),
-        _ => Err(D::Error::custom("expected string or number")),
-    }
-}
-
-fn parse_csv_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn parse_optional_string(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn deserialize_optional_f64_from_string_or_number<'de, D>(
-    deserializer: D,
-) -> Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(value)) => value
-            .parse::<f64>()
-            .map(Some)
-            .map_err(|_| D::Error::custom(format!("invalid numeric string: {value}"))),
-        Some(serde_json::Value::Number(value)) => value
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| D::Error::custom("invalid numeric value")),
-        Some(_) => Err(D::Error::custom("expected string or number")),
     }
 }

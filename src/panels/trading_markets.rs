@@ -12,14 +12,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let body = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(layout[1]);
 
-    let selected = app.selected_owls_endpoint().cloned();
-    render_overview(frame, layout[0], app, selected.as_ref());
+    render_overview(frame, layout[0], app, app.selected_owls_endpoint());
     render_endpoint_table(frame, body[0], app);
     render_overlay_preview(
         frame,
         body[1],
         app.active_trading_section(),
-        selected.as_ref(),
+        app.selected_owls_endpoint(),
     );
 }
 
