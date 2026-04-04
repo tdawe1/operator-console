@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Padding, Paragraph, Row, Table,
+    Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table,
     Wrap,
 };
 use ratatui::Frame;

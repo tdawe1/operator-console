@@ -28,8 +28,8 @@ pub enum WorkerRequestEnvelope {
     RefreshCached,
     RefreshLive,
     CashOutTrackedBet { bet_id: String },
-    ExecuteTradingAction { intent: TradingActionIntent },
-    LoadHorseMatcher { query: HorseMatcherQuery },
+    ExecuteTradingAction { intent: Box<TradingActionIntent> },
+    LoadHorseMatcher { query: Box<HorseMatcherQuery> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

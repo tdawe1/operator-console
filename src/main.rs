@@ -38,19 +38,20 @@ fn main() -> Result<()> {
     let provider: Box<dyn operator_console::provider::ExchangeProvider + Send> =
         match options.launch_mode {
             LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
-            LaunchMode::BetRecorder {
-                positions_payload_path,
-                run_dir,
-                account_payload_path,
-                open_bets_payload_path,
-                agent_browser_session,
-                bet_recorder_command,
-                python_executable,
-                bet_recorder_root,
-                commission_rate,
-                target_profit,
-                stop_loss,
-            } => {
+            LaunchMode::BetRecorder(config) => {
+                let BetRecorderLaunchConfig {
+                    positions_payload_path,
+                    run_dir,
+                    account_payload_path,
+                    open_bets_payload_path,
+                    agent_browser_session,
+                    bet_recorder_command,
+                    python_executable,
+                    bet_recorder_root,
+                    commission_rate,
+                    target_profit,
+                    stop_loss,
+                } = *config;
                 let worker_config = WorkerConfig {
                     positions_payload_path,
                     run_dir,
@@ -184,21 +185,23 @@ struct CliOptions {
     theme: ThemeName,
 }
 
+struct BetRecorderLaunchConfig {
+    positions_payload_path: Option<PathBuf>,
+    run_dir: Option<PathBuf>,
+    account_payload_path: Option<PathBuf>,
+    open_bets_payload_path: Option<PathBuf>,
+    agent_browser_session: Option<String>,
+    bet_recorder_command: PathBuf,
+    python_executable: PathBuf,
+    bet_recorder_root: PathBuf,
+    commission_rate: f64,
+    target_profit: f64,
+    stop_loss: f64,
+}
+
 enum LaunchMode {
     Stub,
-    BetRecorder {
-        positions_payload_path: Option<PathBuf>,
-        run_dir: Option<PathBuf>,
-        account_payload_path: Option<PathBuf>,
-        open_bets_payload_path: Option<PathBuf>,
-        agent_browser_session: Option<String>,
-        bet_recorder_command: PathBuf,
-        python_executable: PathBuf,
-        bet_recorder_root: PathBuf,
-        commission_rate: f64,
-        target_profit: f64,
-        stop_loss: f64,
-    },
+    BetRecorder(Box<BetRecorderLaunchConfig>),
 }
 
 impl CliOptions {
@@ -276,20 +279,22 @@ impl CliOptions {
         }
 
         let launch_mode = match (positions_payload_path, run_dir) {
-            (Some(positions_payload_path), run_dir) => LaunchMode::BetRecorder {
-                positions_payload_path: Some(positions_payload_path),
-                run_dir,
-                account_payload_path,
-                open_bets_payload_path,
-                agent_browser_session,
-                bet_recorder_command,
-                python_executable,
-                bet_recorder_root,
-                commission_rate,
-                target_profit,
-                stop_loss,
-            },
-            (None, Some(run_dir)) => LaunchMode::BetRecorder {
+            (Some(positions_payload_path), run_dir) => {
+                LaunchMode::BetRecorder(Box::new(BetRecorderLaunchConfig {
+                    positions_payload_path: Some(positions_payload_path),
+                    run_dir,
+                    account_payload_path,
+                    open_bets_payload_path,
+                    agent_browser_session,
+                    bet_recorder_command,
+                    python_executable,
+                    bet_recorder_root,
+                    commission_rate,
+                    target_profit,
+                    stop_loss,
+                }))
+            }
+            (None, Some(run_dir)) => LaunchMode::BetRecorder(Box::new(BetRecorderLaunchConfig {
                 positions_payload_path: None,
                 run_dir: Some(run_dir),
                 account_payload_path,
@@ -301,7 +306,7 @@ impl CliOptions {
                 commission_rate,
                 target_profit,
                 stop_loss,
-            },
+            })),
             (None, None) => LaunchMode::Stub,
         };
 

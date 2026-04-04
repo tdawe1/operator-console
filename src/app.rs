@@ -4961,7 +4961,9 @@ impl App {
             overlay.time_in_force,
         )?;
         self.queue_provider_request(ProviderJob {
-            request: ProviderRequest::ExecuteTradingAction { intent },
+            request: ProviderRequest::ExecuteTradingAction {
+                intent: Box::new(intent),
+            },
             failure_context: String::from("Trading action failed"),
             event_message: Some(String::from("Trading action completed.")),
         });
@@ -5375,7 +5377,7 @@ impl App {
     fn refresh_horse_matcher(&mut self) -> Result<()> {
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::LoadHorseMatcher {
-                query: self.horse_matcher_query.clone(),
+                query: Box::new(self.horse_matcher_query.clone()),
             },
             failure_context: String::from("Horse Matcher refresh failed"),
             event_message: Some(String::from("Horse Matcher refresh completed.")),
@@ -8399,7 +8401,7 @@ mod tests {
 
         app.apply_provider_snapshot_result(
             ProviderRequest::ExecuteTradingAction {
-                intent: sample_trading_action_intent(TradingActionMode::Confirm),
+                intent: Box::new(sample_trading_action_intent(TradingActionMode::Confirm)),
             },
             sample_snapshot("submitted"),
             None,
