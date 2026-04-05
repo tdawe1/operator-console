@@ -1,3 +1,5 @@
+mod backend_provider;
+
 use std::env;
 use std::io::{self, stdout};
 use std::path::PathBuf;
@@ -5,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use backend_provider::BackendExchangeProvider;
 use color_eyre::eyre::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -197,14 +200,20 @@ mod tests {
     #[test]
     fn autostart_flag_recognizes_enabled_values() {
         for value in ["1", "true", "TRUE", " yes ", "On"] {
-            assert!(flag_is_enabled(value), "expected {value:?} to enable autostart");
+            assert!(
+                flag_is_enabled(value),
+                "expected {value:?} to enable autostart"
+            );
         }
     }
 
     #[test]
     fn autostart_flag_rejects_disabled_values() {
         for value in ["", "0", "false", "off", "no", "disabled"] {
-            assert!(!flag_is_enabled(value), "expected {value:?} to disable autostart");
+            assert!(
+                !flag_is_enabled(value),
+                "expected {value:?} to disable autostart"
+            );
         }
     }
 
@@ -241,11 +250,16 @@ fn help_text() -> String {
 }
 
 fn default_configured_provider() -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
-    let config_path = default_recorder_config_path();
-    let recorder_config = load_recorder_config_or_default(&config_path)
-        .map(|(config, _)| config)
-        .unwrap_or_else(|_| RecorderConfig::default());
-    provider_from_recorder_config(&recorder_config)
+    match BackendExchangeProvider::new() {
+        Ok(provider) => Box::new(provider),
+        Err(_) => {
+            let config_path = default_recorder_config_path();
+            let recorder_config = load_recorder_config_or_default(&config_path)
+                .map(|(config, _)| config)
+                .unwrap_or_else(|_| RecorderConfig::default());
+            provider_from_recorder_config(&recorder_config)
+        }
+    }
 }
 
 fn provider_from_recorder_config(

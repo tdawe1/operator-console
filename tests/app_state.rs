@@ -49,7 +49,7 @@ impl ExchangeProvider for RecordingActionProvider {
         match request {
             ProviderRequest::LoadDashboard => Ok(self.snapshots.lock().expect("lock").remove(0)),
             ProviderRequest::ExecuteTradingAction { intent } => {
-                *self.captured.lock().expect("lock") = Some(intent);
+                *self.captured.lock().expect("lock") = Some(*intent);
                 Ok(self.snapshots.lock().expect("lock").remove(0))
             }
             ProviderRequest::RefreshCached

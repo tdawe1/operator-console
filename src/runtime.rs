@@ -191,16 +191,15 @@ impl AppRuntimeChannels {
         let (result_tx, result_rx) = tokio_mpsc::unbounded_channel::<MatchbookSyncResult>();
 
         host.spawn(async move {
-            let mut client = None;
-            let mut rate_limited_until = None;
             while let Some(job) = job_rx.recv().await {
                 debug!(reason = job.reason.label(), "matchbook runtime job started");
-                let state = crate::exchange_api::run_matchbook_sync_job_async(
-                    &mut client,
-                    &mut rate_limited_until,
-                )
-                .await
-                .map_err(|error| error.to_string());
+                let state =
+                    crate::matchbook_backend::load_account_state(matches!(
+                        job.reason,
+                        crate::app::MatchbookSyncReason::Manual
+                    ))
+                    .await
+                    .map_err(|error| error.to_string());
                 match &state {
                     Ok(_) => debug!(reason = job.reason.label(), "matchbook runtime job completed"),
                     Err(error) => warn!(reason = job.reason.label(), error = %error, "matchbook runtime job failed"),

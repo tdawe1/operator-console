@@ -7,6 +7,7 @@ use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::VenueId;
@@ -20,7 +21,7 @@ pub struct ExchangeApiExecutionResult {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MatchbookOfferRow {
     pub offer_id: String,
     pub event_id: String,
@@ -36,7 +37,7 @@ pub struct MatchbookOfferRow {
     pub remaining_stake: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MatchbookBetRow {
     pub bet_id: String,
     pub event_id: String,
@@ -52,7 +53,7 @@ pub struct MatchbookBetRow {
     pub profit_loss: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MatchbookPositionRow {
     pub event_id: String,
     pub market_id: String,
@@ -64,7 +65,7 @@ pub struct MatchbookPositionRow {
     pub profit_loss: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MatchbookAccountState {
     pub status_line: String,
     pub balance_label: String,
@@ -88,7 +89,7 @@ pub struct AsyncMatchbookApiClient {
     token: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MatchbookPreflightSummary {
     pub balance: Option<String>,
     pub open_offer_count: usize,

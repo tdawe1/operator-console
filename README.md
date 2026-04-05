@@ -7,8 +7,9 @@ It is the main operator-facing frontend for positions, calculators, matchers, re
 ## What It Does
 
 - Starts the Sabi terminal UI
-- Loads the configured snapshot provider for exchange state and enriches it with `sabisabi`, OwlS, and Matchbook data
+- Loads exchange snapshots through `sabisabi` by default and enriches them with OwlS and market-intel data
 - Reads market-intel data from `sabisabi`
+- Reads Matchbook account-monitor state from `sabisabi`
 - Gives operators a single place to inspect live orders, market views, opportunities, alerts, calculators, and recorder state
 
 ## Owns
@@ -19,9 +20,9 @@ It is the main operator-facing frontend for positions, calculators, matchers, re
 
 ## Integrates With
 
-- `../../bet-recorder` for normalized snapshots and recorder control
-- `../../sabisabi` for persisted market intelligence and query APIs
-- `../../workers/exchange-browser-worker` indirectly through recorder-managed worker flows
+- `../../sabisabi` for operator snapshot control, Matchbook monitor state, execution APIs, and persisted market-intel queries
+- `../../bet-recorder` only behind `sabisabi` or explicit legacy provider modes for normalized snapshots and recorder control
+- `../../workers/exchange-browser-worker` indirectly through legacy recorder-managed worker flows
 
 Treat this crate as the top-level client in the active Sabi runtime path, not as a standalone app.
 
@@ -111,7 +112,8 @@ Useful options:
 
 ## Configuration Notes
 
-- `SABISABI_BASE_URL` overrides the backend base URL used for market-intel reads.
+- `SABISABI_BASE_URL` overrides the backend base URL used for snapshot, Matchbook, execution, and market-intel reads.
+- `SABISABI_CONTROL_TOKEN` is forwarded to backend control endpoints when configured.
 - `OPERATOR_CONSOLE_AUTOSTART_SABISABI=1` restores the old opt-in behavior where the console bootstraps a local `sabisabi` process.
 - The console keeps its own local UI, recorder, alerts, and matcher state on disk through crate-managed config files.
 - For recorder-backed flows, the console can use native file inputs, a worker client, or a hybrid provider that prefers native data and falls back to the worker path.
@@ -122,7 +124,8 @@ Useful options:
 - The in-app keymap overlay is the source of truth for navigation keys.
 - `Trading > Accounts` is the venue-selection surface. Selecting a non-`smarkets` venue updates focus immediately; use `r` or `R` when you want a fresh live recapture.
 - Recorder lifecycle controls are available from the `Recorder` pane.
-- Market-intel data is read from `sabisabi`; recorder data is still a fallback/legacy path where adaptor-backed ingestion is not available and should not be treated as the primary runtime model.
+- Snapshot reads, Matchbook account monitoring, and execution review/submit now go through `sabisabi` by default.
+- Recorder data is still a fallback/legacy path where adaptor-backed ingestion is not available and should not be treated as the primary runtime model.
 
 ## Test
 

@@ -2172,19 +2172,17 @@ impl App {
         match result.state {
             Ok(state) => {
                 self.matchbook_resource_state.finish_ok(state.clone());
-                let first_load = self.matchbook_account_state.is_none();
                 self.matchbook_account_state = Some(state.clone());
                 self.refresh_snapshot_enrichment();
-                if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
+                if matches!(result.reason, MatchbookSyncReason::Manual) {
                     self.status_message = state.status_line.clone();
                     self.status_scroll = 0;
                     self.record_event(format!("Matchbook {} sync applied.", result.reason.label()));
                 }
             }
             Err(error) => {
-                let first_load = self.matchbook_account_state.is_none();
                 self.matchbook_resource_state.finish_error(error.clone());
-                if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
+                if matches!(result.reason, MatchbookSyncReason::Manual) {
                     self.status_message = format!("Matchbook sync failed: {error}");
                     self.status_scroll = 0;
                 }
@@ -2282,9 +2280,8 @@ impl App {
                 self.clamp_selected_intel_row();
             }
             Err(error) => {
-                let first_load = self.market_intel_resource_state.last_good().is_none();
                 self.market_intel_resource_state.finish_error(error.clone());
-                if matches!(result.reason, MarketIntelSyncReason::Manual) || first_load {
+                if matches!(result.reason, MarketIntelSyncReason::Manual) {
                     self.status_message = format!("Market intel sync failed: {error}");
                     self.status_scroll = 0;
                 }
@@ -4200,9 +4197,10 @@ impl App {
         matches!(
             self.active_pane(),
             Some(PaneId::Positions | PaneId::History | PaneId::Stats)
-        ) || self.trading_action_overlay.as_ref().is_some_and(|overlay| {
-            matches!(overlay.seed.venue, VenueId::Matchbook)
-        })
+        ) || self
+            .trading_action_overlay
+            .as_ref()
+            .is_some_and(|overlay| matches!(overlay.seed.venue, VenueId::Matchbook))
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
