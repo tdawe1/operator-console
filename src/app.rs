@@ -4180,8 +4180,7 @@ impl App {
     fn poll_matchbook_account(&mut self) {
         self.drain_matchbook_sync_results();
         self.expire_stuck_matchbook_sync_placeholder();
-        let should_sync = self.active_panel == Panel::Trading;
-        if !should_sync || self.matchbook_resource_state.is_loading() {
+        if !self.should_poll_matchbook_account() || self.matchbook_resource_state.is_loading() {
             return;
         }
         if self
@@ -4191,6 +4190,19 @@ impl App {
             return;
         }
         self.dispatch_matchbook_sync(MatchbookSyncReason::Background);
+    }
+
+    fn should_poll_matchbook_account(&self) -> bool {
+        if self.active_panel != Panel::Trading {
+            return false;
+        }
+
+        matches!(
+            self.active_pane(),
+            Some(PaneId::Positions | PaneId::History | PaneId::Stats)
+        ) || self.trading_action_overlay.as_ref().is_some_and(|overlay| {
+            matches!(overlay.seed.venue, VenueId::Matchbook)
+        })
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
@@ -9418,6 +9430,30 @@ mod tests {
             app.matchbook_resource_state.last_good(),
             app.matchbook_account_state.as_ref()
         );
+    }
+
+    #[test]
+    fn matchbook_polling_stays_idle_outside_matchbook_visible_panes() {
+        let mut app = App::default();
+        let _ = app.wait_for_async_idle(Duration::from_millis(100));
+        app.set_trading_section(TradingSection::Markets);
+
+        app.poll_matchbook_account_for_test();
+
+        assert!(!app.matchbook_sync_in_flight_for_test());
+        assert_eq!(app.matchbook_status_for_test(), "idle");
+    }
+
+    #[test]
+    fn matchbook_polling_runs_when_stats_pane_is_active() {
+        let mut app = App::default();
+        let _ = app.wait_for_async_idle(Duration::from_millis(100));
+        app.set_trading_section(TradingSection::Stats);
+
+        app.poll_matchbook_account_for_test();
+
+        assert!(app.matchbook_sync_in_flight_for_test());
+        assert_eq!(app.matchbook_status_for_test(), "loading");
     }
 
     #[test]
