@@ -21,9 +21,9 @@ use crate::alerts::{
     AlertField, NotificationEntry, NotificationLevel,
 };
 pub use crate::app_state::{
-    CalculatorEditorState, CalculatorField, CalculatorSourceContext, CalculatorState,
-    CalculatorTool, IntelRow, IntelSource, IntelSourceStatus, IntelView, MatcherView,
-    ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus, TradingActionField,
+    BackendExecutionOverlayState, CalculatorEditorState, CalculatorField, CalculatorSourceContext,
+    CalculatorState, CalculatorTool, IntelRow, IntelSource, IntelSourceStatus, IntelView,
+    MatcherView, ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus, TradingActionField,
     TradingActionOverlayState, TradingSection,
 };
 use crate::calculator::{self, BetType, Mode as CalculatorMode};
@@ -35,6 +35,7 @@ use crate::domain::{
 use crate::exchange_api::{
     MatchbookAccountState, MatchbookBetRow, MatchbookOfferRow, MatchbookPositionRow,
 };
+use crate::execution_backend;
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::manual_positions::{
     self, load_entries_or_default, save_entries, ManualPositionEntry, ManualPositionField,
@@ -62,7 +63,7 @@ use crate::recorder::{
     ProcessRecorderSupervisor, RecorderConfig, RecorderEditorState, RecorderField, RecorderStatus,
     RecorderSupervisor,
 };
-use crate::resource_state::ResourceState;
+use crate::resource_state::{ResourcePhase, ResourceState};
 use crate::runtime::{AppRuntimeChannels, AppRuntimeHost};
 use crate::snapshot_projection::project_snapshot;
 use crate::stub_provider::StubExchangeProvider;
@@ -633,6 +634,7 @@ impl App {
     }
 
     fn refresh_snapshot_enrichment(&mut self) {
+        let previous_snapshot = self.snapshot.clone();
         let base_snapshot = self
             .provider_resource_state
             .last_good()
@@ -649,12 +651,33 @@ impl App {
             .cloned()
             .or_else(|| self.matchbook_account_state.clone());
         let market_intel_dashboard = self.market_intel_resource_state.last_good().cloned();
-        self.snapshot = project_snapshot(
+        let mut projected_snapshot = project_snapshot(
             &base_snapshot,
             &owls_dashboard,
             matchbook_account_state.as_ref(),
             market_intel_dashboard.as_ref(),
         );
+        if self.provider_resource_state.phase() == ResourcePhase::Error {
+            projected_snapshot.status_line = previous_snapshot.status_line.clone();
+            projected_snapshot.worker = previous_snapshot.worker.clone();
+            if let Some(selected_venue) = previous_snapshot.selected_venue {
+                if let Some(previous_venue) = previous_snapshot
+                    .venues
+                    .iter()
+                    .find(|venue| venue.id == selected_venue)
+                {
+                    if let Some(projected_venue) = projected_snapshot
+                        .venues
+                        .iter_mut()
+                        .find(|venue| venue.id == selected_venue)
+                    {
+                        projected_venue.status = previous_venue.status;
+                        projected_venue.detail = previous_venue.detail.clone();
+                    }
+                }
+            }
+        }
+        self.snapshot = projected_snapshot;
     }
 
     pub fn owls_sport(&self) -> &str {
@@ -787,10 +810,15 @@ impl App {
             self.trading_action_overlay = None;
         }
         if self.is_owls_context() {
-            self.clamp_selected_owls_endpoint();
+            self.align_owls_selection_for_section();
+            self.request_owls_sync(OwlsSyncReason::Background);
+        }
+        if section == TradingSection::Accounts {
+            self.seed_selected_exchange_row_from_snapshot();
         }
         if section == TradingSection::Intel {
             self.clamp_selected_intel_row();
+            self.request_market_intel_sync(MarketIntelSyncReason::Background);
         }
     }
 
@@ -1010,9 +1038,12 @@ impl App {
         self.owls_dashboard = owls::dashboard_for_sport(sport);
         self.owls_resource_state
             .finish_ok(self.owls_dashboard.clone());
-        self.clamp_selected_owls_endpoint();
+        self.align_owls_selection_for_section();
         self.markets_overlay_visible = false;
         self.request_owls_sync(OwlsSyncReason::Manual);
+        // Sport changes should immediately requery the current operator slice instead of
+        // waiting for the background interval or forcing a full backend refresh.
+        self.request_market_intel_sync(MarketIntelSyncReason::Manual);
         self.status_message = format!("Owls sport set to {sport}. Sync queued.");
         self.status_scroll = 0;
         self.record_event(format!("Owls sport set to {sport}."));
@@ -3156,6 +3187,10 @@ impl App {
                         self.markets_overlay_visible = true;
                     }
                 } else if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Accounts
+                {
+                    self.sync_selected_venue();
+                } else if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
                     && self.positions_focus == PositionsFocus::Active
                 {
@@ -3339,6 +3374,7 @@ impl App {
                 }
             }
             KeyCode::Down => match (self.active_panel, self.trading_section) {
+                (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
@@ -3355,6 +3391,7 @@ impl App {
                 _ => {}
             },
             KeyCode::Up => match (self.active_panel, self.trading_section) {
+                (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_previous_positions_row(),
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
@@ -3586,6 +3623,33 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn seed_selected_exchange_row_from_snapshot(&mut self) {
+        if self.snapshot.venues.is_empty() {
+            self.exchange_list_state.select(None);
+            return;
+        }
+
+        if self
+            .exchange_list_state
+            .selected()
+            .is_some_and(|index| index < self.snapshot.venues.len())
+        {
+            return;
+        }
+
+        let selected_index = self
+            .snapshot
+            .selected_venue
+            .and_then(|selected_venue| {
+                self.snapshot
+                    .venues
+                    .iter()
+                    .position(|venue| venue.id == selected_venue)
+            })
+            .unwrap_or(0);
+        self.exchange_list_state.select(Some(selected_index));
     }
 
     fn clamp_selected_open_position_row(&mut self) {
@@ -3973,6 +4037,41 @@ impl App {
         }
     }
 
+    fn preferred_owls_endpoint_id(&self) -> OwlsEndpointId {
+        match self.trading_section {
+            TradingSection::Live => {
+                if self.owls_dashboard.sport == "soccer" {
+                    OwlsEndpointId::ScoresSport
+                } else {
+                    OwlsEndpointId::Realtime
+                }
+            }
+            TradingSection::Props => OwlsEndpointId::Props,
+            TradingSection::Markets => {
+                if self.owls_dashboard.sport == "soccer" {
+                    OwlsEndpointId::ScoresSport
+                } else {
+                    OwlsEndpointId::Odds
+                }
+            }
+            _ => OwlsEndpointId::Odds,
+        }
+    }
+
+    fn align_owls_selection_for_section(&mut self) {
+        let preferred_id = self.preferred_owls_endpoint_id();
+        let visible = self.visible_owls_endpoints();
+        if let Some(index) = visible
+            .iter()
+            .position(|endpoint| endpoint.id == preferred_id)
+        {
+            self.owls_endpoint_table_state.select(Some(index));
+            return;
+        }
+
+        self.clamp_selected_owls_endpoint();
+    }
+
     fn sync_selected_venue(&mut self) {
         let Some(selected_index) = self.exchange_list_state.selected() else {
             return;
@@ -4064,7 +4163,7 @@ impl App {
     fn poll_market_intel(&mut self) {
         self.drain_market_intel_results();
         self.expire_stuck_market_intel_placeholder();
-        if self.active_panel != Panel::Trading || self.market_intel_resource_state.is_loading() {
+        if !self.should_poll_market_intel() || self.market_intel_resource_state.is_loading() {
             return;
         }
         if self
@@ -4074,6 +4173,10 @@ impl App {
             return;
         }
         self.dispatch_market_intel_sync(MarketIntelSyncReason::Background);
+    }
+
+    fn should_poll_market_intel(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel
     }
 
     fn poll_matchbook_account(&mut self) {
@@ -4334,6 +4437,9 @@ impl App {
             self.status_scroll = 0;
         }
         self.clamp_selected_exchange_row();
+        if self.trading_section == TradingSection::Accounts {
+            self.seed_selected_exchange_row_from_snapshot();
+        }
         self.clamp_selected_open_position_row();
         self.clamp_selected_intel_row();
         self.clamp_selected_oddsmatcher_row();
@@ -4354,7 +4460,8 @@ impl App {
         self.owls_dashboard = owls::dashboard_for_sport(inferred_sport);
         self.owls_resource_state
             .finish_ok(self.owls_dashboard.clone());
-        self.clamp_selected_owls_endpoint();
+        self.align_owls_selection_for_section();
+        self.request_market_intel_sync(MarketIntelSyncReason::Background);
         if self.is_owls_context()
             || (self.trading_section == TradingSection::Positions && self.live_view_overlay_visible)
         {
@@ -4792,6 +4899,7 @@ impl App {
             overlay.time_in_force,
         )?;
         overlay.risk_report = preview.risk_report;
+        overlay.clear_backend_result();
         Ok(())
     }
 
@@ -4951,6 +5059,12 @@ impl App {
             .clone()
             .ok_or_else(|| color_eyre::eyre::eyre!("Trading action overlay is not open."))?;
         let stake = overlay.parsed_stake()?;
+        if overlay.seed.source == TradingActionSource::MarketIntel {
+            return self.execute_market_intel_action_via_backend(&overlay, stake);
+        }
+        if matches!(overlay.seed.venue, VenueId::Matchbook | VenueId::Betfair) {
+            return self.execute_overlay_action_via_backend(&overlay, stake);
+        }
         let request_id = new_trading_action_request_id(overlay.seed.source);
         let intent = overlay.seed.build_intent(
             &self.snapshot,
@@ -4967,6 +5081,130 @@ impl App {
             failure_context: String::from("Trading action failed"),
             event_message: Some(String::from("Trading action completed.")),
         });
+        Ok(())
+    }
+
+    fn execute_market_intel_action_via_backend(
+        &mut self,
+        overlay: &TradingActionOverlayState,
+        stake: f64,
+    ) -> Result<()> {
+        let match_id = overlay.seed.source_ref.trim();
+        if match_id.is_empty() {
+            return Err(color_eyre::eyre::eyre!(
+                "The selected Intel row is missing its backend match identifier."
+            ));
+        }
+
+        if overlay.mode == TradingActionMode::Review {
+            let response = execution_backend::review_execution(match_id, stake)?;
+            if let Some(current) = self.trading_action_overlay.as_mut() {
+                current.backend_gateway = Some(BackendExecutionOverlayState {
+                    gateway: response.gateway.kind,
+                    mode: response.gateway.mode,
+                    detail: response.gateway.detail,
+                    last_status: Some(response.review.status.clone()),
+                    last_detail: Some(response.review.detail.clone()),
+                    executable: Some(response.review.executable),
+                    accepted: None,
+                });
+            }
+            self.status_message = format!(
+                "Execution review {}: {}",
+                response.review.status, response.review.detail
+            );
+            self.status_scroll = 0;
+            self.record_event(format!("Execution review {}.", response.review.status));
+            return Ok(());
+        }
+
+        let response = execution_backend::submit_execution(match_id, stake)?;
+        if let Some(current) = self.trading_action_overlay.as_mut() {
+            current.backend_gateway = Some(BackendExecutionOverlayState {
+                gateway: response.gateway.kind,
+                mode: response.gateway.mode,
+                detail: response.gateway.detail,
+                last_status: Some(response.result.status.clone()),
+                last_detail: Some(response.result.detail.clone()),
+                executable: None,
+                accepted: Some(response.result.accepted),
+            });
+        }
+        self.status_message = format!(
+            "Execution submit {}: {}",
+            response.result.status, response.result.detail
+        );
+        self.status_scroll = 0;
+        self.record_event(format!("Execution submit {}.", response.result.status));
+        Ok(())
+    }
+
+    fn execute_overlay_action_via_backend(
+        &mut self,
+        overlay: &TradingActionOverlayState,
+        stake: f64,
+    ) -> Result<()> {
+        let price = overlay.seed.price_for_side(overlay.side).ok_or_else(|| {
+            color_eyre::eyre::eyre!("No executable price is available for this side.")
+        })?;
+        let request = execution_backend::AdhocExecutionRequest {
+            venue: overlay.seed.venue.as_str().to_string(),
+            side: match overlay.side {
+                TradingActionSide::Buy => String::from("back"),
+                TradingActionSide::Sell => String::from("lay"),
+            },
+            event_name: overlay.seed.event_name.clone(),
+            market_name: overlay.seed.market_name.clone(),
+            selection_name: overlay.seed.selection_name.clone(),
+            stake,
+            price,
+            event_url: overlay.seed.event_url.clone(),
+            deep_link_url: overlay.seed.deep_link_url.clone(),
+            event_ref: overlay.seed.betslip_event_id.clone(),
+            market_ref: overlay.seed.betslip_market_id.clone(),
+            selection_ref: overlay.seed.betslip_selection_id.clone(),
+        };
+
+        if overlay.mode == TradingActionMode::Review {
+            let response = execution_backend::review_adhoc_execution(&request)?;
+            if let Some(current) = self.trading_action_overlay.as_mut() {
+                current.backend_gateway = Some(BackendExecutionOverlayState {
+                    gateway: response.gateway.kind,
+                    mode: response.gateway.mode,
+                    detail: response.gateway.detail,
+                    last_status: Some(response.review.status.clone()),
+                    last_detail: Some(response.review.detail.clone()),
+                    executable: Some(response.review.executable),
+                    accepted: None,
+                });
+            }
+            self.status_message = format!(
+                "Execution review {}: {}",
+                response.review.status, response.review.detail
+            );
+            self.status_scroll = 0;
+            self.record_event(format!("Execution review {}.", response.review.status));
+            return Ok(());
+        }
+
+        let response = execution_backend::submit_adhoc_execution(&request)?;
+        if let Some(current) = self.trading_action_overlay.as_mut() {
+            current.backend_gateway = Some(BackendExecutionOverlayState {
+                gateway: response.gateway.kind,
+                mode: response.gateway.mode,
+                detail: response.gateway.detail,
+                last_status: Some(response.result.status.clone()),
+                last_detail: Some(response.result.detail.clone()),
+                executable: None,
+                accepted: Some(response.result.accepted),
+            });
+        }
+        self.status_message = format!(
+            "Execution submit {}: {}",
+            response.result.status, response.result.detail
+        );
+        self.status_scroll = 0;
+        self.record_event(format!("Execution submit {}.", response.result.status));
         Ok(())
     }
 
@@ -5301,12 +5539,127 @@ impl App {
             return;
         }
 
-        let Some(venue) = exchange_venue_from_bookmaker("", &row.exchange) else {
-            self.status_message =
-                String::from("The selected Intel row does not map to a supported exchange venue.");
-            return;
+        let (seed, backend_gateway) =
+            match self.build_market_intel_overlay_seed(&row).or_else(|error| {
+                warn!("market-intel execution plan unavailable, falling back to row seed: {error}");
+                self.build_market_intel_overlay_seed_legacy(&row)
+                    .map(|seed| (seed, None))
+            }) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.status_message = error.to_string();
+                    self.status_scroll = 0;
+                    return;
+                }
+            };
+
+        self.open_trading_action_overlay(seed);
+        if let (Some(gateway), Some(overlay)) =
+            (backend_gateway, self.trading_action_overlay.as_mut())
+        {
+            overlay.backend_gateway = Some(gateway);
+        }
+    }
+
+    fn build_market_intel_overlay_seed(
+        &self,
+        row: &IntelRow,
+    ) -> Result<(TradingActionSeed, Option<BackendExecutionOverlayState>)> {
+        let plan = execution_backend::fetch_execution_plan(&row.id)?;
+        let action = plan.plan.primary.clone();
+        let venue = exchange_venue_from_bookmaker("", &action.venue).ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "The backend execution venue '{}' is not mapped in operator-console.",
+                action.venue
+            )
+        })?;
+        let primary_mapping = plan
+            .opportunity
+            .venue_mappings
+            .iter()
+            .find(|mapping| mapping.venue.eq_ignore_ascii_case(&action.venue))
+            .cloned();
+        let (buy_price, sell_price, default_side) =
+            backend_action_prices(&action.side, action.price);
+        let mut seed = TradingActionSeed {
+            source: TradingActionSource::MarketIntel,
+            venue,
+            source_ref: row.id.clone(),
+            event_name: plan.opportunity.event_name.clone(),
+            market_name: plan.opportunity.market_name.clone(),
+            selection_name: plan.opportunity.selection_name.clone(),
+            event_url: primary_mapping
+                .as_ref()
+                .map(|mapping| mapping.event_url.clone())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| Some(row.route.clone()).filter(|value| !value.trim().is_empty())),
+            deep_link_url: Some(action.deep_link_url.clone())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    primary_mapping
+                        .as_ref()
+                        .map(|mapping| mapping.deep_link_url.clone())
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .or_else(|| {
+                    Some(row.deep_link_url.clone()).filter(|value| !value.trim().is_empty())
+                }),
+            betslip_event_id: primary_mapping
+                .as_ref()
+                .map(|mapping| mapping.event_ref.clone()),
+            betslip_market_id: primary_mapping
+                .as_ref()
+                .map(|mapping| mapping.market_ref.clone()),
+            betslip_selection_id: primary_mapping
+                .as_ref()
+                .map(|mapping| mapping.selection_ref.clone()),
+            buy_price,
+            sell_price,
+            default_side,
+            default_stake: action
+                .stake_hint
+                .or(plan.opportunity.stake_hint)
+                .or(row.liquidity.map(|liquidity| liquidity.min(25.0)))
+                .or(Some(10.0)),
+            source_context: TradingActionSourceContext {
+                market_status: row.status.clone(),
+                ..TradingActionSourceContext::default()
+            },
+            notes: vec![
+                format!("intel_source:{}", row.source.key()),
+                format!(
+                    "canonical_selection:{}",
+                    plan.opportunity.canonical.selection.id
+                ),
+                format!("gateway:{}:{}", plan.gateway.kind, plan.gateway.mode),
+                format!("bookmaker:{}", row.bookmaker),
+                plan.gateway.detail.clone(),
+                row.note.clone(),
+            ],
         };
-        let seed = TradingActionSeed {
+        seed.notes.retain(|note| !note.trim().is_empty());
+
+        Ok((
+            seed,
+            Some(BackendExecutionOverlayState {
+                gateway: plan.gateway.kind,
+                mode: plan.gateway.mode,
+                detail: plan.gateway.detail,
+                last_status: None,
+                last_detail: None,
+                executable: None,
+                accepted: None,
+            }),
+        ))
+    }
+
+    fn build_market_intel_overlay_seed_legacy(&self, row: &IntelRow) -> Result<TradingActionSeed> {
+        let venue = exchange_venue_from_bookmaker("", &row.exchange).ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "The selected Intel row does not map to a supported exchange venue."
+            )
+        })?;
+        Ok(TradingActionSeed {
             source: TradingActionSource::MarketIntel,
             venue,
             source_ref: row.id.clone(),
@@ -5331,12 +5684,11 @@ impl App {
             },
             notes: vec![
                 format!("intel_source:{}", row.source.key()),
+                String::from("gateway:fallback:legacy"),
                 format!("bookmaker:{}", row.bookmaker),
                 row.note.clone(),
             ],
-        };
-
-        self.open_trading_action_overlay(seed);
+        })
     }
 
     fn load_calculator_from_matcher_row(&mut self, row: OddsMatcherRow, source_name: &str) {
@@ -5470,6 +5822,7 @@ fn infer_problem_level(value: &str) -> NotificationLevel {
 fn pane_for_trading_section(section: TradingSection) -> PaneId {
     match section {
         TradingSection::Positions => PaneId::Positions,
+        TradingSection::Accounts => PaneId::Accounts,
         TradingSection::Markets => PaneId::Markets,
         TradingSection::Live => PaneId::Live,
         TradingSection::Props => PaneId::Props,
@@ -5485,6 +5838,7 @@ fn pane_for_trading_section(section: TradingSection) -> PaneId {
 fn trading_section_for_pane(pane: PaneId) -> TradingSection {
     match pane {
         PaneId::Positions => TradingSection::Positions,
+        PaneId::Accounts => TradingSection::Accounts,
         PaneId::History => TradingSection::Positions,
         PaneId::Markets => TradingSection::Markets,
         PaneId::Live => TradingSection::Live,
@@ -6751,6 +7105,20 @@ fn exchange_venue_from_bookmaker(code: &str, display_name: &str) -> Option<Venue
         Some(VenueId::Smarkets)
     } else {
         None
+    }
+}
+
+fn backend_action_prices(
+    side: &str,
+    price: Option<f64>,
+) -> (Option<f64>, Option<f64>, TradingActionSide) {
+    if side.eq_ignore_ascii_case("lay")
+        || side.eq_ignore_ascii_case("sell")
+        || side.eq_ignore_ascii_case("lose")
+    {
+        (None, price, TradingActionSide::Sell)
+    } else {
+        (price, None, TradingActionSide::Buy)
     }
 }
 
@@ -9227,6 +9595,80 @@ mod tests {
             .any(|quote| { quote.provider == "matchbook_api" && quote.price == Some(2.28) }));
         assert_eq!(app.snapshot.external_live_events.len(), 1);
         assert_eq!(app.snapshot.open_positions[0].live_clock, "45:00");
+    }
+
+    #[test]
+    fn accounts_section_seeds_selected_exchange_row_from_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let mut snapshot = sample_snapshot("snapshot");
+        snapshot.venues = vec![
+            VenueSummary {
+                id: VenueId::Smarkets,
+                label: String::from("smarkets"),
+                status: VenueStatus::Connected,
+                detail: String::from("watcher"),
+                event_count: 2,
+                market_count: 4,
+            },
+            VenueSummary {
+                id: VenueId::Betway,
+                label: String::from("betway"),
+                status: VenueStatus::Connected,
+                detail: String::from("live"),
+                event_count: 3,
+                market_count: 6,
+            },
+        ];
+        snapshot.selected_venue = Some(VenueId::Betway);
+        app.exchange_list_state.select(None);
+        app.replace_snapshot(snapshot);
+
+        app.set_trading_section(TradingSection::Accounts);
+
+        assert_eq!(app.selected_exchange_row(), Some(1));
+        assert_eq!(app.selected_venue(), Some(VenueId::Betway));
+    }
+
+    #[test]
+    fn soccer_live_section_prefers_scores_endpoint() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.set_owls_dashboard_for_test(owls::dashboard_for_sport("soccer"));
+        app.set_trading_section(TradingSection::Live);
+
+        assert_eq!(
+            app.selected_owls_endpoint_id(),
+            Some(OwlsEndpointId::ScoresSport)
+        );
     }
 
     #[test]

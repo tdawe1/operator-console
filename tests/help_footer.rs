@@ -1,5 +1,5 @@
 use color_eyre::Result;
-use operator_console::app::App;
+use operator_console::app::{App, Panel};
 use operator_console::domain::{
     ExchangePanelSnapshot, VenueId, VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
 };
@@ -47,6 +47,7 @@ fn status_bar_renders_latest_timestamp_and_compact_error_summary() {
         snapshot: sample_snapshot("Recorder start failed: watcher timed out"),
     })
     .expect("app should load snapshot");
+    app.set_active_panel(Panel::Observability);
     let backend = TestBackend::new(120, 20);
     let mut terminal = Terminal::new(backend).expect("terminal");
 
@@ -67,6 +68,7 @@ fn status_bar_renders_latest_timestamp_and_compact_error_summary() {
     let rendered = lines.join("\n");
 
     assert!(rendered.contains("latest"));
+    assert!(rendered.contains("Recorder start failed"));
     assert!(
         rendered.contains("No recent errors")
             || rendered.contains("issue")

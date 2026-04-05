@@ -25,6 +25,7 @@ impl Panel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingSection {
     Positions,
+    Accounts,
     Markets,
     Live,
     Props,
@@ -37,8 +38,9 @@ pub enum TradingSection {
 }
 
 impl TradingSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Positions,
+        Self::Accounts,
         Self::Markets,
         Self::Live,
         Self::Props,
@@ -53,6 +55,7 @@ impl TradingSection {
     pub fn label(self) -> &'static str {
         match self {
             Self::Positions => "Positions",
+            Self::Accounts => "Accounts",
             Self::Markets => "Markets",
             Self::Live => "Live",
             Self::Props => "Props",
@@ -100,6 +103,7 @@ impl IntelView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntelSource {
+    Owls,
     OddsEntry,
     FairOdds,
     OddsApi,
@@ -108,6 +112,7 @@ pub enum IntelSource {
 impl IntelSource {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Owls => "Owls",
             Self::OddsEntry => "OddsEntry",
             Self::FairOdds => "FairOdds",
             Self::OddsApi => "The Odds API",
@@ -116,6 +121,7 @@ impl IntelSource {
 
     pub fn key(self) -> &'static str {
         match self {
+            Self::Owls => "owls",
             Self::OddsEntry => "oddsentry",
             Self::FairOdds => "fairodds",
             Self::OddsApi => "odds_api",
@@ -420,6 +426,18 @@ pub struct TradingActionOverlayState {
     pub editing: bool,
     pub buffer: String,
     pub replace_on_input: bool,
+    pub backend_gateway: Option<BackendExecutionOverlayState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendExecutionOverlayState {
+    pub gateway: String,
+    pub mode: String,
+    pub detail: String,
+    pub last_status: Option<String>,
+    pub last_detail: Option<String>,
+    pub executable: Option<bool>,
+    pub accepted: Option<bool>,
 }
 
 impl TradingActionOverlayState {
@@ -437,6 +455,7 @@ impl TradingActionOverlayState {
             selected_field: TradingActionField::Stake,
             editing: false,
             replace_on_input: true,
+            backend_gateway: None,
         }
     }
 
@@ -470,6 +489,15 @@ impl TradingActionOverlayState {
 
     pub fn can_cycle_side(&self) -> bool {
         self.seed.buy_price.is_some() && self.seed.sell_price.is_some()
+    }
+
+    pub fn clear_backend_result(&mut self) {
+        if let Some(state) = self.backend_gateway.as_mut() {
+            state.last_status = None;
+            state.last_detail = None;
+            state.executable = None;
+            state.accepted = None;
+        }
     }
 }
 

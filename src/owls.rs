@@ -11,6 +11,7 @@ use color_eyre::eyre::{eyre, Result, WrapErr};
 use futures_util::FutureExt;
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
+use reqwest::Url;
 use rust_socketio::{asynchronous::ClientBuilder as SocketClientBuilder, Payload, TransportType};
 use serde_json::Value;
 
@@ -30,6 +31,7 @@ const WARM_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const COOL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const COLD_SYNC_INTERVAL: Duration = Duration::from_secs(120);
 const BACKGROUND_SYNC_BATCH: usize = 3;
+const MANUAL_SYNC_BATCH: usize = 6;
 pub const SUPPORTED_SPORTS: &[&str] = &[
     "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "soccer", "epl", "mma", "tennis", "cs2",
 ];
@@ -741,9 +743,11 @@ fn due_endpoint_ids(
     focused: Option<OwlsEndpointId>,
 ) -> Vec<OwlsEndpointId> {
     if matches!(reason, OwlsSyncReason::Manual) {
-        return dashboard
-            .endpoints
-            .iter()
+        let mut prioritized = dashboard.endpoints.iter().collect::<Vec<_>>();
+        prioritized.sort_by_key(|endpoint| manual_priority(endpoint, focused));
+        return prioritized
+            .into_iter()
+            .take(MANUAL_SYNC_BATCH)
             .map(|endpoint| endpoint.id)
             .collect();
     }
@@ -759,6 +763,19 @@ fn due_endpoint_ids(
         .take(BACKGROUND_SYNC_BATCH)
         .map(|endpoint| endpoint.id)
         .collect()
+}
+
+fn manual_priority(
+    endpoint: &OwlsEndpointSummary,
+    focused: Option<OwlsEndpointId>,
+) -> (usize, usize, usize) {
+    let focus_rank = if focused == Some(endpoint.id) { 0 } else { 1 };
+    let freshness_rank = if endpoint.last_checked_at.is_none() {
+        0
+    } else {
+        1
+    };
+    (focus_rank, group_rank(endpoint.group), freshness_rank)
 }
 
 fn endpoint_due(
@@ -2254,6 +2271,12 @@ async fn fetch_realtime_payload_async(
     }
 }
 
+fn socketio_connect_url(base_url: &str, api_key: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).wrap_err("invalid Owls Socket.IO base URL")?;
+    url.query_pairs_mut().append_pair("apiKey", api_key);
+    Ok(url.to_string())
+}
+
 async fn fetch_socketio_realtime_payload(
     base_url: &str,
     api_key: &str,
@@ -2262,16 +2285,12 @@ async fn fetch_socketio_realtime_payload(
     let sport = sport.to_string();
     let payload_cell = Arc::new(Mutex::new(None::<Value>));
     let error_cell = Arc::new(Mutex::new(None::<String>));
+    let socket_url = socketio_connect_url(base_url, api_key)?;
 
-    let mut builder = SocketClientBuilder::new(format!(
-        "{}?apiKey={}",
-        base_url.trim_end_matches('/'),
-        api_key
-    ))
-    .transport_type(TransportType::Websocket)
-    .opening_header("Authorization", format!("Bearer {api_key}"))
-    .reconnect(false)
-    .namespace("/");
+    let mut builder = SocketClientBuilder::new(socket_url)
+        .transport_type(TransportType::Websocket)
+        .reconnect(false)
+        .namespace("/");
 
     for event_name in ["odds-update", "pinnacle-realtime", "ps3838-realtime"] {
         let payload_cell = Arc::clone(&payload_cell);
@@ -2320,7 +2339,6 @@ async fn fetch_socketio_realtime_payload(
             "subscribe",
             serde_json::json!({
                 "sports": [sport],
-                "books": ["pinnacle", "ps3838"],
                 "alternates": true
             }),
         )
@@ -2349,6 +2367,7 @@ async fn fetch_socketio_realtime_payload(
     Err(eyre!("socket.io timed out waiting for realtime payload"))
 }
 
+#[allow(deprecated)]
 fn first_json_value(payload: Payload) -> Option<Value> {
     match payload {
         Payload::Text(values) => values.into_iter().next(),
@@ -2357,6 +2376,7 @@ fn first_json_value(payload: Payload) -> Option<Value> {
     }
 }
 
+#[allow(deprecated)]
 fn payload_debug_string(payload: Payload) -> String {
     match payload {
         Payload::Text(values) => serde_json::to_string(&values)
@@ -3789,6 +3809,39 @@ mod tests {
 
         assert_eq!(due_ids.len(), BACKGROUND_SYNC_BATCH);
         assert!(due_ids.contains(&OwlsEndpointId::Realtime));
+    }
+
+    #[test]
+    fn manual_sync_is_batched_and_prioritizes_the_focused_endpoint() {
+        let dashboard = OwlsDashboard::default();
+
+        let due_ids = due_endpoint_ids(
+            &dashboard,
+            OwlsSyncReason::Manual,
+            Some(OwlsEndpointId::HistoryGames),
+        );
+
+        assert_eq!(due_ids.len(), 6);
+        assert_eq!(due_ids.first(), Some(&OwlsEndpointId::HistoryGames));
+    }
+
+    #[test]
+    fn socketio_connect_url_preserves_existing_query_and_adds_api_key() {
+        let url = socketio_connect_url(
+            "https://api.owlsinsight.com/socket.io?transport=websocket",
+            "secret:value",
+        )
+        .expect("socket url");
+
+        let parsed = Url::parse(&url).expect("parsed url");
+        let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
+
+        assert!(query_pairs
+            .iter()
+            .any(|(key, value)| { key == "transport" && value == "websocket" }));
+        assert!(query_pairs
+            .iter()
+            .any(|(key, value)| { key == "apiKey" && value == "secret:value" }));
     }
 
     #[test]

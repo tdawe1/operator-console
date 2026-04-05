@@ -163,6 +163,10 @@ fn render_pane(frame: &mut Frame<'_>, area: Rect, app: &mut App, pane_id: PaneId
                 status_scroll,
             )
         }
+        PaneId::Accounts => {
+            let snapshot = app.snapshot().clone();
+            panels::exchanges::render(frame, content_area, &snapshot, app.exchange_list_state())
+        }
         PaneId::History => {
             let PositionsRenderState {
                 snapshot,
@@ -516,24 +520,14 @@ fn render_footer_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let [status_area, error_area] =
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
+    let worker = worker_status_label(app);
+    let refresh_kind = refresh_kind_label(app);
+    let latest_status = footer_status_detail(app, status_area.width);
 
     let line = Paragraph::new(Line::from(vec![
-        Span::styled(
-            worker_status_label(app),
-            Style::default().fg(worker_status_color(app)),
-        ),
+        Span::styled(worker, Style::default().fg(worker_status_color(app))),
         Span::styled(" | ", Style::default().fg(muted_text())),
-        Span::styled(
-            format!("positions {}", app.snapshot().open_positions.len()),
-            Style::default().fg(text_color()),
-        ),
-        Span::styled(" | ", Style::default().fg(muted_text())),
-        Span::styled(
-            format!("decisions {}", app.snapshot().decisions.len()),
-            Style::default().fg(text_color()),
-        ),
-        Span::styled(" | ", Style::default().fg(muted_text())),
-        Span::styled(refresh_kind_label(app), Style::default().fg(accent_gold())),
+        Span::styled(refresh_kind, Style::default().fg(accent_gold())),
         Span::styled(" | ", Style::default().fg(muted_text())),
         Span::styled(
             fresh,
@@ -545,6 +539,8 @@ fn render_footer_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::styled(" | ", Style::default().fg(muted_text())),
         Span::styled(last_refresh_label(app), Style::default().fg(muted_text())),
+        Span::styled(" | ", Style::default().fg(muted_text())),
+        Span::styled(latest_status, Style::default().fg(text_color())),
     ]))
     .style(Style::default().bg(shell_background()));
     frame.render_widget(line, status_area);
@@ -1027,6 +1023,16 @@ fn last_refresh_label(app: &App) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| String::from("unknown"))
+}
+
+fn footer_status_detail(app: &App, width: u16) -> String {
+    let worker = worker_status_label(app);
+    let refresh_kind = refresh_kind_label(app);
+    let last_refresh = last_refresh_label(app);
+    let reserved =
+        worker.chars().count() + refresh_kind.chars().count() + last_refresh.chars().count() + 15;
+    let max_chars = usize::from(width).saturating_sub(reserved).max(12);
+    truncate_line(app.status_message(), max_chars)
 }
 
 fn worker_status_label(app: &App) -> String {

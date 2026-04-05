@@ -16,7 +16,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let model = build_chart_model(app);
-    let shell = section_block("Price Chart", accent_blue());
+    let shell = section_block("Market Chart", accent_blue());
     let inner = shell.inner(area);
     frame.render_widget(shell, area);
 
@@ -112,15 +112,10 @@ fn chart_from_intel_history(app: &App) -> Option<ChartModel> {
 
 fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
     let endpoint = app.selected_owls_endpoint()?;
-    let mut quotes = endpoint
-        .quotes
-        .iter()
-        .filter_map(|quote| quote.decimal_price.map(|price| (quote, price)))
-        .collect::<Vec<_>>();
+    let quotes = top_chart_quotes(endpoint, 12);
     if quotes.len() < 2 {
         return None;
     }
-    quotes.sort_by(|left, right| right.1.total_cmp(&left.1));
 
     let price_points = quotes
         .iter()
@@ -376,7 +371,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 }
 
 fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Price Area", accent_blue());
+    let block = section_block("Curve", accent_blue());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 4 {
@@ -600,6 +595,32 @@ fn render_market_ladder(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     .wrap(Wrap { trim: true })
     .style(Style::default().bg(panel_background()));
     frame.render_widget(center, center_area);
+}
+
+fn top_chart_quotes(
+    endpoint: &crate::owls::OwlsEndpointSummary,
+    limit: usize,
+) -> Vec<(&crate::owls::OwlsMarketQuote, f64)> {
+    let mut top = Vec::new();
+    for quote in endpoint
+        .quotes
+        .iter()
+        .filter_map(|quote| quote.decimal_price.map(|price| (quote, price)))
+    {
+        let insert_at = top
+            .iter()
+            .position(|existing: &(&crate::owls::OwlsMarketQuote, f64)| existing.1 < quote.1)
+            .unwrap_or(top.len());
+        if insert_at < limit {
+            top.insert(insert_at, quote);
+            if top.len() > limit {
+                top.pop();
+            }
+        } else if top.len() < limit {
+            top.push(quote);
+        }
+    }
+    top
 }
 
 fn render_ladder_table(

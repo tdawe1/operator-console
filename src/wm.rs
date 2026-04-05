@@ -26,6 +26,7 @@ pub enum NavDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PaneId {
     Positions,
+    Accounts,
     History,
     Markets,
     Live,
@@ -44,6 +45,7 @@ impl PaneId {
     pub fn title(self) -> &'static str {
         match self {
             Self::Positions => "Live Orders",
+            Self::Accounts => "Accounts",
             Self::History => "History",
             Self::Markets => "Markets",
             Self::Live => "Live",
@@ -451,7 +453,14 @@ impl WindowManager {
                 root: split(
                     SplitDirection::Horizontal,
                     vec![34, 66],
-                    vec![pane(PaneId::Recorder), pane(PaneId::Observability)],
+                    vec![
+                        split(
+                            SplitDirection::Vertical,
+                            vec![46, 54],
+                            vec![pane(PaneId::Accounts), pane(PaneId::Recorder)],
+                        ),
+                        pane(PaneId::Observability),
+                    ],
                 ),
                 minimized: vec![PaneId::Alerts],
                 emphasized_pane: None,

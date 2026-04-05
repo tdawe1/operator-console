@@ -56,6 +56,15 @@ fn markets_panel_renders_api_surface_board() {
 }
 
 #[test]
+fn accounts_panel_renders_venue_board() {
+    let rendered = render_section(TradingSection::Accounts);
+
+    assert!(rendered.contains("Venue Board"));
+    assert!(rendered.contains("Accounts"));
+    assert!(rendered.contains("Selected Venue"));
+}
+
+#[test]
 fn chart_pane_renders_market_curve() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: sample_snapshot(),

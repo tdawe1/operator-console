@@ -37,6 +37,7 @@ The console currently exposes two top-level workspaces:
 The active pane set includes:
 
 - `Live Orders`
+- `Accounts`
 - `History`
 - `Markets`
 - `Live`
@@ -115,6 +116,7 @@ Useful options:
 ## Operator Notes
 
 - The in-app keymap overlay is the source of truth for navigation keys.
+- `Trading > Accounts` is the venue-selection surface. Selecting a non-`smarkets` venue updates focus immediately; use `r` or `R` when you want a fresh live recapture.
 - Recorder lifecycle controls are available from the `Recorder` pane.
 - Market-intel data is read from `sabisabi`; recorder data is still a fallback/legacy path where adaptor-backed ingestion is not available.
 

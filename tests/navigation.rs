@@ -163,7 +163,13 @@ fn trading_section_navigation_cycles_inside_trading_module() {
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
 
     app.next_section();
+    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
+
+    app.next_section();
     assert_eq!(app.active_trading_section(), TradingSection::Markets);
+
+    app.previous_section();
+    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
 
     app.previous_section();
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
@@ -193,6 +199,18 @@ fn plain_horizontal_arrows_do_not_switch_sections() {
 
     app.handle_key(KeyCode::Left);
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
+}
+
+#[test]
+fn market_intel_polling_stays_idle_outside_intel_section() {
+    let mut app = App::default();
+    let _ = app.wait_for_async_idle(Duration::from_millis(200));
+    app.set_market_intel_dashboard_for_test(MarketIntelDashboard::default());
+    app.set_trading_section(TradingSection::Positions);
+
+    app.poll_market_intel_for_test();
+
+    assert_eq!(app.market_intel_phase(), "ready");
 }
 
 #[test]
