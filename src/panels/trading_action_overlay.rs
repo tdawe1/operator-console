@@ -189,6 +189,54 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if overlay.seed.venue == crate::domain::VenueId::Matchbook {
         risk_lines.extend(matchbook_context_lines(app, overlay));
     }
+    if let Some(backend) = overlay.backend_gateway.as_ref() {
+        risk_lines.push(Line::raw(""));
+        risk_lines.push(Line::from(vec![
+            Span::styled("Backend ", Style::default().fg(accent_blue())),
+            Span::styled(
+                format!("{} ({})", backend.gateway, backend.mode),
+                Style::default()
+                    .fg(text_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        risk_lines.push(Line::from(Span::styled(
+            backend.detail.clone(),
+            Style::default().fg(muted_text()),
+        )));
+        if let Some(status) = backend.last_status.as_ref() {
+            risk_lines.push(Line::from(vec![
+                Span::styled("Result ", Style::default().fg(accent_gold())),
+                Span::styled(status.clone(), Style::default().fg(text_color())),
+            ]));
+        }
+        if let Some(detail) = backend.last_detail.as_ref() {
+            risk_lines.push(Line::from(Span::styled(
+                detail.clone(),
+                Style::default().fg(muted_text()),
+            )));
+        }
+        if let Some(executable) = backend.executable {
+            risk_lines.push(Line::from(Span::styled(
+                format!("Executable: {}", if executable { "yes" } else { "no" }),
+                Style::default().fg(if executable {
+                    accent_green()
+                } else {
+                    accent_gold()
+                }),
+            )));
+        }
+        if let Some(accepted) = backend.accepted {
+            risk_lines.push(Line::from(Span::styled(
+                format!("Accepted: {}", if accepted { "yes" } else { "no" }),
+                Style::default().fg(if accepted {
+                    accent_green()
+                } else {
+                    accent_red()
+                }),
+            )));
+        }
+    }
     risk_lines.extend([
         Line::raw(""),
         Line::from(Span::styled(

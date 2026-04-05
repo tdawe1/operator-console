@@ -357,13 +357,15 @@ fn worker_backed_provider_maps_execute_trading_action_request() {
 
     provider
         .handle(ProviderRequest::ExecuteTradingAction {
-            intent: intent.clone(),
+            intent: Box::new(intent.clone()),
         })
         .expect("execute trading action should serialize");
 
     assert_eq!(
         *last_request.lock().expect("lock"),
-        Some(WorkerRequest::ExecuteTradingAction { intent })
+        Some(WorkerRequest::ExecuteTradingAction {
+            intent: Box::new(intent),
+        })
     );
 }
 
@@ -393,12 +395,14 @@ fn worker_backed_provider_maps_load_horse_matcher_request() {
 
     provider
         .handle(ProviderRequest::LoadHorseMatcher {
-            query: query.clone(),
+            query: Box::new(query.clone()),
         })
         .expect("load horse matcher should serialize");
 
     assert_eq!(
         *last_request.lock().expect("lock"),
-        Some(WorkerRequest::LoadHorseMatcher { query })
+        Some(WorkerRequest::LoadHorseMatcher {
+            query: Box::new(query),
+        })
     );
 }

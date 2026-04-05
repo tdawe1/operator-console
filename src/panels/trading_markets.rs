@@ -502,17 +502,7 @@ fn render_quote_ladder(
     section: TradingSection,
     endpoint: &OwlsEndpointSummary,
 ) {
-    let mut quotes = endpoint
-        .quotes
-        .iter()
-        .filter(|quote| quote.decimal_price.is_some())
-        .collect::<Vec<_>>();
-    quotes.sort_by(|left, right| {
-        right
-            .decimal_price
-            .partial_cmp(&left.decimal_price)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let quotes = top_market_quotes(endpoint, 8);
 
     let [left, center, right] = Layout::horizontal([
         Constraint::Percentage(42),
@@ -609,6 +599,35 @@ fn render_quote_ladder(
     .column_spacing(1)
     .block(section_block("Field", accent_gold()));
     frame.render_widget(right_table, right);
+}
+
+fn top_market_quotes(
+    endpoint: &OwlsEndpointSummary,
+    limit: usize,
+) -> Vec<&crate::owls::OwlsMarketQuote> {
+    let mut top = Vec::new();
+    for quote in endpoint
+        .quotes
+        .iter()
+        .filter(|quote| quote.decimal_price.is_some())
+    {
+        let price = quote.decimal_price.unwrap_or_default();
+        let insert_at = top
+            .iter()
+            .position(|existing: &&crate::owls::OwlsMarketQuote| {
+                existing.decimal_price.unwrap_or_default() < price
+            })
+            .unwrap_or(top.len());
+        if insert_at < limit {
+            top.insert(insert_at, quote);
+            if top.len() > limit {
+                top.pop();
+            }
+        } else if top.len() < limit {
+            top.push(quote);
+        }
+    }
+    top
 }
 
 fn ladder_row(quote: &crate::owls::OwlsMarketQuote) -> Row<'static> {

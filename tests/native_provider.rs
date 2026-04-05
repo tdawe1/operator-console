@@ -282,7 +282,10 @@ fn native_provider_executes_review_action_in_rust_and_records_markers() -> Resul
     );
 
     let snapshot = provider.handle(ProviderRequest::ExecuteTradingAction {
-        intent: sample_trading_intent(TradingActionMode::Review, TradingTimeInForce::GoodTilCancel),
+        intent: Box::new(sample_trading_intent(
+            TradingActionMode::Review,
+            TradingTimeInForce::GoodTilCancel,
+        )),
     })?;
 
     assert_eq!(snapshot.worker.status, WorkerStatus::Ready);
@@ -346,7 +349,10 @@ fn native_provider_executes_confirm_action_in_rust() -> Result<()> {
     );
 
     let snapshot = provider.handle(ProviderRequest::ExecuteTradingAction {
-        intent: sample_trading_intent(TradingActionMode::Confirm, TradingTimeInForce::FillOrKill),
+        intent: Box::new(sample_trading_intent(
+            TradingActionMode::Confirm,
+            TradingTimeInForce::FillOrKill,
+        )),
     })?;
 
     assert_eq!(snapshot.worker.status, WorkerStatus::Ready);
@@ -405,7 +411,7 @@ fn native_provider_routes_matchbook_actions_to_api_runner() -> Result<()> {
     );
 
     let snapshot = provider.handle(ProviderRequest::ExecuteTradingAction {
-        intent: sample_api_trading_intent(),
+        intent: Box::new(sample_api_trading_intent()),
     })?;
 
     assert!(snapshot.status_line.contains("Matchbook review ready"));
