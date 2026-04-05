@@ -196,7 +196,7 @@ fn source_mode(snapshot: &ExchangePanelSnapshot, recorder_status: &RecorderStatu
         "stub/demo"
     } else if *recorder_status == RecorderStatus::Running || snapshot.worker.name == "bet-recorder"
     {
-        "recorder-backed"
+        "legacy-capture"
     } else {
         "provider-backed"
     }

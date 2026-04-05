@@ -15,7 +15,7 @@ It is the main operator-facing frontend for positions, calculators, matchers, re
 
 - Trading-focused operator UX
 - Panel routing, keyboard flow, and persisted local UI state
-- Rendering recorder-backed positions, stats, matcher, calculator, and observability views
+- Rendering provider-backed positions, stats, matcher, calculator, and observability views
 
 ## Integrates With
 

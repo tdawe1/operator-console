@@ -5,8 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table,
-    Wrap,
+    Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 
@@ -275,7 +274,7 @@ fn render_venue_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePane
     if snapshot.venues.is_empty() {
         let body = Paragraph::new(vec![
             Line::raw("No venue summaries loaded."),
-            Line::raw("Refresh the provider or start the recorder-backed source."),
+            Line::raw("Refresh the provider or start the configured capture source."),
         ])
         .block(section_block("󰀶 Venue Split", accent_cyan()))
         .wrap(Wrap { trim: true });
@@ -764,7 +763,7 @@ fn render_matchbook_table(
     if rows.is_empty() {
         let body = Paragraph::new(vec![
             Line::raw("No tracked activity loaded."),
-            Line::raw("Recorder and ledger imports will populate this board."),
+            Line::raw("Capture backfills and ledger imports will populate this board."),
         ])
         .block(section_block("󰋼 Tracked Mix", accent_green()))
         .wrap(Wrap { trim: true });
