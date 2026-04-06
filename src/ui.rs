@@ -693,11 +693,11 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled("Movement", Style::default().add_modifier(Modifier::BOLD)),
-            Line::raw("Alt+1-3 switch workspaces"),
+            Line::raw("1-3 and Alt+1-3 switch workspaces"),
             Line::raw("h/j/k/l focus panes"),
-            Line::raw("arrows navigate inside pane"),
+            Line::raw("Left/Right switch sections"),
+            Line::raw("Up/Down navigate inside pane"),
             Line::raw("Alt+arrows also focus panes"),
-            Line::raw("Ctrl+Left/Right switch sections"),
         ])
         .block(shell_block("󰹑 Navigation", accent_cyan()))
         .wrap(Wrap { trim: true }),
@@ -709,6 +709,7 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Line::styled("Actions", Style::default().add_modifier(Modifier::BOLD)),
             Line::raw("enter open/edit/apply"),
             Line::raw("tab rotate pane tool/view"),
+            Line::raw("shift+tab reverse where supported"),
             Line::raw("p place action"),
             Line::raw("a manual position"),
             Line::raw("c cash out first actionable"),
@@ -737,11 +738,11 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(vec![
             Line::styled("Global", Style::default().add_modifier(Modifier::BOLD)),
             Line::raw("? keymap"),
-            Line::raw("n error console"),
+            Line::raw("n problems / events"),
+            Line::raw("f maximize pane"),
             Line::raw("o observability"),
             Line::raw("s start recorder"),
             Line::raw("x stop recorder"),
-            Line::raw("Alt+f maximize"),
             Line::raw("q quit"),
             Line::raw("esc cancel"),
             Line::raw("b cycle calc type"),

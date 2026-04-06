@@ -10,6 +10,10 @@ impl MarketIntelSourceId {
         Self(normalize_market_intel_source_key(&value.into()))
     }
 
+    pub fn owls() -> Self {
+        Self::new("owls")
+    }
+
     pub fn oddsentry() -> Self {
         Self::new("oddsentry")
     }
@@ -24,6 +28,7 @@ impl MarketIntelSourceId {
 
     pub fn label(&self) -> &str {
         match self.key() {
+            "owls" => "Owls",
             "oddsentry" => "Oddsentry",
             "fair_odds" => "FairOdds",
             "odds_api" => "The Odds API",
@@ -38,6 +43,7 @@ impl MarketIntelSourceId {
 
 fn normalize_market_intel_source_key(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
+        "owls" | "owlsinsight" | "owls_insight" => String::from("owls"),
         "oddsapi" | "odds_api" | "the-odds-api" => String::from("odds_api"),
         "fairodds" | "fair_odds" => String::from("fair_odds"),
         "oddsentry" => String::from("oddsentry"),
@@ -377,6 +383,91 @@ pub struct MarketIntelDashboard {
     pub drops: Vec<MarketOpportunityRow>,
     pub value: Vec<MarketOpportunityRow>,
     pub event_detail: Option<MarketEventDetail>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorActiveResponse {
+    pub refreshed_at: String,
+    pub generated_at: String,
+    pub summary: OperatorSummary,
+    pub matches: Vec<OperatorMatchOpportunity>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorSummary {
+    pub total_matches: usize,
+    pub live_matches: usize,
+    pub arbitrage_matches: usize,
+    pub positive_ev_matches: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorMatchOpportunity {
+    pub id: String,
+    pub source: MarketIntelSourceId,
+    pub kind: OpportunityKind,
+    pub event_id: String,
+    pub sport: String,
+    pub competition_name: String,
+    pub event_name: String,
+    pub market_name: String,
+    pub selection_name: String,
+    pub is_live: bool,
+    pub live_status: Option<String>,
+    pub start_time: String,
+    pub updated_at: String,
+    pub edge_percent: Option<f64>,
+    pub arbitrage_margin: Option<f64>,
+    pub fair_price: Option<f64>,
+    pub stake_hint: Option<f64>,
+    #[serde(default)]
+    pub quotes: Vec<OperatorMatchQuote>,
+    pub execution_plan: OperatorExecutionPlan,
+    pub strategy: OperatorStrategyRecommendation,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorMatchQuote {
+    pub source: MarketIntelSourceId,
+    pub venue: String,
+    pub selection_name: String,
+    pub side: String,
+    pub price: Option<f64>,
+    pub fair_price: Option<f64>,
+    pub liquidity: Option<f64>,
+    pub updated_at: String,
+    pub is_sharp: bool,
+    pub deep_link_url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorExecutionPlan {
+    pub executor: String,
+    pub status: String,
+    pub primary: OperatorExecutionAction,
+    pub secondary: Option<OperatorExecutionAction>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorExecutionAction {
+    pub venue: String,
+    pub selection_name: String,
+    pub side: String,
+    pub price: Option<f64>,
+    pub stake_hint: Option<f64>,
+    pub deep_link_url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OperatorStrategyRecommendation {
+    pub action: String,
+    pub confidence: String,
+    pub summary: String,
+    pub stale: bool,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 impl MarketIntelDashboard {

@@ -1,5 +1,6 @@
 mod models;
 
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
@@ -11,7 +12,9 @@ use reqwest::blocking::Client;
 pub use models::{
     MarketEventDetail, MarketHistoryPoint, MarketIntelCalculatorSeed, MarketIntelDashboard,
     MarketIntelSourceId, MarketIntelTradingSeed, MarketOpportunityRow, MarketQuoteComparisonRow,
-    OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
+    OperatorActiveResponse, OperatorExecutionAction, OperatorMatchOpportunity, OperatorMatchQuote,
+    OperatorStrategyRecommendation, OpportunityKind, SourceHealth, SourceHealthStatus,
+    SourceLoadMode,
 };
 
 const SABISABI_BASE_URL_ENV: &str = "SABISABI_BASE_URL";
@@ -53,7 +56,7 @@ fn load_dashboard_via_backend(
     if refresh {
         refresh_backend_dashboard(&client, &base_url)?;
     }
-    query_backend_dashboard(&client, &base_url, sport_key)
+    query_backend_operator_active(&client, &base_url, sport_key)
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -90,15 +93,15 @@ fn refresh_backend_dashboard(client: &Client, base_url: &str) -> color_eyre::Res
     Ok(())
 }
 
-fn query_backend_dashboard(
+fn query_backend_operator_active(
     client: &Client,
     base_url: &str,
     sport_key: Option<&str>,
 ) -> color_eyre::Result<MarketIntelDashboard> {
-    let path = "/api/v1/query/market-intel/dashboard";
+    let path = "/api/v1/query/operator/active";
     let mut request = client.get(format!("{}{}", base_url.trim_end_matches('/'), path));
     if let Some(sport_key) = sport_key.map(str::trim).filter(|value| !value.is_empty()) {
-        request = request.query(&[("sport_key", sport_key)]);
+        request = request.query(&[("sport", sport_key)]);
     }
     let response = request
         .send()
@@ -109,12 +112,170 @@ fn query_backend_dashboard(
         .wrap_err("failed to read market-intel dashboard response body")?;
     if !status.is_success() {
         return Err(eyre!(
-            "HTTP {} during market-intel query: {}",
+            "HTTP {} during operator-active query: {}",
             status.as_u16(),
             truncate(&payload, 160)
         ));
     }
-    serde_json::from_str(&payload).wrap_err("failed to decode market-intel dashboard response")
+    let active: OperatorActiveResponse =
+        serde_json::from_str(&payload).wrap_err("failed to decode operator-active response")?;
+    Ok(operator_active_to_dashboard(active))
+}
+
+fn operator_active_to_dashboard(active: OperatorActiveResponse) -> MarketIntelDashboard {
+    let mut dashboard = MarketIntelDashboard {
+        refreshed_at: active.refreshed_at.clone(),
+        status_line: format!(
+            "Operator active: {} matches, {} live, {} arbs, {} +EV.",
+            active.summary.total_matches,
+            active.summary.live_matches,
+            active.summary.arbitrage_matches,
+            active.summary.positive_ev_matches
+        ),
+        total_events: active.matches.iter().map(|m| m.event_id.clone()).collect::<HashSet<_>>().len(),
+        total_opportunities: active.summary.total_matches,
+        ..MarketIntelDashboard::default()
+    };
+
+    for item in active.matches {
+        let row = operator_match_to_row(item);
+        match row.kind {
+            OpportunityKind::Arbitrage => dashboard.arbitrages.push(row),
+            OpportunityKind::PositiveEv => dashboard.plus_ev.push(row),
+            OpportunityKind::Drop => dashboard.drops.push(row),
+            OpportunityKind::Value => dashboard.value.push(row),
+            OpportunityKind::Market => dashboard.markets.push(row),
+        }
+    }
+
+    dashboard
+}
+
+fn operator_match_to_row(item: OperatorMatchOpportunity) -> MarketOpportunityRow {
+    let primary_quote = item.execution_plan.primary.clone();
+    let secondary_quote = item.execution_plan.secondary.clone();
+    let mut quotes = item
+        .quotes
+        .iter()
+        .cloned()
+        .map(|mut quote| {
+            let mut row = operator_quote_to_quote_row(quote, item.is_live);
+            // Populate missing fields from parent context
+            row.event_id = item.event_id.clone();
+            row.event_name = item.event_name.clone();
+            row.market_name = item.market_name.clone();
+            row
+        })
+        .collect::<Vec<_>>();
+
+    if quotes.is_empty() {
+        quotes.push(execution_action_to_quote_row(&item, &primary_quote, false));
+        if let Some(secondary) = secondary_quote.as_ref() {
+            quotes.push(execution_action_to_quote_row(&item, secondary, true));
+        }
+    }
+
+    let strategy_note = if item.strategy.reasons.is_empty() {
+        item.strategy.summary.clone()
+    } else {
+        format!(
+            "{} | {}",
+            item.strategy.summary,
+            item.strategy.reasons.join(" | ")
+        )
+    };
+
+    MarketOpportunityRow {
+        source: item.source,
+        kind: item.kind,
+        id: item.id,
+        sport: item.sport,
+        competition_name: item.competition_name,
+        event_id: item.event_id,
+        event_name: item.event_name,
+        market_name: item.market_name,
+        selection_name: item.selection_name,
+        secondary_selection_name: String::new(),
+        venue: primary_quote.venue,
+        secondary_venue: secondary_quote
+            .as_ref()
+            .map(|item| item.venue.clone())
+            .unwrap_or_default(),
+        price: primary_quote.price,
+        secondary_price: secondary_quote.as_ref().and_then(|item| item.price),
+        fair_price: item.fair_price,
+        liquidity: quotes.iter().find_map(|quote| quote.liquidity),
+        edge_percent: item.edge_percent,
+        arbitrage_margin: item.arbitrage_margin,
+        stake_hint: item.stake_hint.or(primary_quote.stake_hint),
+        start_time: item.start_time,
+        updated_at: item.updated_at,
+        event_url: String::new(),
+        deep_link_url: primary_quote.deep_link_url,
+        is_live: item.is_live,
+        quotes,
+        notes: vec![strategy_note],
+        raw_data: serde_json::json!({
+            "strategy": item.strategy,
+            "execution_plan": item.execution_plan,
+            "live_status": item.live_status,
+        }),
+    }
+}
+
+fn operator_quote_to_quote_row(
+    item: OperatorMatchQuote,
+    is_live: bool,
+) -> MarketQuoteComparisonRow {
+    MarketQuoteComparisonRow {
+        source: item.source,
+        event_id: String::new(),
+        market_id: String::new(),
+        selection_id: String::new(),
+        event_name: String::new(),
+        market_name: String::new(),
+        selection_name: item.selection_name,
+        side: item.side,
+        venue: item.venue,
+        price: item.price,
+        fair_price: item.fair_price,
+        liquidity: item.liquidity,
+        event_url: String::new(),
+        deep_link_url: item.deep_link_url,
+        updated_at: item.updated_at,
+        is_live,
+        is_sharp: item.is_sharp,
+        notes: Vec::new(),
+        raw_data: serde_json::Value::Null,
+    }
+}
+
+fn execution_action_to_quote_row(
+    item: &OperatorMatchOpportunity,
+    action: &OperatorExecutionAction,
+    secondary: bool,
+) -> MarketQuoteComparisonRow {
+    MarketQuoteComparisonRow {
+        source: item.source.clone(),
+        event_id: item.event_id.clone(),
+        market_id: String::new(),
+        selection_id: String::new(),
+        event_name: item.event_name.clone(),
+        market_name: item.market_name.clone(),
+        selection_name: action.selection_name.clone(),
+        side: action.side.clone(),
+        venue: action.venue.clone(),
+        price: action.price,
+        fair_price: item.fair_price,
+        liquidity: None,
+        event_url: String::new(),
+        deep_link_url: action.deep_link_url.clone(),
+        updated_at: item.updated_at.clone(),
+        is_live: item.is_live,
+        is_sharp: !secondary,
+        notes: Vec::new(),
+        raw_data: serde_json::Value::Null,
+    }
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -484,7 +645,7 @@ mod tests {
 
     use reqwest::blocking::Client;
 
-    use super::{load_dashboard, project_external_quote_rows, test_dashboard_fixture};
+    use super::{load_dashboard, project_external_quote_rows};
     use crate::domain::{ExchangePanelSnapshot, OpenPositionRow};
 
     #[test]
@@ -537,8 +698,158 @@ mod tests {
 
     #[test]
     fn backend_http_contract_round_trips_dashboard_shape() {
-        let dashboard = test_dashboard_fixture();
-        let body = serde_json::to_string(&dashboard).expect("serialize dashboard");
+        let body = serde_json::json!({
+            "refreshed_at": "2026-04-03T11:24:00Z",
+            "generated_at": "2026-04-03T11:24:01Z",
+            "summary": {
+                "total_matches": 2,
+                "live_matches": 1,
+                "arbitrage_matches": 1,
+                "positive_ev_matches": 1
+            },
+            "matches": [
+                {
+                    "id": "oddsentry:arb:chelsea-liverpool",
+                    "source": "oddsentry",
+                    "kind": "arbitrage",
+                    "event_id": "chelsea-liverpool",
+                    "sport": "soccer",
+                    "competition_name": "Premier League",
+                    "event_name": "Chelsea v Liverpool",
+                    "market_name": "Match Odds",
+                    "selection_name": "Liverpool",
+                    "is_live": true,
+                    "live_status": null,
+                    "start_time": "2026-04-03T13:00:00Z",
+                    "updated_at": "2026-04-03T11:24:03Z",
+                    "edge_percent": 2.4,
+                    "arbitrage_margin": 2.4,
+                    "fair_price": null,
+                    "stake_hint": 25.0,
+                    "quotes": [
+                        {
+                            "source": "oddsentry",
+                            "venue": "bet365",
+                            "selection_name": "Liverpool",
+                            "side": "back",
+                            "price": 3.55,
+                            "fair_price": null,
+                            "liquidity": 310.0,
+                            "updated_at": "2026-04-03T11:24:03Z",
+                            "is_sharp": false,
+                            "deep_link_url": "https://example.test/chelsea-liverpool/deep"
+                        },
+                        {
+                            "source": "oddsentry",
+                            "venue": "matchbook",
+                            "selection_name": "Draw",
+                            "side": "lay",
+                            "price": 3.30,
+                            "fair_price": null,
+                            "liquidity": 240.0,
+                            "updated_at": "2026-04-03T11:24:03Z",
+                            "is_sharp": true,
+                            "deep_link_url": "https://example.test/chelsea-liverpool/deep"
+                        }
+                    ],
+                    "execution_plan": {
+                        "executor": "matchbook",
+                        "status": "ready",
+                        "primary": {
+                            "venue": "bet365",
+                            "selection_name": "Liverpool",
+                            "side": "back",
+                            "price": 3.55,
+                            "stake_hint": 25.0,
+                            "deep_link_url": "https://example.test/chelsea-liverpool/deep"
+                        },
+                        "secondary": {
+                            "venue": "matchbook",
+                            "selection_name": "Draw",
+                            "side": "lay",
+                            "price": 3.30,
+                            "stake_hint": 25.0,
+                            "deep_link_url": "https://example.test/chelsea-liverpool/deep"
+                        },
+                        "notes": ["paired execution required"]
+                    },
+                    "strategy": {
+                        "action": "enter",
+                        "confidence": "high",
+                        "summary": "Execute both legs while the spread is available.",
+                        "stale": false,
+                        "reasons": ["arbitrage margin positive"]
+                    }
+                },
+                {
+                    "id": "oddsentry:ev:bayern-dortmund",
+                    "source": "oddsentry",
+                    "kind": "positive_ev",
+                    "event_id": "bayern-dortmund",
+                    "sport": "soccer",
+                    "competition_name": "Bundesliga",
+                    "event_name": "Bayern v Dortmund",
+                    "market_name": "BTTS",
+                    "selection_name": "Yes",
+                    "is_live": false,
+                    "live_status": null,
+                    "start_time": "2026-04-03T15:00:00Z",
+                    "updated_at": "2026-04-03T11:24:06Z",
+                    "edge_percent": 7.3,
+                    "arbitrage_margin": null,
+                    "fair_price": 1.78,
+                    "stake_hint": null,
+                    "quotes": [
+                        {
+                            "source": "oddsentry",
+                            "venue": "williamhill",
+                            "selection_name": "Yes",
+                            "side": "back",
+                            "price": 1.91,
+                            "fair_price": 1.78,
+                            "liquidity": 205.0,
+                            "updated_at": "2026-04-03T11:24:06Z",
+                            "is_sharp": false,
+                            "deep_link_url": "https://example.test/bayern-dortmund/deep"
+                        },
+                        {
+                            "source": "oddsentry",
+                            "venue": "matchbook",
+                            "selection_name": "Yes",
+                            "side": "lay",
+                            "price": 1.84,
+                            "fair_price": 1.78,
+                            "liquidity": 180.0,
+                            "updated_at": "2026-04-03T11:24:06Z",
+                            "is_sharp": true,
+                            "deep_link_url": "https://example.test/bayern-dortmund/deep"
+                        }
+                    ],
+                    "execution_plan": {
+                        "executor": "matchbook",
+                        "status": "ready",
+                        "primary": {
+                            "venue": "williamhill",
+                            "selection_name": "Yes",
+                            "side": "back",
+                            "price": 1.91,
+                            "stake_hint": null,
+                            "deep_link_url": "https://example.test/bayern-dortmund/deep"
+                        },
+                        "secondary": null,
+                        "notes": []
+                    },
+                    "strategy": {
+                        "action": "enter",
+                        "confidence": "medium",
+                        "summary": "Enter with the indicated stake and monitor for a hedge.",
+                        "stale": false,
+                        "reasons": ["edge exceeds threshold"]
+                    }
+                }
+            ]
+        })
+        .to_string();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("server address");
 
@@ -567,15 +878,17 @@ mod tests {
         let client = Client::builder().build().expect("client");
         let base_url = format!("http://{address}");
         super::refresh_backend_dashboard(&client, &base_url).expect("refresh via backend");
-        let fetched =
-            super::query_backend_dashboard(&client, &base_url, None).expect("query backend");
+        let fetched = super::query_backend_operator_active(&client, &base_url, None)
+            .expect("query operator backend");
 
-        assert_eq!(fetched.sources.len(), dashboard.sources.len());
-        assert_eq!(fetched.markets.len(), dashboard.markets.len());
-        assert_eq!(fetched.arbitrages.len(), dashboard.arbitrages.len());
-        assert_eq!(fetched.plus_ev.len(), dashboard.plus_ev.len());
-        assert_eq!(fetched.value.len(), dashboard.value.len());
-        assert_eq!(fetched.drops.len(), dashboard.drops.len());
+        assert_eq!(fetched.arbitrages.len(), 1);
+        assert_eq!(fetched.plus_ev.len(), 1);
+        assert_eq!(fetched.total_opportunities, 2);
+        assert_eq!(fetched.markets.len(), 0);
+        assert!(fetched.arbitrages[0]
+            .quotes
+            .iter()
+            .all(|quote| quote.is_live));
 
         server.join().expect("server join");
     }

@@ -13,8 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::app::{
     start_market_intel_worker, start_oddsmatcher_worker, MarketIntelJob, MarketIntelResult,
-    MatchbookSyncJob, MatchbookSyncResult, OddsMatcherJob, OddsMatcherResult, OwlsSyncJob,
-    OwlsSyncResult, ProviderJob, ProviderResult,
+    OddsMatcherJob, OddsMatcherResult, OwlsSyncJob, OwlsSyncResult, ProviderJob, ProviderResult,
 };
 use crate::provider::ExchangeProvider;
 
@@ -59,8 +58,6 @@ pub(crate) struct AppRuntimeChannels {
     pub(crate) market_intel_rx: Receiver<MarketIntelResult>,
     pub(crate) owls_sync_tx: UnboundedSender<OwlsSyncJob>,
     pub(crate) owls_sync_rx: UnboundedReceiver<OwlsSyncResult>,
-    pub(crate) matchbook_sync_tx: UnboundedSender<MatchbookSyncJob>,
-    pub(crate) matchbook_sync_rx: UnboundedReceiver<MatchbookSyncResult>,
 }
 
 impl AppRuntimeChannels {
@@ -75,7 +72,6 @@ impl AppRuntimeChannels {
         let (oddsmatcher_tx, oddsmatcher_rx) = Self::start_oddsmatcher(host, oddsmatcher_client);
         let (market_intel_tx, market_intel_rx) = Self::start_market_intel(host);
         let (owls_sync_tx, owls_sync_rx) = Self::start_owls(host, owls_client);
-        let (matchbook_sync_tx, matchbook_sync_rx) = Self::start_matchbook(host);
 
         Self {
             provider_tx,
@@ -86,8 +82,6 @@ impl AppRuntimeChannels {
             market_intel_rx,
             owls_sync_tx,
             owls_sync_rx,
-            matchbook_sync_tx,
-            matchbook_sync_rx,
         }
     }
 
@@ -107,7 +101,7 @@ impl AppRuntimeChannels {
                 let request = job.request.clone();
                 debug!(request = ?request, "provider runtime job started");
                 let result = provider
-                    .handle(request.clone())
+                    .handle_with_metadata(request.clone())
                     .map_err(|error| error.to_string());
                 match &result {
                     Ok(_) => debug!(request = ?request, "provider runtime job completed"),
@@ -169,45 +163,6 @@ impl AppRuntimeChannels {
                 if result_tx
                     .send(OwlsSyncResult {
                         outcome,
-                        reason: job.reason,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        (job_tx, result_rx)
-    }
-
-    pub(crate) fn start_matchbook(
-        host: &AppRuntimeHost,
-    ) -> (
-        UnboundedSender<MatchbookSyncJob>,
-        UnboundedReceiver<MatchbookSyncResult>,
-    ) {
-        let (job_tx, mut job_rx) = tokio_mpsc::unbounded_channel::<MatchbookSyncJob>();
-        let (result_tx, result_rx) = tokio_mpsc::unbounded_channel::<MatchbookSyncResult>();
-
-        host.spawn(async move {
-            let mut client = None;
-            let mut rate_limited_until = None;
-            while let Some(job) = job_rx.recv().await {
-                debug!(reason = job.reason.label(), "matchbook runtime job started");
-                let state = crate::exchange_api::run_matchbook_sync_job_async(
-                    &mut client,
-                    &mut rate_limited_until,
-                )
-                .await
-                .map_err(|error| error.to_string());
-                match &state {
-                    Ok(_) => debug!(reason = job.reason.label(), "matchbook runtime job completed"),
-                    Err(error) => warn!(reason = job.reason.label(), error = %error, "matchbook runtime job failed"),
-                }
-                if result_tx
-                    .send(MatchbookSyncResult {
-                        state,
                         reason: job.reason,
                     })
                     .is_err()
@@ -292,7 +247,7 @@ mod tests {
 
         assert_eq!(result.request, ProviderRequest::LoadDashboard);
         assert_eq!(
-            result.result.expect("provider result").status_line,
+            result.result.expect("provider result").snapshot.status_line,
             "runtime::LoadDashboard"
         );
     }

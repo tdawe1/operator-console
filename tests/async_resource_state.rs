@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use color_eyre::Result;
 use operator_console::app::{App, Panel, TradingSection};
 use operator_console::domain::{ExchangePanelSnapshot, OpenPositionRow};
-use operator_console::exchange_api::MatchbookAccountState;
 use operator_console::owls::{self, OwlsLiveScoreEvent};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
@@ -68,21 +67,6 @@ impl ExchangeProvider for HangsAfterBootstrapProvider {
 }
 
 #[test]
-fn stuck_matchbook_sync_expires_and_preserves_last_good_data() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let mut app = test_app_with_snapshot(temp_dir.path().join("recorder.json"));
-    app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::Stats);
-    app.set_matchbook_state_for_test(sample_matchbook_state("good"));
-    app.mark_matchbook_sync_in_flight_for_test(Instant::now() - Duration::from_secs(60));
-
-    app.poll_matchbook_account_for_test();
-
-    assert_eq!(app.matchbook_status_for_test(), "stale");
-    assert_eq!(app.matchbook_account_state().unwrap().status_line, "good");
-}
-
-#[test]
 fn stuck_owls_sync_expires_and_keeps_live_context_targets() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut app = test_app_with_live_snapshot(temp_dir.path().join("recorder.json"));
@@ -94,7 +78,11 @@ fn stuck_owls_sync_expires_and_keeps_live_context_targets() {
     app.poll_owls_dashboard_for_test();
 
     assert_eq!(app.owls_status_for_test(), "stale");
-    assert!(!app.snapshot().external_live_events.is_empty());
+    assert!(app
+        .owls_dashboard()
+        .endpoints
+        .iter()
+        .any(|endpoint| !endpoint.live_scores.is_empty()));
 }
 
 #[test]
@@ -228,12 +216,6 @@ fn sample_live_snapshot() -> ExchangePanelSnapshot {
     snapshot
 }
 
-fn sample_matchbook_state(status_line: &str) -> MatchbookAccountState {
-    MatchbookAccountState {
-        status_line: status_line.to_string(),
-        ..MatchbookAccountState::default()
-    }
-}
 
 fn sample_ready_owls_dashboard() -> owls::OwlsDashboard {
     let mut dashboard = owls::dashboard_for_sport("soccer");

@@ -4,21 +4,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, TradingSection};
+use crate::app::{App, OwlsFocus, OwlsMarketSelection, TradingSection};
 use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let layout = Layout::vertical([Constraint::Length(4), Constraint::Min(13)]).split(area);
-    let body = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+    let layout = Layout::vertical([Constraint::Length(11), Constraint::Min(13)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(layout[1]);
+    let right = Layout::vertical([Constraint::Length(10), Constraint::Min(8)]).split(body[1]);
 
     render_overview(frame, layout[0], app, app.selected_owls_endpoint());
     render_endpoint_table(frame, body[0], app);
+    render_market_table(frame, right[0], app);
     render_overlay_preview(
         frame,
-        body[1],
+        right[1],
         app.active_trading_section(),
         app.selected_owls_endpoint(),
+        app.selected_owls_market_selection(),
     );
 }
 
@@ -45,7 +48,13 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_overlay_summary(frame, layout[0], app, selected);
     render_selection_meta(frame, body[0], selected);
     render_selection_request(frame, body[1], selected);
-    render_overlay_preview(frame, layout[2], app.active_trading_section(), selected);
+    render_overlay_preview(
+        frame,
+        layout[2],
+        app.active_trading_section(),
+        selected,
+        app.selected_owls_market_selection(),
+    );
 }
 
 fn render_overview(
@@ -85,6 +94,18 @@ fn render_overview(
             )
         })
         .unwrap_or_else(|| String::from("No endpoint selected."));
+    let selected_market_line = app
+        .selected_owls_market_selection()
+        .map(|selection| {
+            format!(
+                "{} • {} • {} [{} books]",
+                selection.event,
+                selection.market_label(),
+                selection.selection_label(),
+                selection.books()
+            )
+        })
+        .unwrap_or_else(|| String::from("No event market selected."));
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)]).areas(area);
 
@@ -123,12 +144,21 @@ fn render_overview(
         ]),
         Line::from(vec![
             Span::styled("Controls  ", Style::default().fg(accent_pink())),
-            Span::raw("[/] cycle sport • ↑/↓ endpoint • Enter inspect"),
+            Span::raw("[/] cycle sport • Tab focus • ↑/↓ select • Enter inspect"),
         ]),
         Line::from(vec![
             Span::styled("Selected  ", Style::default().fg(accent_green())),
             Span::styled(
                 truncate(&selected_line, 78),
+                Style::default()
+                    .fg(text_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Market    ", Style::default().fg(accent_gold())),
+            Span::styled(
+                truncate(&selected_market_line, 78),
                 Style::default()
                     .fg(text_color())
                     .add_modifier(Modifier::BOLD),
@@ -145,6 +175,10 @@ fn render_overview(
     let board = Table::new(
         vec![
             Row::new(vec![
+                Cell::from("Focus"),
+                Cell::from(app.owls_focus().label()),
+            ]),
+            Row::new(vec![
                 Cell::from("View"),
                 Cell::from(section_title(app.active_trading_section())),
             ]),
@@ -153,20 +187,9 @@ fn render_overview(
                 Cell::from(app.visible_owls_endpoints().len().to_string()),
             ]),
             Row::new(vec![
-                Cell::from("Books"),
-                Cell::from(
-                    selected
-                        .map(|endpoint| {
-                            if endpoint.books_returned.is_empty() {
-                                String::from("-")
-                            } else {
-                                endpoint.books_returned.len().to_string()
-                            }
-                        })
-                        .unwrap_or_else(|| String::from("-")),
-                ),
+                Cell::from("Markets"),
+                Cell::from(app.owls_market_selections().len().to_string()),
             ]),
-            Row::new(vec![Cell::from("Hint"), Cell::from("[/] cycle sport")]),
         ],
         [Constraint::Length(10), Constraint::Min(8)],
     )
@@ -232,6 +255,73 @@ fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         accent_cyan(),
     ));
     frame.render_stateful_widget(table, area, app.owls_endpoint_table_state());
+}
+
+fn render_market_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let rows = app.owls_market_selections();
+    if rows.is_empty() {
+        let body =
+            Paragraph::new("No event-scoped markets are available for the selected endpoint.")
+                .block(section_block("Event Markets", accent_gold()))
+                .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
+    }
+
+    let table_rows = rows
+        .iter()
+        .map(|selection| {
+            Row::new(vec![
+                Cell::from(truncate(&selection.event, 28)),
+                Cell::from(truncate(&selection.market_label(), 14)),
+                Cell::from(truncate(&selection.selection_label(), 14)),
+                Cell::from(selection.books().to_string()),
+                Cell::from(
+                    selection
+                        .best_price()
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| String::from("-")),
+                )
+                .style(
+                    Style::default()
+                        .fg(accent_green())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let accent = if app.owls_focus() == OwlsFocus::Markets {
+        accent_gold()
+    } else {
+        accent_cyan()
+    };
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(30),
+            Constraint::Length(15),
+            Constraint::Length(15),
+            Constraint::Length(5),
+            Constraint::Min(6),
+        ],
+    )
+    .header(
+        Row::new(vec!["Event", "Market", "Selection", "Bk", "Best"]).style(
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .row_highlight_style(
+        Style::default()
+            .fg(selected_text())
+            .bg(selected_background())
+            .add_modifier(Modifier::BOLD),
+    )
+    .column_spacing(1)
+    .block(section_block("Event Markets", accent));
+    frame.render_stateful_widget(table, area, app.owls_market_table_state());
 }
 
 fn render_overlay_summary(
@@ -439,12 +529,13 @@ fn render_overlay_preview(
     area: Rect,
     section: TradingSection,
     selected: Option<&OwlsEndpointSummary>,
+    market_selection: Option<OwlsMarketSelection>,
 ) {
-    match selected {
-        Some(endpoint) if !endpoint.quotes.is_empty() => {
-            render_quote_ladder(frame, area, section, endpoint);
+    match (selected, market_selection) {
+        (Some(_endpoint), Some(selection)) if !selection.quotes.is_empty() => {
+            render_quote_ladder(frame, area, section, &selection);
         }
-        Some(endpoint) if !endpoint.preview.is_empty() => {
+        (Some(endpoint), _) if !endpoint.preview.is_empty() => {
             let rows = endpoint
                 .preview
                 .iter()
@@ -481,13 +572,13 @@ fn render_overlay_preview(
             .block(section_block(preview_title(section), accent_pink()));
             frame.render_widget(table, area);
         }
-        Some(endpoint) => {
+        (Some(endpoint), _) => {
             let body = Paragraph::new(format!("No preview rows returned for {}.", endpoint.label))
                 .block(section_block(preview_title(section), accent_pink()))
                 .wrap(Wrap { trim: true });
             frame.render_widget(body, area);
         }
-        None => {
+        (None, _) => {
             let body = Paragraph::new("No endpoint selected.")
                 .block(section_block(preview_title(section), accent_pink()))
                 .wrap(Wrap { trim: true });
@@ -500,19 +591,9 @@ fn render_quote_ladder(
     frame: &mut Frame<'_>,
     area: Rect,
     section: TradingSection,
-    endpoint: &OwlsEndpointSummary,
+    market_selection: &OwlsMarketSelection,
 ) {
-    let mut quotes = endpoint
-        .quotes
-        .iter()
-        .filter(|quote| quote.decimal_price.is_some())
-        .collect::<Vec<_>>();
-    quotes.sort_by(|left, right| {
-        right
-            .decimal_price
-            .partial_cmp(&left.decimal_price)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let quotes = top_market_quotes(&market_selection.quotes, 8);
 
     let [left, center, right] = Layout::horizontal([
         Constraint::Percentage(42),
@@ -561,11 +642,23 @@ fn render_quote_ladder(
 
     let center_body = Paragraph::new(vec![
         Line::styled(
-            truncate(&endpoint.label, 16),
+            truncate(&market_selection.selection_label(), 16),
             Style::default()
                 .fg(text_color())
                 .add_modifier(Modifier::BOLD),
         ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Event", Style::default().fg(muted_text())),
+            Span::raw(format!(" {}", truncate(&market_selection.event, 22))),
+        ]),
+        Line::from(vec![
+            Span::styled("Mkt  ", Style::default().fg(muted_text())),
+            Span::raw(format!(
+                " {}",
+                truncate(&market_selection.market_label(), 22)
+            )),
+        ]),
         Line::raw(""),
         Line::from(vec![
             Span::styled("Best", Style::default().fg(accent_cyan())),
@@ -582,7 +675,7 @@ fn render_quote_ladder(
         Line::raw(""),
         Line::from(vec![
             Span::styled("Rows", Style::default().fg(muted_text())),
-            Span::raw(format!(" {}", endpoint.count)),
+            Span::raw(format!(" {}", market_selection.quote_count())),
         ]),
     ])
     .block(section_block(preview_title(section), accent_pink()))
@@ -609,6 +702,31 @@ fn render_quote_ladder(
     .column_spacing(1)
     .block(section_block("Field", accent_gold()));
     frame.render_widget(right_table, right);
+}
+
+fn top_market_quotes(
+    quotes: &[crate::owls::OwlsMarketQuote],
+    limit: usize,
+) -> Vec<&crate::owls::OwlsMarketQuote> {
+    let mut top = Vec::new();
+    for quote in quotes.iter().filter(|quote| quote.decimal_price.is_some()) {
+        let price = quote.decimal_price.unwrap_or_default();
+        let insert_at = top
+            .iter()
+            .position(|existing: &&crate::owls::OwlsMarketQuote| {
+                existing.decimal_price.unwrap_or_default() < price
+            })
+            .unwrap_or(top.len());
+        if insert_at < limit {
+            top.insert(insert_at, quote);
+            if top.len() > limit {
+                top.pop();
+            }
+        } else if top.len() < limit {
+            top.push(quote);
+        }
+    }
+    top
 }
 
 fn ladder_row(quote: &crate::owls::OwlsMarketQuote) -> Row<'static> {

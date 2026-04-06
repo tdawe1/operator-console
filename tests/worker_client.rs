@@ -124,7 +124,7 @@ fn worker_request_serializes_cash_out_tracked_bet() {
 #[test]
 fn worker_request_serializes_execute_trading_action() {
     let request = serde_json::to_string(&WorkerRequest::ExecuteTradingAction {
-        intent: TradingActionIntent {
+        intent: Box::new(TradingActionIntent {
             action_kind: TradingActionKind::PlaceBet,
             source: TradingActionSource::Positions,
             venue: VenueId::Smarkets,
@@ -163,7 +163,7 @@ fn worker_request_serializes_execute_trading_action() {
                 baseline_price: Some(3.35),
             },
             notes: vec![String::from("positions")],
-        },
+        }),
     })
     .expect("serialize");
 
@@ -224,7 +224,7 @@ fn worker_request_serializes_execute_trading_action() {
 #[test]
 fn worker_request_serializes_load_horse_matcher() {
     let request = serde_json::to_string(&WorkerRequest::LoadHorseMatcher {
-        query: HorseMatcherQuery {
+        query: Box::new(HorseMatcherQuery {
             mode: HorseMatcherMode::RacesPerOffer,
             bookmakers: vec![String::from("betfred"), String::from("coral")],
             exchanges: vec![String::from("smarkets"), String::from("betdaq")],
@@ -237,7 +237,7 @@ fn worker_request_serializes_load_horse_matcher() {
             date_to: Some(String::from("2026-03-20")),
             offers: vec![],
             offer_types: vec![],
-        },
+        }),
     })
     .expect("serialize");
 

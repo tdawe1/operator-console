@@ -111,8 +111,8 @@ fn chart_from_intel_history(app: &App) -> Option<ChartModel> {
 }
 
 fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
-    let endpoint = app.selected_owls_endpoint()?;
-    let quotes = top_chart_quotes(endpoint, 12);
+    let selection = app.selected_owls_market_selection()?;
+    let quotes = top_chart_quotes(&selection.quotes, 12);
     if quotes.len() < 2 {
         return None;
     }
@@ -145,9 +145,13 @@ fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
         .collect::<Vec<_>>();
 
     Some(finalize_chart_model(
-        endpoint.label.clone(),
-        format!("{} {}", endpoint.method, endpoint.path),
-        String::from("endpoint quotes"),
+        selection.selection_label(),
+        format!(
+            "{} • {}",
+            truncate(&selection.event, 34),
+            selection.market_label()
+        ),
+        String::from("market quotes"),
         price_points,
         volume_points,
         ladder_quotes,
@@ -598,12 +602,11 @@ fn render_market_ladder(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 }
 
 fn top_chart_quotes(
-    endpoint: &crate::owls::OwlsEndpointSummary,
+    quotes: &[crate::owls::OwlsMarketQuote],
     limit: usize,
 ) -> Vec<(&crate::owls::OwlsMarketQuote, f64)> {
     let mut top = Vec::new();
-    for quote in endpoint
-        .quotes
+    for quote in quotes
         .iter()
         .filter_map(|quote| quote.decimal_price.map(|price| (quote, price)))
     {

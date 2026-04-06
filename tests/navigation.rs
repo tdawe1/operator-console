@@ -189,13 +189,13 @@ fn set_trading_section_syncs_workspace_and_focused_pane() {
 }
 
 #[test]
-fn plain_horizontal_arrows_do_not_switch_sections() {
+fn plain_horizontal_arrows_switch_sections() {
     let mut app = App::default();
 
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
 
     app.handle_key(KeyCode::Right);
-    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
 
     app.handle_key(KeyCode::Left);
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
@@ -263,6 +263,54 @@ fn vim_keys_move_between_panes_not_within_tables() {
 
     assert_ne!(app.active_pane(), Some(PaneId::Positions));
     assert_eq!(app.selected_open_position_row(), Some(0));
+}
+
+#[test]
+fn left_and_right_switch_sections_without_modifiers() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Positions);
+
+    app.handle_key(KeyCode::Right);
+    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
+
+    app.handle_key(KeyCode::Left);
+    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+}
+
+#[test]
+fn plain_number_keys_switch_workspaces() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+
+    assert_eq!(app.wm.active_workspace, 0);
+
+    app.handle_key(KeyCode::Char('2'));
+    assert_eq!(app.wm.active_workspace, 1);
+
+    app.handle_key(KeyCode::Char('3'));
+    assert_eq!(app.wm.active_workspace, 2);
+}
+
+#[test]
+fn plain_f_toggles_maximize() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+
+    assert_eq!(app.wm.maximized_pane, None);
+    app.handle_key(KeyCode::Char('f'));
+    assert_eq!(app.wm.maximized_pane, app.active_pane());
+
+    app.handle_key(KeyCode::Char('f'));
+    assert_eq!(app.wm.maximized_pane, None);
 }
 
 #[test]

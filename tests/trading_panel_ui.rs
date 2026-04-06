@@ -52,7 +52,7 @@ fn markets_panel_renders_api_surface_board() {
     assert!(rendered.contains("Owls Markets"));
     assert!(rendered.contains("Endpoint Board"));
     assert!(rendered.contains("/api/v1/nba/odds"));
-    assert!(rendered.contains("Preview"));
+    assert!(rendered.contains("Event Markets"));
 }
 
 #[test]
@@ -118,8 +118,9 @@ fn chart_pane_renders_market_curve() {
 
     assert!(rendered.contains("Market Chart") || rendered.contains("CHART"));
     assert!(rendered.contains("Curve"));
-    assert!(rendered.contains("endpoint quotes"));
-    assert!(rendered.contains("Main Markets"));
+    assert!(rendered.contains("market quotes"));
+    assert!(rendered.contains("Arsenal"));
+    assert!(rendered.contains("Arsenal v Everton"));
 }
 
 #[test]

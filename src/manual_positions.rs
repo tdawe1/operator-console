@@ -249,13 +249,14 @@ pub fn load_entries_or_default(path: &Path) -> Result<(Vec<ManualPositionEntry>,
             "Loaded manual positions from {} after filtering {} example entr{}.",
             path.display(),
             original_len - entries.len(),
-            if original_len - entries.len() == 1 { "y" } else { "ies" }
+            if original_len - entries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
         )
     };
-    Ok((
-        entries,
-        note,
-    ))
+    Ok((entries, note))
 }
 
 pub fn save_entries(path: &Path, entries: &[ManualPositionEntry]) -> Result<String> {

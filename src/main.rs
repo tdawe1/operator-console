@@ -1,3 +1,5 @@
+mod backend_provider;
+
 use std::env;
 use std::io::{self, stdout};
 use std::path::PathBuf;
@@ -5,16 +7,17 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use backend_provider::BackendExchangeProvider;
 use color_eyre::eyre::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use operator_console::app::App;
+use operator_console::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus, WorkerSummary};
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
-    default_config_path as default_recorder_config_path, load_recorder_config_or_default,
-    RecorderConfig,
 };
+use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::theme::{self, Name as ThemeName};
 use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
@@ -79,7 +82,7 @@ fn main() -> Result<()> {
             }
         };
 
-    let mut app = App::from_provider(provider)?;
+    let mut app = App::from_provider_with_base_factory(provider, Box::new(default_configured_provider))?;
     enable_mouse_capture()?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -197,14 +200,20 @@ mod tests {
     #[test]
     fn autostart_flag_recognizes_enabled_values() {
         for value in ["1", "true", "TRUE", " yes ", "On"] {
-            assert!(flag_is_enabled(value), "expected {value:?} to enable autostart");
+            assert!(
+                flag_is_enabled(value),
+                "expected {value:?} to enable autostart"
+            );
         }
     }
 
     #[test]
     fn autostart_flag_rejects_disabled_values() {
         for value in ["", "0", "false", "off", "no", "disabled"] {
-            assert!(!flag_is_enabled(value), "expected {value:?} to disable autostart");
+            assert!(
+                !flag_is_enabled(value),
+                "expected {value:?} to disable autostart"
+            );
         }
     }
 
@@ -241,48 +250,40 @@ fn help_text() -> String {
 }
 
 fn default_configured_provider() -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
-    let config_path = default_recorder_config_path();
-    let recorder_config = load_recorder_config_or_default(&config_path)
-        .map(|(config, _)| config)
-        .unwrap_or_else(|_| RecorderConfig::default());
-    provider_from_recorder_config(&recorder_config)
+    match BackendExchangeProvider::new() {
+        Ok(provider) => Box::new(provider),
+        Err(error) => Box::new(BackendUnavailableProvider::new(error.to_string())),
+    }
 }
 
-fn provider_from_recorder_config(
-    config: &RecorderConfig,
-) -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
-    let worker_config = WorkerConfig {
-        positions_payload_path: None,
-        run_dir: Some(config.run_dir.clone()),
-        account_payload_path: None,
-        open_bets_payload_path: None,
-        companion_legs_path: config.companion_legs_path.clone(),
-        agent_browser_session: Some(config.session.clone()),
-        commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
-        target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
-        stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
-        hard_margin_call_profit_floor: if config.hard_margin_call_profit_floor.trim().is_empty() {
-            None
-        } else {
-            config.hard_margin_call_profit_floor.parse::<f64>().ok()
-        },
-        warn_only_default: config.warn_only_default,
-    };
+#[derive(Debug, Clone)]
+struct BackendUnavailableProvider {
+    detail: String,
+}
 
-    Box::new(HybridExchangeProvider::new(
-        Box::new(NativeExchangeProvider::new(worker_config.clone())),
-        Box::new(WorkerClientExchangeProvider::new(
-            if config.command.exists() {
-                BetRecorderWorkerClient::new_command(config.command.clone())
-            } else {
-                BetRecorderWorkerClient::new(
-                    default_bet_recorder_python(),
-                    default_bet_recorder_root(),
-                )
+impl BackendUnavailableProvider {
+    fn new(detail: String) -> Self {
+        Self { detail }
+    }
+
+    fn snapshot(&self) -> ExchangePanelSnapshot {
+        ExchangePanelSnapshot {
+            worker: WorkerSummary {
+                name: String::from("sabisabi"),
+                status: WorkerStatus::Error,
+                detail: self.detail.clone(),
             },
-            worker_config,
-        )),
-    ))
+            selected_venue: Some(VenueId::Smarkets),
+            status_line: format!("Backend unavailable: {}", self.detail),
+            ..ExchangePanelSnapshot::default()
+        }
+    }
+}
+
+impl ExchangeProvider for BackendUnavailableProvider {
+    fn handle(&mut self, _request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
+        Ok(self.snapshot())
+    }
 }
 
 fn list_themes_text() -> String {
