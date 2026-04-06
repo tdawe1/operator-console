@@ -16,7 +16,6 @@ use operator_console::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus, Wor
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
-    RecorderConfig,
 };
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::theme::{self, Name as ThemeName};
@@ -83,7 +82,7 @@ fn main() -> Result<()> {
             }
         };
 
-    let mut app = App::from_provider(provider)?;
+    let mut app = App::from_provider_with_base_factory(provider, Box::new(default_configured_provider))?;
     enable_mouse_capture()?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -285,43 +284,6 @@ impl ExchangeProvider for BackendUnavailableProvider {
     fn handle(&mut self, _request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
         Ok(self.snapshot())
     }
-}
-
-fn provider_from_recorder_config(
-    config: &RecorderConfig,
-) -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
-    let worker_config = WorkerConfig {
-        positions_payload_path: None,
-        run_dir: Some(config.run_dir.clone()),
-        account_payload_path: None,
-        open_bets_payload_path: None,
-        companion_legs_path: config.companion_legs_path.clone(),
-        agent_browser_session: Some(config.session.clone()),
-        commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
-        target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
-        stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
-        hard_margin_call_profit_floor: if config.hard_margin_call_profit_floor.trim().is_empty() {
-            None
-        } else {
-            config.hard_margin_call_profit_floor.parse::<f64>().ok()
-        },
-        warn_only_default: config.warn_only_default,
-    };
-
-    Box::new(HybridExchangeProvider::new(
-        Box::new(NativeExchangeProvider::new(worker_config.clone())),
-        Box::new(WorkerClientExchangeProvider::new(
-            if config.command.exists() {
-                BetRecorderWorkerClient::new_command(config.command.clone())
-            } else {
-                BetRecorderWorkerClient::new(
-                    default_bet_recorder_python(),
-                    default_bet_recorder_root(),
-                )
-            },
-            worker_config,
-        )),
-    ))
 }
 
 fn list_themes_text() -> String {

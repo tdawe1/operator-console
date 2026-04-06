@@ -28,13 +28,9 @@ pub use crate::app_state::{
 };
 use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
-    ExchangePanelSnapshot, ExternalLiveEventRow, ExternalLiveIncidentRow, ExternalLiveStatRow,
-    ExternalPlayerRatingRow, ExternalQuoteRow, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId,
-    WorkerStatus,
+    ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId, WorkerStatus,
 };
-use crate::exchange_api::{
-    MatchbookAccountState, MatchbookBetRow, MatchbookOfferRow, MatchbookPositionRow,
-};
+use crate::exchange_api::MatchbookAccountState;
 use crate::execution_backend;
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::manual_positions::{
@@ -43,8 +39,7 @@ use crate::manual_positions::{
 };
 use crate::market_intel::{self, MarketIntelDashboard, MarketOpportunityRow};
 use crate::market_normalization::{
-    event_matches, market_matches, normalize_key, selection_matches,
-    selection_matches_with_context, text_matches,
+    market_matches, normalize_key, selection_matches, text_matches,
 };
 use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
@@ -76,7 +71,7 @@ use crate::wm::{NavDirection, PaneId};
 use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
 
 type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider + Send>;
-type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider + Send>;
+type BaseProviderFactory = dyn Fn() -> Box<dyn ExchangeProvider + Send>;
 
 pub(crate) struct ProviderJob {
     pub(crate) request: ProviderRequest,
@@ -246,7 +241,7 @@ pub struct App {
     provider_pending_job: Option<ProviderJob>,
     #[cfg(debug_assertions)]
     provider_in_flight_started_at_for_test: Option<Instant>,
-    make_stub_provider: Box<StubFactory>,
+    make_base_provider: Box<BaseProviderFactory>,
     make_recorder_provider: Box<ProviderFactory>,
     recorder_supervisor: Box<dyn RecorderSupervisor>,
     recorder_config: RecorderConfig,
@@ -375,6 +370,16 @@ impl Default for App {
 
 impl App {
     pub fn from_provider<P: ExchangeProvider + Send + 'static>(provider: P) -> Result<Self> {
+        Self::from_provider_with_base_factory(
+            provider,
+            Box::new(|| Box::new(StubExchangeProvider::default())),
+        )
+    }
+
+    pub fn from_provider_with_base_factory<P: ExchangeProvider + Send + 'static>(
+        provider: P,
+        make_base_provider: Box<BaseProviderFactory>,
+    ) -> Result<Self> {
         let recorder_config_path = default_config_path();
         let (recorder_config, recorder_config_note) =
             load_recorder_config_or_default(&recorder_config_path).unwrap_or_else(|error| {
@@ -385,7 +390,7 @@ impl App {
             });
         let mut app = Self::with_dependencies_and_storage(
             Box::new(provider),
-            Box::new(|| Box::new(StubExchangeProvider::default())),
+            make_base_provider,
             default_recorder_provider_factory(),
             Box::new(ProcessRecorderSupervisor::default()),
             recorder_config,
@@ -398,14 +403,14 @@ impl App {
 
     pub fn with_dependencies(
         provider: Box<dyn ExchangeProvider + Send>,
-        make_stub_provider: Box<StubFactory>,
+        make_base_provider: Box<BaseProviderFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
         recorder_config: RecorderConfig,
     ) -> Result<Self> {
         Self::with_dependencies_and_storage(
             provider,
-            make_stub_provider,
+            make_base_provider,
             make_recorder_provider,
             recorder_supervisor,
             recorder_config,
@@ -416,7 +421,7 @@ impl App {
 
     pub fn with_dependencies_and_storage(
         provider: Box<dyn ExchangeProvider + Send>,
-        make_stub_provider: Box<StubFactory>,
+        make_base_provider: Box<BaseProviderFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
         recorder_config: RecorderConfig,
@@ -425,7 +430,7 @@ impl App {
     ) -> Result<Self> {
         Self::with_dependencies_and_storage_paths(
             provider,
-            make_stub_provider,
+            make_base_provider,
             make_recorder_provider,
             recorder_supervisor,
             recorder_config,
@@ -437,7 +442,7 @@ impl App {
 
     pub fn with_dependencies_and_storage_paths(
         provider: Box<dyn ExchangeProvider + Send>,
-        make_stub_provider: Box<StubFactory>,
+        make_base_provider: Box<BaseProviderFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
         recorder_config: RecorderConfig,
@@ -447,7 +452,7 @@ impl App {
     ) -> Result<Self> {
         Self::with_dependencies_and_storage_matcher_paths(
             provider,
-            make_stub_provider,
+            make_base_provider,
             make_recorder_provider,
             recorder_supervisor,
             recorder_config,
@@ -460,7 +465,7 @@ impl App {
 
     pub fn with_dependencies_and_storage_matcher_paths(
         mut provider: Box<dyn ExchangeProvider + Send>,
-        make_stub_provider: Box<StubFactory>,
+        make_base_provider: Box<BaseProviderFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
         recorder_config: RecorderConfig,
@@ -536,7 +541,7 @@ impl App {
             provider_pending_job: None,
             #[cfg(debug_assertions)]
             provider_in_flight_started_at_for_test: None,
-            make_stub_provider,
+            make_base_provider,
             make_recorder_provider,
             recorder_supervisor,
             recorder_config,
@@ -1972,7 +1977,7 @@ impl App {
         if self.recorder_status == RecorderStatus::Running {
             (self.make_recorder_provider)(&self.recorder_config)
         } else {
-            (self.make_stub_provider)()
+            (self.make_base_provider)()
         }
     }
 
@@ -2400,13 +2405,13 @@ impl App {
         self.last_recorder_start_failure = None;
         self.recorder_startup_alerts_pending = false;
         self.recorder_startup_alerts_muted_until = None;
-        self.restart_provider_worker((self.make_stub_provider)());
+        self.restart_provider_worker((self.make_base_provider)());
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::LoadDashboard,
-            failure_context: String::from("Stub dashboard load failed"),
-            event_message: Some(String::from("Recorder stopped; restored stub dashboard.")),
+            failure_context: String::from("Base dashboard load failed"),
+            event_message: Some(String::from("Recorder stopped; restored base dashboard.")),
         });
-        self.record_event("Recorder stopped; restored stub dashboard.");
+        self.record_event("Recorder stopped; restored base dashboard.");
         Ok(())
     }
 
@@ -5847,449 +5852,6 @@ fn trading_section_for_pane(pane: PaneId) -> TradingSection {
     }
 }
 
-#[derive(Clone)]
-struct SnapshotMarketTarget {
-    event: String,
-    market: String,
-    selection: String,
-    event_url: String,
-}
-
-pub(crate) fn populate_snapshot_enrichment(
-    snapshot: &mut ExchangePanelSnapshot,
-    owls_dashboard: &OwlsDashboard,
-    matchbook_account_state: Option<&MatchbookAccountState>,
-    market_intel_dashboard: Option<&MarketIntelDashboard>,
-) {
-    snapshot.external_quotes = build_external_quote_rows(
-        snapshot,
-        owls_dashboard,
-        matchbook_account_state,
-        market_intel_dashboard,
-    );
-    snapshot.external_live_events = build_external_live_event_rows(snapshot, owls_dashboard);
-    apply_external_live_context(snapshot);
-}
-
-fn build_external_quote_rows(
-    snapshot: &ExchangePanelSnapshot,
-    owls_dashboard: &OwlsDashboard,
-    matchbook_account_state: Option<&MatchbookAccountState>,
-    market_intel_dashboard: Option<&MarketIntelDashboard>,
-) -> Vec<ExternalQuoteRow> {
-    let mut rows = Vec::new();
-    let mut seen = HashSet::new();
-
-    for open_position in &snapshot.open_positions {
-        if let Some(price) = open_position.current_back_odds {
-            push_external_quote_row(
-                &mut rows,
-                &mut seen,
-                ExternalQuoteRow {
-                    provider: String::from("snapshot"),
-                    venue: String::from("smarkets"),
-                    event: open_position.event.clone(),
-                    market: open_position.market.clone(),
-                    selection: open_position.contract.clone(),
-                    side: String::from("back"),
-                    event_url: open_position.event_url.clone(),
-                    deep_link_url: String::new(),
-                    event_id: String::new(),
-                    market_id: String::new(),
-                    selection_id: String::new(),
-                    price: Some(price),
-                    liquidity: None,
-                    is_sharp: false,
-                    updated_at: snapshot
-                        .runtime
-                        .as_ref()
-                        .map(|runtime| runtime.updated_at.clone())
-                        .unwrap_or_default(),
-                    status: if open_position.can_trade_out {
-                        String::from("live")
-                    } else {
-                        String::from("snapshot")
-                    },
-                },
-            );
-        }
-    }
-
-    let targets = snapshot_market_targets(snapshot);
-    for target in &targets {
-        for quote in owls::matching_market_quotes(
-            owls_dashboard,
-            &target.event,
-            &target.market,
-            &target.selection,
-        ) {
-            let book = quote.book.trim().to_string();
-            push_external_quote_row(
-                &mut rows,
-                &mut seen,
-                ExternalQuoteRow {
-                    provider: String::from("owls"),
-                    venue: if book.is_empty() {
-                        String::from("unknown")
-                    } else {
-                        book.clone()
-                    },
-                    event: target.event.clone(),
-                    market: target.market.clone(),
-                    selection: target.selection.clone(),
-                    side: String::from("back"),
-                    event_url: target.event_url.clone(),
-                    deep_link_url: quote.event_link.clone(),
-                    event_id: String::new(),
-                    market_id: String::new(),
-                    selection_id: String::new(),
-                    price: quote.decimal_price,
-                    liquidity: quote.limit_amount,
-                    is_sharp: normalize_key(&book) == "pinnacle",
-                    updated_at: owls_dashboard.refreshed_at.clone(),
-                    status: if quote.suspended {
-                        String::from("suspended")
-                    } else {
-                        String::from("ready")
-                    },
-                },
-            );
-        }
-    }
-
-    if let Some(state) = matchbook_account_state {
-        for target in &targets {
-            for offer in state
-                .current_offers
-                .iter()
-                .filter(|offer| matchbook_offer_matches_target(offer, target))
-            {
-                push_external_quote_row(
-                    &mut rows,
-                    &mut seen,
-                    ExternalQuoteRow {
-                        provider: String::from("matchbook_api"),
-                        venue: String::from("matchbook"),
-                        event: target.event.clone(),
-                        market: target.market.clone(),
-                        selection: target.selection.clone(),
-                        side: offer.side.clone(),
-                        event_url: target.event_url.clone(),
-                        deep_link_url: String::new(),
-                        event_id: offer.event_id.clone(),
-                        market_id: offer.market_id.clone(),
-                        selection_id: offer.runner_id.clone(),
-                        price: offer.odds,
-                        liquidity: offer.remaining_stake.or(offer.stake),
-                        is_sharp: false,
-                        updated_at: String::new(),
-                        status: offer.status.clone(),
-                    },
-                );
-            }
-            for bet in state
-                .current_bets
-                .iter()
-                .filter(|bet| matchbook_bet_matches_target(bet, target))
-            {
-                push_external_quote_row(
-                    &mut rows,
-                    &mut seen,
-                    ExternalQuoteRow {
-                        provider: String::from("matchbook_api"),
-                        venue: String::from("matchbook"),
-                        event: target.event.clone(),
-                        market: target.market.clone(),
-                        selection: target.selection.clone(),
-                        side: bet.side.clone(),
-                        event_url: target.event_url.clone(),
-                        deep_link_url: String::new(),
-                        event_id: bet.event_id.clone(),
-                        market_id: bet.market_id.clone(),
-                        selection_id: bet.runner_id.clone(),
-                        price: bet.odds,
-                        liquidity: bet.stake,
-                        is_sharp: false,
-                        updated_at: String::new(),
-                        status: bet.status.clone(),
-                    },
-                );
-            }
-            for position in state
-                .positions
-                .iter()
-                .filter(|position| matchbook_position_matches_target(position, target))
-            {
-                push_external_quote_row(
-                    &mut rows,
-                    &mut seen,
-                    ExternalQuoteRow {
-                        provider: String::from("matchbook_api"),
-                        venue: String::from("matchbook"),
-                        event: target.event.clone(),
-                        market: target.market.clone(),
-                        selection: target.selection.clone(),
-                        side: String::new(),
-                        event_url: target.event_url.clone(),
-                        deep_link_url: String::new(),
-                        event_id: position.event_id.clone(),
-                        market_id: position.market_id.clone(),
-                        selection_id: position.runner_id.clone(),
-                        price: None,
-                        liquidity: position.exposure.map(f64::abs),
-                        is_sharp: false,
-                        updated_at: String::new(),
-                        status: String::from("position"),
-                    },
-                );
-            }
-        }
-    }
-
-    if let Some(dashboard) = market_intel_dashboard {
-        for quote in market_intel::project_external_quote_rows(snapshot, dashboard) {
-            push_external_quote_row(&mut rows, &mut seen, quote);
-        }
-    }
-
-    rows
-}
-
-fn build_external_live_event_rows(
-    snapshot: &ExchangePanelSnapshot,
-    owls_dashboard: &OwlsDashboard,
-) -> Vec<ExternalLiveEventRow> {
-    let mut rows = Vec::new();
-    let mut seen = HashSet::new();
-    for target in snapshot_market_targets(snapshot) {
-        let Some(live_event) = owls::find_live_score(owls_dashboard, &target.event).or_else(|| {
-            owls_dashboard
-                .endpoints
-                .iter()
-                .flat_map(|endpoint| endpoint.live_scores.iter())
-                .find(|score| event_matches(&score.name, &target.event))
-                .cloned()
-        }) else {
-            continue;
-        };
-        let key = normalize_key(&target.event);
-        if !seen.insert(key) {
-            continue;
-        }
-        rows.push(ExternalLiveEventRow {
-            provider: String::from("owls"),
-            sport: live_event.sport.clone(),
-            event: target.event,
-            event_id: live_event.event_id.clone(),
-            source_match_id: live_event.source_match_id.clone(),
-            home_team: live_event.home_team.clone(),
-            away_team: live_event.away_team.clone(),
-            home_score: live_event.home_score,
-            away_score: live_event.away_score,
-            status_state: live_event.status_state.clone(),
-            status_detail: live_event.status_detail.clone(),
-            display_clock: live_event.display_clock.clone(),
-            last_updated: live_event.last_updated.clone(),
-            stats: live_event
-                .stats
-                .iter()
-                .map(|stat| ExternalLiveStatRow {
-                    key: stat.key.clone(),
-                    label: stat.label.clone(),
-                    home_value: stat.home_value.clone(),
-                    away_value: stat.away_value.clone(),
-                })
-                .collect(),
-            incidents: live_event
-                .incidents
-                .iter()
-                .map(|incident| ExternalLiveIncidentRow {
-                    minute: incident.minute,
-                    incident_type: incident.incident_type.clone(),
-                    team_side: incident.team_side.clone(),
-                    player_name: incident.player_name.clone(),
-                    detail: incident.detail.clone(),
-                })
-                .collect(),
-            player_ratings: live_event
-                .player_ratings
-                .iter()
-                .map(|player| ExternalPlayerRatingRow {
-                    player_name: player.player_name.clone(),
-                    team_side: player.team_side.clone(),
-                    rating: player.rating,
-                })
-                .collect(),
-        });
-    }
-    rows
-}
-
-fn apply_external_live_context(snapshot: &mut ExchangePanelSnapshot) {
-    for open_position in &mut snapshot.open_positions {
-        let Some(live_event) = snapshot
-            .external_live_events
-            .iter()
-            .find(|live_event| event_matches(&live_event.event, &open_position.event))
-        else {
-            continue;
-        };
-        open_position.current_score_home = live_event.home_score;
-        open_position.current_score_away = live_event.away_score;
-        if let (Some(away), Some(home)) = (live_event.away_score, live_event.home_score) {
-            open_position.current_score = format!("{away}-{home}");
-        }
-        if !live_event.display_clock.trim().is_empty() {
-            open_position.live_clock = live_event.display_clock.clone();
-        } else if !live_event.status_detail.trim().is_empty() {
-            open_position.live_clock = live_event.status_detail.clone();
-        }
-        if !live_event.status_detail.trim().is_empty() {
-            open_position.event_status = live_event.status_detail.clone();
-        } else if !live_event.status_state.trim().is_empty() {
-            open_position.event_status = live_event.status_state.clone();
-        }
-        open_position.is_in_play = matches!(
-            normalize_key(&live_event.status_state).as_str(),
-            "in" | "live" | "inplay"
-        );
-    }
-}
-
-fn snapshot_market_targets(snapshot: &ExchangePanelSnapshot) -> Vec<SnapshotMarketTarget> {
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    for open_position in &snapshot.open_positions {
-        push_snapshot_target(
-            &mut targets,
-            &mut seen,
-            &open_position.event,
-            &open_position.market,
-            &open_position.contract,
-            &open_position.event_url,
-        );
-    }
-    for tracked_bet in &snapshot.tracked_bets {
-        if tracked_bet_is_closed(tracked_bet) {
-            continue;
-        }
-        push_snapshot_target(
-            &mut targets,
-            &mut seen,
-            &tracked_bet.event,
-            &tracked_bet.market,
-            &tracked_bet.selection,
-            "",
-        );
-    }
-    for sportsbook_bet in &snapshot.other_open_bets {
-        push_snapshot_target(
-            &mut targets,
-            &mut seen,
-            &sportsbook_bet.event,
-            &sportsbook_bet.market,
-            &sportsbook_bet.label,
-            "",
-        );
-    }
-    targets
-}
-
-fn push_snapshot_target(
-    targets: &mut Vec<SnapshotMarketTarget>,
-    seen: &mut HashSet<String>,
-    event: &str,
-    market: &str,
-    selection: &str,
-    event_url: &str,
-) {
-    if event.trim().is_empty() || market.trim().is_empty() || selection.trim().is_empty() {
-        return;
-    }
-    let key = format!(
-        "{}|{}|{}",
-        normalize_key(event),
-        normalize_key(market),
-        normalize_key(selection)
-    );
-    if !seen.insert(key) {
-        return;
-    }
-    targets.push(SnapshotMarketTarget {
-        event: event.to_string(),
-        market: market.to_string(),
-        selection: selection.to_string(),
-        event_url: event_url.to_string(),
-    });
-}
-
-fn push_external_quote_row(
-    rows: &mut Vec<ExternalQuoteRow>,
-    seen: &mut HashSet<String>,
-    row: ExternalQuoteRow,
-) {
-    let key = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        normalize_key(&row.provider),
-        normalize_key(&row.venue),
-        normalize_key(&row.event),
-        normalize_key(&row.market),
-        normalize_key(&row.selection),
-        normalize_key(&row.side),
-        row.price.unwrap_or_default(),
-        row.event_id.as_str(),
-        row.selection_id.as_str()
-    );
-    if seen.insert(key) {
-        rows.push(row);
-    }
-}
-
-fn matchbook_offer_matches_target(
-    offer: &MatchbookOfferRow,
-    target: &SnapshotMarketTarget,
-) -> bool {
-    event_matches(&offer.event_name, &target.event)
-        && market_matches(&offer.market_name, &target.market)
-        && selection_matches_with_context(
-            &offer.selection_name,
-            &offer.event_name,
-            &offer.market_name,
-            &target.selection,
-            &target.event,
-            &target.market,
-        )
-}
-
-fn matchbook_bet_matches_target(bet: &MatchbookBetRow, target: &SnapshotMarketTarget) -> bool {
-    event_matches(&bet.event_name, &target.event)
-        && market_matches(&bet.market_name, &target.market)
-        && selection_matches_with_context(
-            &bet.selection_name,
-            &bet.event_name,
-            &bet.market_name,
-            &target.selection,
-            &target.event,
-            &target.market,
-        )
-}
-
-fn matchbook_position_matches_target(
-    position: &MatchbookPositionRow,
-    target: &SnapshotMarketTarget,
-) -> bool {
-    event_matches(&position.event_name, &target.event)
-        && market_matches(&position.market_name, &target.market)
-        && selection_matches_with_context(
-            &position.selection_name,
-            &position.event_name,
-            &position.market_name,
-            &target.selection,
-            &target.event,
-            &target.market,
-        )
-}
-
 fn normalize_snapshot(
     mut snapshot: ExchangePanelSnapshot,
     disabled_venues: &str,
@@ -7488,10 +7050,7 @@ mod tests {
         WorkerSummary,
     };
     use crate::manual_positions::ManualPositionEntry;
-    use crate::owls::{
-        self, OwlsDashboard, OwlsEndpointId, OwlsLiveIncident, OwlsLiveScoreEvent, OwlsLiveStat,
-        OwlsMarketQuote, OwlsPlayerRating, OwlsPreviewRow, OwlsSyncReason,
-    };
+    use crate::owls::{self, OwlsDashboard, OwlsEndpointId, OwlsMarketQuote, OwlsPreviewRow, OwlsSyncReason};
     use crate::provider::{ExchangeProvider, ProviderRequest, ProviderSnapshot};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
     use crate::resource_state::ResourcePhase;
@@ -7504,8 +7063,8 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::{
-        populate_snapshot_enrichment, App, NotificationLevel, OwlsSyncJob, OwlsSyncResult, Panel,
-        ProviderJob, ProviderResult, TradingSection, MAX_EVENT_HISTORY,
+        App, NotificationLevel, OwlsSyncJob, OwlsSyncResult, Panel, ProviderJob, ProviderResult,
+        TradingSection, MAX_EVENT_HISTORY,
     };
 
     struct RefreshingProvider {
@@ -9350,124 +8909,6 @@ mod tests {
         app.replace_snapshot(snapshot);
 
         assert_eq!(app.owls_sport(), "soccer");
-    }
-
-    #[test]
-    fn snapshot_enrichment_projects_owls_quotes_and_live_scores() {
-        let mut snapshot = sample_snapshot("snapshot");
-        snapshot.open_positions = vec![OpenPositionRow {
-            event: String::from("Malta vs Luxembourg"),
-            event_status: String::new(),
-            event_url: String::from("https://example.com/malta-luxembourg"),
-            contract: String::from("Draw"),
-            market: String::from("Full-time result"),
-            status: String::from("open"),
-            market_status: String::from("live"),
-            is_in_play: true,
-            price: 3.35,
-            stake: 25.0,
-            liability: 58.75,
-            current_value: 25.0,
-            pnl_amount: 0.0,
-            overall_pnl_known: true,
-            current_back_odds: Some(3.35),
-            current_implied_probability: Some(1.0 / 3.35),
-            current_implied_percentage: Some(100.0 / 3.35),
-            current_buy_odds: Some(3.35),
-            current_buy_implied_probability: Some(1.0 / 3.35),
-            current_sell_odds: Some(3.4),
-            current_sell_implied_probability: Some(1.0 / 3.4),
-            current_score: String::new(),
-            current_score_home: None,
-            current_score_away: None,
-            live_clock: String::new(),
-            can_trade_out: true,
-        }];
-
-        let mut dashboard = OwlsDashboard::default();
-        dashboard.sport = String::from("soccer");
-        if let Some(endpoint) = dashboard
-            .endpoints
-            .iter_mut()
-            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
-        {
-            endpoint.status = String::from("ready");
-            endpoint.quotes = vec![
-                OwlsMarketQuote {
-                    book: String::from("matchbook"),
-                    event: String::from("Luxembourg @ Malta"),
-                    selection: String::from("Draw"),
-                    market_key: String::from("h2h"),
-                    decimal_price: Some(3.25),
-                    limit_amount: Some(120.0),
-                    ..OwlsMarketQuote::default()
-                },
-                OwlsMarketQuote {
-                    book: String::from("pinnacle"),
-                    event: String::from("Luxembourg @ Malta"),
-                    selection: String::from("Draw"),
-                    market_key: String::from("h2h"),
-                    decimal_price: Some(3.10),
-                    ..OwlsMarketQuote::default()
-                },
-            ];
-        }
-        if let Some(endpoint) = dashboard
-            .endpoints
-            .iter_mut()
-            .find(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
-        {
-            endpoint.status = String::from("ready");
-            endpoint.live_scores = vec![OwlsLiveScoreEvent {
-                sport: String::from("soccer"),
-                event_id: String::from("soccer:Malta@Luxembourg-20260325"),
-                name: String::from("Malta at Luxembourg"),
-                home_team: String::from("Luxembourg"),
-                away_team: String::from("Malta"),
-                home_score: Some(1),
-                away_score: Some(2),
-                status_state: String::from("in"),
-                status_detail: String::from("72'"),
-                display_clock: String::from("72"),
-                source_match_id: String::from("owls-1"),
-                last_updated: String::from("2026-03-25T11:12:13Z"),
-                stats: vec![OwlsLiveStat {
-                    key: String::from("expectedGoals"),
-                    label: String::from("xG"),
-                    home_value: String::from("0.8"),
-                    away_value: String::from("1.7"),
-                }],
-                incidents: vec![OwlsLiveIncident {
-                    minute: Some(58),
-                    incident_type: String::from("goal"),
-                    team_side: String::from("away"),
-                    player_name: String::from("Attard"),
-                    detail: String::new(),
-                }],
-                player_ratings: vec![OwlsPlayerRating {
-                    player_name: String::from("Teuma"),
-                    team_side: String::from("away"),
-                    rating: Some(8.4),
-                }],
-            }];
-        }
-
-        populate_snapshot_enrichment(&mut snapshot, &dashboard, None, None);
-
-        assert!(snapshot.external_quotes.iter().any(|quote| {
-            quote.provider == "owls"
-                && quote.venue == "matchbook"
-                && quote.price == Some(3.25)
-                && quote.liquidity == Some(120.0)
-        }));
-        assert!(snapshot.external_quotes.iter().any(|quote| {
-            quote.is_sharp && quote.venue == "pinnacle" && quote.price == Some(3.10)
-        }));
-        assert_eq!(snapshot.external_live_events.len(), 1);
-        assert_eq!(snapshot.external_live_events[0].display_clock, "72");
-        assert_eq!(snapshot.external_live_events[0].stats.len(), 1);
-        assert_eq!(snapshot.open_positions[0].current_score, "2-1");
-        assert_eq!(snapshot.open_positions[0].live_clock, "72");
     }
 
     #[test]
