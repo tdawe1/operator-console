@@ -1,5 +1,6 @@
 mod models;
 
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
@@ -131,7 +132,7 @@ fn operator_active_to_dashboard(active: OperatorActiveResponse) -> MarketIntelDa
             active.summary.arbitrage_matches,
             active.summary.positive_ev_matches
         ),
-        total_events: active.matches.len(),
+        total_events: active.matches.iter().map(|m| m.event_id.clone()).collect::<HashSet<_>>().len(),
         total_opportunities: active.summary.total_matches,
         ..MarketIntelDashboard::default()
     };
@@ -157,7 +158,14 @@ fn operator_match_to_row(item: OperatorMatchOpportunity) -> MarketOpportunityRow
         .quotes
         .iter()
         .cloned()
-        .map(|quote| operator_quote_to_quote_row(quote, item.is_live))
+        .map(|mut quote| {
+            let mut row = operator_quote_to_quote_row(quote, item.is_live);
+            // Populate missing fields from parent context
+            row.event_id = item.event_id.clone();
+            row.event_name = item.event_name.clone();
+            row.market_name = item.market_name.clone();
+            row
+        })
         .collect::<Vec<_>>();
 
     if quotes.is_empty() {

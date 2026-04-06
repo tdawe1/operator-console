@@ -8,7 +8,7 @@ use crate::app::{App, OwlsFocus, OwlsMarketSelection, TradingSection};
 use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(13)]).split(area);
+    let layout = Layout::vertical([Constraint::Length(11), Constraint::Min(13)]).split(area);
     let body = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(layout[1]);
     let right = Layout::vertical([Constraint::Length(10), Constraint::Min(8)]).split(body[1]);

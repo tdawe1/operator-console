@@ -767,7 +767,7 @@ impl App {
             return Vec::new();
         };
 
-        let mut grouped = BTreeMap::<(String, String, String, String), OwlsMarketSelection>::new();
+        let mut grouped = BTreeMap::<(String, String, String, String, String, String), OwlsMarketSelection>::new();
         for quote in endpoint
             .quotes
             .iter()
@@ -781,6 +781,8 @@ impl App {
                     .point
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_default(),
+                normalize_key(&quote.league),
+                normalize_key(&quote.country_code),
             );
             let entry = grouped.entry(key).or_insert_with(|| OwlsMarketSelection {
                 event: quote.event.clone(),
@@ -2405,6 +2407,12 @@ impl App {
         self.last_recorder_start_failure = None;
         self.recorder_startup_alerts_pending = false;
         self.recorder_startup_alerts_muted_until = None;
+        // Clear pending write jobs before restarting provider to avoid replaying recorder-session writes
+        if let Some(pending) = &self.provider_pending_job {
+            if !matches!(pending.request, ProviderRequest::LoadDashboard | ProviderRequest::RefreshCached | ProviderRequest::RefreshLive | ProviderRequest::SelectVenue(_) | ProviderRequest::LoadHorseMatcher { .. }) {
+                self.provider_pending_job = None;
+            }
+        }
         self.restart_provider_worker((self.make_base_provider)());
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::LoadDashboard,

@@ -242,16 +242,18 @@ fn dotenv_value_from_paths(name: &str, paths: &[PathBuf]) -> Option<String> {
 
 fn dotenv_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        let home_path = PathBuf::from(home);
-        paths.push(home_path.join(".env"));
-        paths.push(home_path.join(".env.local"));
-    }
+    // Search repository tree (project directories) before home directory
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors() {
-            paths.push(ancestor.join(".env"));
+            // Within each directory, check .env.local before .env
             paths.push(ancestor.join(".env.local"));
+            paths.push(ancestor.join(".env"));
         }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        paths.push(home_path.join(".env.local"));
+        paths.push(home_path.join(".env"));
     }
     paths
 }

@@ -693,7 +693,7 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled("Movement", Style::default().add_modifier(Modifier::BOLD)),
-            Line::raw("1-3 switch workspaces"),
+            Line::raw("1-3 and Alt+1-3 switch workspaces"),
             Line::raw("h/j/k/l focus panes"),
             Line::raw("Left/Right switch sections"),
             Line::raw("Up/Down navigate inside pane"),
