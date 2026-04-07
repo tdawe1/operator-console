@@ -4,22 +4,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, IntelRow, IntelSourceStatus, IntelView};
+use crate::app::{App, IntelRow, IntelView};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let overview_height = if area.width < 44 { 7 } else { 6 };
     let layout = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(5),
-        Constraint::Min(12),
+        Constraint::Length(overview_height),
+        Constraint::Min(10),
     ])
     .split(area);
-    let body = Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
-        .split(layout[2]);
 
     render_tabs(frame, layout[0], app);
     render_overview(frame, layout[1], app);
-    render_table(frame, body[0], app);
-    render_detail(frame, body[1], app);
+    render_table(frame, layout[2], app);
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -49,6 +47,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let compact = area.width < 44;
     let rows = app.intel_rows();
     let tradable_count = rows.iter().filter(|row| row.can_open_action()).count();
     let best_edge = rows
@@ -62,11 +61,50 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = app.selected_intel_row();
     let title = format!("Intel {}", app.intel_view().label());
 
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).areas(area);
-
-    let body =
-        Paragraph::new(vec![
+    let lines = if compact {
+        vec![
+            Line::from(vec![
+                badge("View", app.intel_view().label(), accent_blue()),
+                Span::raw(" "),
+                badge(
+                    "Sources",
+                    &format!(
+                        "{}/{}",
+                        app.intel_ready_sources(),
+                        app.intel_source_statuses().len()
+                    ),
+                    accent_green(),
+                ),
+            ]),
+            Line::from(vec![
+                badge("Tradable", &tradable_count.to_string(), accent_gold()),
+                Span::raw(" "),
+                badge("Top", &format!("{best_edge:.1}%"), accent_pink()),
+            ]),
+            Line::from(vec![
+                Span::styled("Selection ", Style::default().fg(accent_cyan())),
+                Span::styled(
+                    selected
+                        .as_ref()
+                        .map(|row| format!("{} • {}", truncate(&row.event, 18), truncate(&row.selection, 12)))
+                        .unwrap_or_else(|| String::from("No Intel opportunity selected.")),
+                    Style::default()
+                        .fg(text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Workflow  ", Style::default().fg(accent_gold())),
+                Span::raw(
+                    selected
+                        .as_ref()
+                        .map(workflow_summary)
+                        .unwrap_or("tab cycle Intel view • select a row"),
+                ),
+            ]),
+        ]
+    } else {
+        vec![
             Line::from(vec![
                 badge("View", app.intel_view().label(), accent_blue()),
                 Span::raw("  "),
@@ -84,7 +122,6 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::raw("  "),
                 badge("Top", &format!("{best_edge:.1}%"), accent_pink()),
             ]),
-            Line::raw(""),
             Line::from(vec![
                 Span::styled("Selection  ", Style::default().fg(accent_cyan())),
                 Span::styled(
@@ -112,39 +149,13 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     "tab cycle Intel view  •  select a row for calculator/action handoff",
                 )),
             ]),
-        ])
+        ]
+    };
+
+    let body = Paragraph::new(lines)
         .block(section_block(&title, accent_blue()))
         .wrap(Wrap { trim: true });
-    frame.render_widget(body, left);
-
-    let metrics = Table::new(
-        vec![
-            Row::new(vec![Cell::from("Rows"), Cell::from(rows.len().to_string())]),
-            Row::new(vec![
-                Cell::from("Tradable"),
-                Cell::from(tradable_count.to_string()),
-            ]),
-            Row::new(vec![
-                Cell::from("Best Edge"),
-                Cell::from(format!("{best_edge:.1}%")),
-            ]),
-            Row::new(vec![
-                Cell::from("Freshness"),
-                Cell::from(app.intel_freshness_label().to_string()),
-            ]),
-        ],
-        [Constraint::Length(10), Constraint::Min(8)],
-    )
-    .header(
-        Row::new(vec!["Metric", "Value"]).style(
-            Style::default()
-                .fg(accent_cyan())
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .column_spacing(1)
-    .block(section_block("Board", accent_cyan()));
-    frame.render_widget(metrics, right);
+    frame.render_widget(body, area);
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -168,40 +179,58 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
+    let compact = area.width < 52;
     let rows = intel_rows
         .into_iter()
         .map(|row| {
-            Row::new(vec![
-                Cell::from(row.source.label()),
-                Cell::from(truncate(&row.event, 22)),
-                Cell::from(truncate(&row.selection, 16)),
-                Cell::from(format!("{}/{}", row.bookmaker, row.exchange)),
-                Cell::from(metric_summary(&row)).style(Style::default().fg(metric_color(&row))),
-                Cell::from(row.updated_at.clone()).style(Style::default().fg(muted_text())),
-            ])
+            if compact {
+                Row::new(vec![
+                    Cell::from(row.source.label()),
+                    Cell::from(truncate(&row.event, 18)),
+                    Cell::from(truncate(&row.selection, 12)),
+                    Cell::from(metric_summary(&row)).style(Style::default().fg(metric_color(&row))),
+                ])
+            } else {
+                Row::new(vec![
+                    Cell::from(row.source.label()),
+                    Cell::from(truncate(&row.event, 22)),
+                    Cell::from(truncate(&row.selection, 16)),
+                    Cell::from(format!("{}/{}", row.bookmaker, row.exchange)),
+                    Cell::from(metric_summary(&row)).style(Style::default().fg(metric_color(&row))),
+                    Cell::from(row.updated_at.clone()).style(Style::default().fg(muted_text())),
+                ])
+            }
         })
         .collect::<Vec<_>>();
 
+    let layout = Layout::vertical([Constraint::Min(8), Constraint::Length(7)]).split(area);
+
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(11),
-            Constraint::Length(24),
-            Constraint::Length(18),
-            Constraint::Length(22),
-            Constraint::Length(14),
-            Constraint::Min(10),
-        ],
+        if compact {
+            vec![
+                Constraint::Length(6),
+                Constraint::Min(12),
+                Constraint::Length(12),
+                Constraint::Length(10),
+            ]
+        } else {
+            vec![
+                Constraint::Length(11),
+                Constraint::Length(24),
+                Constraint::Length(18),
+                Constraint::Length(22),
+                Constraint::Length(14),
+                Constraint::Min(10),
+            ]
+        },
     )
     .header(
-        Row::new(vec![
-            "Source",
-            "Event",
-            "Selection",
-            "Route",
-            "Signal",
-            "Fresh",
-        ])
+        Row::new(if compact {
+            vec!["Source", "Event", "Sel", "Signal"]
+        } else {
+            vec!["Source", "Event", "Selection", "Route", "Signal", "Fresh"]
+        })
         .style(
             Style::default()
                 .fg(accent_cyan())
@@ -214,175 +243,73 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .bg(selected_background())
             .add_modifier(Modifier::BOLD),
     )
-    .column_spacing(1)
+    .column_spacing(if compact { 1 } else { 2 })
     .block(section_block("Opportunity Board", accent_cyan()));
-    frame.render_stateful_widget(table, area, app.intel_table_state());
+    frame.render_stateful_widget(table, layout[0], app.intel_table_state());
+    render_selected_summary(frame, layout[1], app);
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let layout = Layout::vertical([
-        Constraint::Length(10),
-        Constraint::Length(8),
-        Constraint::Min(7),
-    ])
-    .split(area);
-    render_selected_row(frame, layout[0], app.selected_intel_row().as_ref());
-    render_source_health(frame, layout[1], &app.intel_source_statuses());
-    render_workflow(frame, layout[2], app.selected_intel_row().as_ref());
-}
+fn render_selected_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let selected = app.selected_intel_row();
+    let statuses = app.intel_source_statuses();
 
-fn render_selected_row(frame: &mut Frame<'_>, area: Rect, selected: Option<&IntelRow>) {
-    let Some(row) = selected else {
-        let body =
-            Paragraph::new("Select an Intel row to inspect source, quote, and workflow detail.")
-                .block(section_block("Detail Rail", accent_gold()))
-                .wrap(Wrap { trim: true });
-        frame.render_widget(body, area);
-        return;
-    };
-
-    let table = Table::new(
-        vec![
-            Row::new(vec![Cell::from("Source"), Cell::from(row.source.label())]),
-            Row::new(vec![Cell::from("Status"), Cell::from(row.status.as_str())])
-                .style(Style::default().fg(status_color(&row.status))),
-            Row::new(vec![
-                Cell::from("Event"),
-                Cell::from(truncate(&row.event, 42)),
+    let lines = match selected.as_ref() {
+        Some(row) => vec![
+            Line::from(vec![
+                badge("Selected", &truncate(&row.selection, 18), accent_gold()),
+                Span::raw("  "),
+                badge("Signal", &metric_summary(row), metric_color(row)),
             ]),
-            Row::new(vec![
-                Cell::from("Market"),
-                Cell::from(format!("{} • {}", row.market, row.selection)),
+            Line::from(vec![
+                Span::styled("Event  ", Style::default().fg(accent_cyan())),
+                Span::raw(truncate(&row.event, 34)),
             ]),
-            Row::new(vec![
-                Cell::from("Back"),
-                Cell::from(format!("{:.2}", row.back_odds)),
+            Line::from(vec![
+                Span::styled("Route  ", Style::default().fg(accent_cyan())),
+                Span::raw(format!("{}/{}", row.bookmaker, row.exchange)),
             ]),
-            Row::new(vec![
-                Cell::from("Lay"),
-                Cell::from(
-                    row.lay_odds
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| String::from("-")),
-                ),
+            Line::from(vec![
+                Span::styled("Action ", Style::default().fg(accent_pink())),
+                Span::raw(workflow_summary(row)),
             ]),
-            Row::new(vec![
-                Cell::from("Fair"),
-                Cell::from(
-                    row.fair_odds
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| String::from("-")),
-                ),
-            ]),
-            Row::new(vec![
-                Cell::from("Edge"),
-                Cell::from(optional_pct(row.edge_pct)),
-            ]),
-            Row::new(vec![
-                Cell::from("Arb"),
-                Cell::from(optional_pct(row.arb_pct)),
-            ]),
-            Row::new(vec![
-                Cell::from("Liquidity"),
-                Cell::from(
-                    row.liquidity
-                        .map(|value| format!("{value:.0}"))
-                        .unwrap_or_else(|| String::from("-")),
+            Line::from(vec![
+                Span::styled("Source ", Style::default().fg(accent_green())),
+                Span::raw(
+                    statuses
+                        .first()
+                        .map(|status| {
+                            format!("{} • {}", status.source.label(), truncate(&status.detail, 24))
+                        })
+                        .unwrap_or_else(|| String::from("No source health loaded.")),
                 ),
             ]),
         ],
-        [Constraint::Length(10), Constraint::Min(12)],
-    )
-    .header(
-        Row::new(vec!["Field", "Value"]).style(
-            Style::default()
-                .fg(accent_cyan())
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .column_spacing(1)
-    .block(section_block("Detail Rail", accent_gold()));
-    frame.render_widget(table, area);
-}
-
-fn render_source_health(frame: &mut Frame<'_>, area: Rect, statuses: &[IntelSourceStatus]) {
-    let lines = statuses
-        .iter()
-        .flat_map(|status| {
-            [
-                Line::from(vec![
-                    Span::styled(
-                        status.source.label(),
-                        Style::default()
-                            .fg(accent_cyan())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        status.health.as_str(),
-                        Style::default().fg(status_color(&status.health)),
-                    ),
-                    Span::raw("  "),
-                    Span::raw(format!("{} • {}", status.freshness, status.transport)),
-                ]),
-                Line::raw(truncate(&status.detail, 46)),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-    let body = Paragraph::new(lines)
-        .block(section_block("Source Health", accent_green()))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(body, area);
-}
-
-fn render_workflow(frame: &mut Frame<'_>, area: Rect, selected: Option<&IntelRow>) {
-    let table = match selected {
-        Some(row) => Table::new(
-            vec![
-                Row::new(vec![
-                    Cell::from("Competition"),
-                    Cell::from(row.competition.clone()),
-                ]),
-                Row::new(vec![
-                    Cell::from("Route"),
-                    Cell::from(truncate(&row.route, 44)),
-                ]),
-                Row::new(vec![
-                    Cell::from("Action"),
-                    Cell::from(workflow_summary(row)),
-                ]),
-            ],
-            [Constraint::Length(12), Constraint::Min(12)],
-        )
-        .header(
-            Row::new(vec!["Step", "Detail"]).style(
-                Style::default()
-                    .fg(accent_cyan())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
-        .block(section_block("Workflow", accent_pink())),
-        None => Table::new(
-            vec![Row::new(vec![
-                Cell::from("Action"),
-                Cell::from("No Intel workflow is available without a selection."),
-            ])],
-            [Constraint::Length(12), Constraint::Min(12)],
-        )
-        .header(
-            Row::new(vec!["Step", "Detail"]).style(
-                Style::default()
-                    .fg(accent_cyan())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
-        .block(section_block("Workflow", accent_pink())),
+        None => vec![
+            Line::from(vec![Span::styled(
+                "Select an Intel row to inspect the decision rail.",
+                Style::default().fg(muted_text()),
+            )]),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Source ", Style::default().fg(accent_green())),
+                Span::raw(
+                    statuses
+                        .first()
+                        .map(|status| {
+                            format!("{} • {}", status.source.label(), truncate(&status.detail, 26))
+                        })
+                        .unwrap_or_else(|| String::from("No source health loaded.")),
+                ),
+            ]),
+        ],
     };
 
-    frame.render_widget(table, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(section_block("Decision Rail", accent_gold()))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn register_tab_targets(area: Rect, titles: &[&str]) -> Vec<Rect> {
@@ -422,12 +349,6 @@ fn metric_color(row: &IntelRow) -> Color {
     } else {
         accent_gold()
     }
-}
-
-fn optional_pct(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.1}%"))
-        .unwrap_or_else(|| String::from("-"))
 }
 
 fn workflow_summary(row: &IntelRow) -> &'static str {
@@ -476,15 +397,6 @@ fn section_block(title: &str, accent: Color) -> Block<'_> {
         .border_style(Style::default().fg(border_color()))
 }
 
-fn status_color(status: &str) -> Color {
-    match status {
-        "ready" | "fixture" | "open" => accent_green(),
-        "watch" | "degraded" | "delayed" => accent_gold(),
-        "error" | "closed" => accent_red(),
-        _ => muted_text(),
-    }
-}
-
 fn panel_background() -> Color {
     crate::theme::panel_background()
 }
@@ -519,10 +431,6 @@ fn accent_gold() -> Color {
 
 fn accent_pink() -> Color {
     crate::theme::accent_pink()
-}
-
-fn accent_red() -> Color {
-    crate::theme::accent_red()
 }
 
 fn selected_background() -> Color {

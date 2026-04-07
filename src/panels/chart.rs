@@ -1,10 +1,11 @@
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Rectangle};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use tui_big_text::{BigText, PixelSize};
 
 use crate::app::{App, IntelRow};
 use crate::market_intel::{MarketHistoryPoint, MarketQuoteComparisonRow};
@@ -16,28 +17,50 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let model = build_chart_model(app);
-    let shell = section_block("Market Chart", accent_blue());
-    let inner = shell.inner(area);
-    frame.render_widget(shell, area);
+    if area.width < 24 || area.height < 10 {
+        return;
+    }
+
+    let block = panel_block(" Price Chart ");
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    frame.render_widget(block, area);
 
     if inner.width < 20 || inner.height < 8 {
         return;
     }
 
+    let header_height = if inner.width >= 78 { 3 } else { 2 };
     let [legend_area, content_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(6)]).areas(inner);
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(6)]).areas(inner);
     render_legend(frame, legend_area, &model);
 
-    let [curve_area, ladder_area] =
-        Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .areas(content_area);
-    let [price_area, volume_area] =
-        Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .areas(curve_area);
+    if model.price_points.len() < 2 {
+        render_market_ladder(frame, content_area, &model);
+        return;
+    }
 
-    render_price_curve(frame, price_area, &model);
-    render_volume_histogram(frame, volume_area, &model);
-    render_market_ladder(frame, ladder_area, &model);
+    if content_area.height >= 18 {
+        let [price_area, volume_area, ladder_area] = Layout::vertical([
+            Constraint::Percentage(52),
+            Constraint::Length(6),
+            Constraint::Min(8),
+        ])
+        .areas(content_area);
+
+        render_price_curve(frame, price_area, &model);
+        render_volume_histogram(frame, volume_area, &model);
+        render_market_ladder(frame, ladder_area, &model);
+    } else if content_area.height >= 11 {
+        let [price_area, ladder_area] =
+            Layout::vertical([Constraint::Min(5), Constraint::Length(6)]).areas(content_area);
+        render_price_curve(frame, price_area, &model);
+        render_market_ladder(frame, ladder_area, &model);
+    } else {
+        render_price_curve(frame, content_area, &model);
+    }
 }
 
 #[derive(Clone)]
@@ -48,6 +71,7 @@ struct ChartModel {
     price_points: Vec<(f64, f64)>,
     volume_points: Vec<(f64, f64)>,
     ladder_quotes: Vec<LadderQuote>,
+    comparison_series: Vec<ChartSeries>,
     x_bounds: [f64; 2],
     y_bounds: [f64; 2],
     trend_up: bool,
@@ -65,6 +89,13 @@ struct LadderQuote {
     side: String,
     price: f64,
     liquidity: Option<f64>,
+}
+
+#[derive(Clone)]
+struct ChartSeries {
+    label: String,
+    points: Vec<(f64, f64)>,
+    color: Color,
 }
 
 fn build_chart_model(app: &App) -> ChartModel {
@@ -99,6 +130,10 @@ fn chart_from_intel_history(app: &App) -> Option<ChartModel> {
         .filter(|quote| quote_matches_selected(quote, &selected))
         .map(ladder_quote_from_market_quote)
         .collect::<Vec<_>>();
+    let comparison_series = comparison_series_from_ladder_quotes(
+        &ladder_quotes,
+        price_points.last().map(|(x, _)| *x).unwrap_or(1.0).max(1.0),
+    );
 
     Some(finalize_chart_model(
         selected.selection,
@@ -107,16 +142,26 @@ fn chart_from_intel_history(app: &App) -> Option<ChartModel> {
         price_points,
         volume_points,
         ladder_quotes,
+        comparison_series,
     ))
 }
 
 fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
     let selection = app.selected_owls_market_selection()?;
     let quotes = top_chart_quotes(&selection.quotes, 12);
-    if quotes.len() < 2 {
+    if quotes.is_empty() {
         return None;
     }
 
+    let ladder_quotes = quotes
+        .iter()
+        .map(|(quote, price)| LadderQuote {
+            venue: quote.book.clone(),
+            side: String::from("book"),
+            price: *price,
+            liquidity: quote.limit_amount,
+        })
+        .collect::<Vec<_>>();
     let price_points = quotes
         .iter()
         .enumerate()
@@ -130,19 +175,14 @@ fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
                 index as f64,
                 quote
                     .limit_amount
-                    .unwrap_or_else(|| (quotes.len() - index) as f64),
+                    .unwrap_or_else(|| (quotes.len().saturating_sub(index)) as f64),
             )
         })
         .collect::<Vec<_>>();
-    let ladder_quotes = quotes
-        .iter()
-        .map(|(quote, price)| LadderQuote {
-            venue: quote.book.clone(),
-            side: String::from("book"),
-            price: *price,
-            liquidity: quote.limit_amount,
-        })
-        .collect::<Vec<_>>();
+    let comparison_series = comparison_series_from_ladder_quotes(
+        &ladder_quotes,
+        price_points.last().map(|(x, _)| *x).unwrap_or(1.0).max(1.0),
+    );
 
     Some(finalize_chart_model(
         selection.selection_label(),
@@ -151,10 +191,11 @@ fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
             truncate(&selection.event, 34),
             selection.market_label()
         ),
-        String::from("market quotes"),
+        String::from("book distribution"),
         price_points,
         volume_points,
         ladder_quotes,
+        comparison_series,
     ))
 }
 
@@ -182,28 +223,27 @@ fn chart_from_intel_snapshot(selected: Option<&IntelRow>) -> Option<ChartModel> 
             liquidity: row.liquidity,
         });
     }
-    if ladder_quotes.len() < 2 {
+    if ladder_quotes.is_empty() {
         return None;
     }
-
-    let price_points = ladder_quotes
+    let sorted_prices = ladder_quotes
         .iter()
         .enumerate()
         .map(|(index, quote)| (index as f64, quote.price))
         .collect::<Vec<_>>();
-    let volume_points = ladder_quotes
-        .iter()
-        .enumerate()
-        .map(|(index, quote)| (index as f64, quote.liquidity.unwrap_or(1.0)))
-        .collect::<Vec<_>>();
+    let comparison_series = comparison_series_from_ladder_quotes(
+        &ladder_quotes,
+        sorted_prices.last().map(|(x, _)| *x).unwrap_or(1.0).max(1.0),
+    );
 
     Some(finalize_chart_model(
         row.selection.clone(),
         format!("{} • {}", truncate(&row.event, 34), row.market),
         String::from("snapshot ladder"),
-        price_points,
-        volume_points,
+        sorted_prices,
+        Vec::new(),
         ladder_quotes,
+        comparison_series,
     ))
 }
 
@@ -214,10 +254,22 @@ fn finalize_chart_model(
     price_points: Vec<(f64, f64)>,
     volume_points: Vec<(f64, f64)>,
     ladder_quotes: Vec<LadderQuote>,
+    comparison_series: Vec<ChartSeries>,
 ) -> ChartModel {
+    let ladder_prices = ladder_quotes.iter().map(|quote| quote.price).collect::<Vec<_>>();
     let x_max = price_points.last().map(|(x, _)| *x).unwrap_or(1.0).max(1.0);
     let (min_price, max_price) = if price_points.is_empty() {
-        (0.0, 1.0)
+        if ladder_prices.is_empty() {
+            (0.0, 1.0)
+        } else {
+            (
+                ladder_prices.iter().copied().fold(f64::INFINITY, f64::min),
+                ladder_prices
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max),
+            )
+        }
     } else {
         let min = price_points
             .iter()
@@ -233,18 +285,32 @@ fn finalize_chart_model(
     let last_price = price_points
         .last()
         .map(|(_, value)| *value)
+        .or_else(|| ladder_prices.first().copied())
         .unwrap_or_default();
     let average_price = if price_points.is_empty() {
-        0.0
+        if ladder_prices.is_empty() {
+            0.0
+        } else {
+            ladder_prices.iter().sum::<f64>() / ladder_prices.len() as f64
+        }
     } else {
         price_points.iter().map(|(_, value)| *value).sum::<f64>() / price_points.len() as f64
     };
     let last_volume = volume_points
         .last()
         .map(|(_, value)| *value)
+        .or_else(|| ladder_quotes.iter().find_map(|quote| quote.liquidity))
         .unwrap_or_default();
     let average_volume = if volume_points.is_empty() {
-        0.0
+        let liquidities = ladder_quotes
+            .iter()
+            .filter_map(|quote| quote.liquidity)
+            .collect::<Vec<_>>();
+        if liquidities.is_empty() {
+            0.0
+        } else {
+            liquidities.iter().sum::<f64>() / liquidities.len() as f64
+        }
     } else {
         volume_points.iter().map(|(_, value)| *value).sum::<f64>() / volume_points.len() as f64
     };
@@ -256,6 +322,7 @@ fn finalize_chart_model(
         price_points: price_points.clone(),
         volume_points,
         ladder_quotes,
+        comparison_series,
         x_bounds: [0.0, x_max],
         y_bounds: [min_price - padding, max_price + padding],
         trend_up: price_points
@@ -280,24 +347,131 @@ fn empty_chart_model() -> ChartModel {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     )
 }
 
 fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     let compact = area.width < 72;
+    let is_distribution = model.source == "book distribution";
+    let base_price = model
+        .price_points
+        .first()
+        .map(|(_, value)| *value)
+        .unwrap_or(model.average_price);
+    let change = model.last_price - base_price;
+    let change_pct = if base_price.abs() > f64::EPSILON {
+        (change / base_price) * 100.0
+    } else {
+        0.0
+    };
+    let move_color = if is_distribution || change >= 0.0 {
+        accent_green()
+    } else {
+        accent_red()
+    };
+    let series_label = model
+        .comparison_series
+        .iter()
+        .take(3)
+        .map(|series| truncate(&series.label, 8))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if !compact && area.height >= 4 {
+        let [headline_area, meta_area] =
+            Layout::horizontal([Constraint::Length(22), Constraint::Min(24)]).areas(area);
+        let big_price = BigText::builder()
+            .pixel_size(PixelSize::HalfHeight)
+            .style(Style::default().fg(move_color))
+            .lines(vec![Line::from(format!("{:.2}", model.last_price))])
+            .build();
+        frame.render_widget(big_price, headline_area);
+
+        let right_lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    truncate(&model.title, 18),
+                    Style::default()
+                        .fg(text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    if is_distribution {
+                        format!("Spread {:.2}", model.high_price - model.low_price)
+                    } else {
+                        format!("{:+.2} ({:+.1}%)", change, change_pct)
+                    },
+                    Style::default()
+                        .fg(move_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    truncate(&model.subtitle, 24),
+                    Style::default().fg(accent_gold()),
+                ),
+                Span::raw("  "),
+                Span::styled("Source ", Style::default().fg(muted_text())),
+                Span::styled(
+                    truncate(&model.source, 16),
+                    Style::default().fg(accent_blue()),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Avg ", Style::default().fg(muted_text())),
+                Span::styled(format!("{:.2}", model.average_price), Style::default().fg(text_color())),
+                Span::raw("   "),
+                Span::styled("Low ", Style::default().fg(muted_text())),
+                Span::styled(format!("{:.2}", model.low_price), Style::default().fg(text_color())),
+                Span::raw("   "),
+                Span::styled(
+                    if series_label.is_empty() { "High " } else { "Books " },
+                    Style::default().fg(muted_text()),
+                ),
+                Span::styled(
+                    if series_label.is_empty() {
+                        format!("{:.2}", model.high_price)
+                    } else {
+                        series_label.clone()
+                    },
+                    Style::default().fg(if series_label.is_empty() {
+                        text_color()
+                    } else {
+                        accent_cyan()
+                    }),
+                ),
+            ]),
+        ];
+        frame.render_widget(
+            Paragraph::new(right_lines)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().bg(panel_background())),
+            meta_area,
+        );
+        return;
+    }
+
     let lines = if compact {
         vec![Line::from(vec![
             Span::styled("● ", Style::default().fg(accent_cyan())),
             Span::styled(
                 truncate(&model.title, 18),
-                Style::default().fg(text_color()),
+                Style::default()
+                    .fg(text_color())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Last ", Style::default().fg(muted_text())),
+            Span::styled(
+                if is_distribution { "Best " } else { "Last " },
+                Style::default().fg(muted_text()),
+            ),
             Span::styled(
                 format!("{:.2}", model.last_price),
                 Style::default()
-                    .fg(if model.trend_up {
+                    .fg(if is_distribution || model.trend_up {
                         accent_green()
                     } else {
                         accent_red()
@@ -308,24 +482,36 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
             Span::styled("Src ", Style::default().fg(muted_text())),
             Span::styled(
                 truncate(&model.source, 14),
-                Style::default().fg(accent_pink()),
+                Style::default().fg(accent_blue()),
             ),
         ])]
     } else {
         vec![
             Line::from(vec![
                 Span::styled(" ● ", Style::default().fg(accent_cyan())),
-                Span::styled("Day Session   ", Style::default().fg(muted_text())),
+                Span::styled(
+                    if is_distribution {
+                        "Book Spread   "
+                    } else {
+                        "Day Session   "
+                    },
+                    Style::default().fg(muted_text()),
+                ),
                 Span::styled(
                     truncate(&model.title, 22),
-                    Style::default().fg(text_color()),
+                    Style::default()
+                        .fg(text_color())
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  "),
-                Span::styled("Last ", Style::default().fg(muted_text())),
+                Span::raw("   "),
+                Span::styled(
+                    if is_distribution { "Best " } else { "Last " },
+                    Style::default().fg(muted_text()),
+                ),
                 Span::styled(
                     format!("{:.2}", model.last_price),
                     Style::default()
-                        .fg(if model.trend_up {
+                        .fg(if is_distribution || model.trend_up {
                             accent_green()
                         } else {
                             accent_red()
@@ -333,10 +519,17 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
-                Span::styled("High ", Style::default().fg(muted_text())),
                 Span::styled(
-                    format!("{:.2}", model.high_price),
-                    Style::default().fg(text_color()),
+                    if is_distribution { "Spread " } else { "Move " },
+                    Style::default().fg(muted_text()),
+                ),
+                Span::styled(
+                    if is_distribution {
+                        format!("{:.2}", model.high_price - model.low_price)
+                    } else {
+                        format!("{:+.2} ({:+.1}%)", change, change_pct)
+                    },
+                    Style::default().fg(move_color),
                 ),
             ]),
             Line::from(vec![
@@ -361,7 +554,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
                 Span::styled("Source ", Style::default().fg(muted_text())),
                 Span::styled(
                     truncate(&model.source, 16),
-                    Style::default().fg(accent_pink()),
+                    Style::default().fg(accent_blue()),
                 ),
             ]),
         ]
@@ -375,7 +568,14 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 }
 
 fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Curve", accent_blue());
+    let block = section_block(
+        if model.source == "book distribution" {
+            "Price Distribution"
+        } else {
+            "Price Action"
+        },
+        accent_blue(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 4 {
@@ -391,17 +591,19 @@ fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
         return;
     }
 
-    let fill_color = if model.trend_up {
+    let is_distribution = model.source == "book distribution";
+    let fill_color = if is_distribution || model.trend_up {
         elevated_background()
     } else {
         selected_background()
     };
-    let line_color = if model.trend_up {
+    let line_color = if is_distribution || model.trend_up {
         accent_cyan()
     } else {
         accent_red()
     };
     let points = model.price_points.clone();
+    let comparison_series = model.comparison_series.clone();
     let x_bounds = model.x_bounds;
     let y_bounds = model.y_bounds;
 
@@ -431,13 +633,33 @@ fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
                         color: line_color,
                     });
                 }
+                for series in &comparison_series {
+                    for pair in series.points.windows(2) {
+                        let first = pair[0];
+                        let second = pair[1];
+                        ctx.draw(&CanvasLine {
+                            x1: first.0,
+                            y1: first.1,
+                            x2: second.0,
+                            y2: second.1,
+                            color: series.color,
+                        });
+                    }
+                }
             }),
         inner,
     );
 }
 
 fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Volume Histogram", accent_pink());
+    let block = section_block(
+        if model.source == "book distribution" {
+            "Liquidity Profile"
+        } else {
+            "Volume"
+        },
+        accent_pink(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 3 {
@@ -464,13 +686,27 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ░ ", Style::default().fg(accent_pink())),
-            Span::styled("Volume ", Style::default().fg(muted_text())),
+            Span::styled(
+                if model.source == "book distribution" {
+                    "Limit "
+                } else {
+                    "Volume "
+                },
+                Style::default().fg(muted_text()),
+            ),
             Span::styled(
                 format!("{:.0} ", model.last_volume),
                 Style::default().fg(text_color()),
             ),
             Span::styled(" █ ", Style::default().fg(accent_green())),
-            Span::styled("SMAVG(5) ", Style::default().fg(muted_text())),
+            Span::styled(
+                if model.source == "book distribution" {
+                    "Avg "
+                } else {
+                    "SMAVG(5) "
+                },
+                Style::default().fg(muted_text()),
+            ),
             Span::styled(
                 format!("{average_volume:.0}"),
                 Style::default().fg(text_color()),
@@ -520,7 +756,7 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
 }
 
 fn render_market_ladder(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Book", accent_gold());
+    let block = section_block("Order Book", accent_gold());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 24 || inner.height < 4 {
@@ -539,9 +775,9 @@ fn render_market_ladder(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     let mut quotes = model.ladder_quotes.clone();
     quotes.sort_by(|left, right| right.price.total_cmp(&left.price));
     let [left_area, center_area, right_area] = Layout::horizontal([
-        Constraint::Percentage(42),
-        Constraint::Length(18),
-        Constraint::Percentage(42),
+        Constraint::Percentage(40),
+        Constraint::Length(22),
+        Constraint::Percentage(40),
     ])
     .areas(inner);
 
@@ -574,6 +810,22 @@ fn render_market_ladder(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
                 .fg(text_color())
                 .add_modifier(Modifier::BOLD),
         ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Board ", Style::default().fg(muted_text())),
+            Span::styled(
+                if quotes
+                    .first()
+                    .map(|quote| quote.venue.eq_ignore_ascii_case("pinnacle"))
+                    .unwrap_or(false)
+                {
+                    "pinnacle"
+                } else {
+                    "multi-book"
+                },
+                Style::default().fg(accent_blue()),
+            ),
+        ]),
         Line::raw(""),
         Line::from(vec![
             Span::styled("Best ", Style::default().fg(accent_cyan())),
@@ -626,6 +878,31 @@ fn top_chart_quotes(
     top
 }
 
+fn comparison_series_from_ladder_quotes(
+    quotes: &[LadderQuote],
+    x_max: f64,
+) -> Vec<ChartSeries> {
+    let palette = [
+        accent_green(),
+        accent_gold(),
+        accent_pink(),
+        accent_blue(),
+        accent_cyan(),
+    ];
+    let mut ranked = quotes.to_vec();
+    ranked.sort_by(|left, right| right.price.total_cmp(&left.price));
+    ranked
+        .into_iter()
+        .take(4)
+        .enumerate()
+        .map(|(index, quote)| ChartSeries {
+            label: quote.venue.clone(),
+            points: vec![(0.0, quote.price), (x_max.max(1.0), quote.price)],
+            color: palette[index % palette.len()],
+        })
+        .collect()
+}
+
 fn render_ladder_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -673,7 +950,7 @@ fn render_ladder_table(
             Row::new(vec!["Venue", "Price", "Flow"])
                 .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
         )
-        .column_spacing(1)
+        .column_spacing(2)
         .block(section_block(title, accent)),
         area,
     );
@@ -751,6 +1028,19 @@ fn section_block(title: &str, accent: Color) -> Block<'_> {
         .title(Span::styled(
             format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::TOP)
+        .style(Style::default().bg(panel_background()).fg(text_color()))
+        .border_style(Style::default().fg(border_color()))
+}
+
+fn panel_block(title: &str) -> Block<'_> {
+    Block::default()
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(muted_text())
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .style(Style::default().bg(panel_background()).fg(text_color()))

@@ -4096,7 +4096,7 @@ fn section_block(title: &str, accent: Color) -> Block<'_> {
             format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }

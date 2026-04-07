@@ -70,10 +70,10 @@ pub fn render(
     let runtime = snapshot.runtime.as_ref();
 
     let layout = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(3),
         Constraint::Length(3), // row 1
-        Constraint::Length(3), // row 2
-        Constraint::Min(12),   // lower
+        Constraint::Length(2), // row 2
+        Constraint::Min(10),   // lower
     ])
     .split(area);
 
@@ -83,11 +83,11 @@ pub fn render(
 
     let lower = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(layout[3]);
-    let left = Layout::vertical([Constraint::Length(12), Constraint::Min(8)]).split(lower[0]);
+    let left = Layout::vertical([Constraint::Length(10), Constraint::Min(7)]).split(lower[0]);
     let right = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Length(7),
-        Constraint::Min(8),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Min(7),
     ])
     .split(lower[1]);
     let running_pnl = build_running_pnl_summary(snapshot, total_open_pnl);
@@ -1248,7 +1248,7 @@ fn section_block(title: &'static str, color: Color) -> Block<'static> {
             format!(" {} ", title),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }

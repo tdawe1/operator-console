@@ -355,9 +355,9 @@ pub(crate) fn effective_ratios(
 
     let baseline_ratio = base.get(index).copied().unwrap_or_default();
     let emphasis_ratio = match children.len() {
-        2 => baseline_ratio.saturating_add(12).clamp(68, 82),
-        3 => baseline_ratio.saturating_add(8).clamp(56, 72),
-        _ => baseline_ratio.saturating_add(6).clamp(50, 60),
+        2 => baseline_ratio.saturating_add(8).clamp(58, 64),
+        3 => baseline_ratio.saturating_add(10).clamp(44, 50),
+        _ => baseline_ratio.saturating_add(6).clamp(40, 48),
     };
     if baseline_ratio >= emphasis_ratio {
         return base;
@@ -417,10 +417,10 @@ impl WindowManager {
     pub fn set_predefined_workspaces(&mut self) {
         self.workspaces = vec![
             Workspace {
-                name: "Ledger".to_string(),
+                name: "Trading".to_string(),
                 root: split(
                     SplitDirection::Horizontal,
-                    vec![22, 50, 28],
+                    vec![33, 34, 33],
                     vec![
                         split(
                             SplitDirection::Vertical,
@@ -441,11 +441,19 @@ impl WindowManager {
             Workspace {
                 name: "Markets".to_string(),
                 root: split(
-                    SplitDirection::Vertical,
-                    vec![58, 42],
-                    vec![pane(PaneId::Chart), pane(PaneId::Markets)],
+                    SplitDirection::Horizontal,
+                    vec![22, 50, 28],
+                    vec![
+                        pane(PaneId::Intel),
+                        split(
+                            SplitDirection::Vertical,
+                            vec![36, 64],
+                            vec![pane(PaneId::Markets), pane(PaneId::Chart)],
+                        ),
+                        pane(PaneId::Matcher),
+                    ],
                 ),
-                minimized: vec![PaneId::Matcher, PaneId::Live, PaneId::Props],
+                minimized: vec![PaneId::Live, PaneId::Props],
                 emphasized_pane: None,
             },
             Workspace {
@@ -631,10 +639,13 @@ mod tests {
         let market_panes = wm.current_workspace().pane_rects();
         assert!(market_panes
             .iter()
-            .any(|(pane, _)| matches!(pane, PaneId::Markets | PaneId::Live | PaneId::Props)));
+            .any(|(pane, _)| matches!(
+                pane,
+                PaneId::Intel | PaneId::Markets | PaneId::Chart | PaneId::Matcher
+            )));
         assert!(market_panes
             .iter()
-            .all(|(pane, _)| !matches!(pane, PaneId::Matcher)));
+            .all(|(pane, _)| !matches!(pane, PaneId::Live | PaneId::Props)));
 
         wm.switch_workspace(2);
         let control_panes = wm.current_workspace().pane_rects();
@@ -681,9 +692,27 @@ mod tests {
             .find_map(|(pane, rect)| (pane == PaneId::Chart).then_some(rect))
             .expect("emphasized chart rect");
 
-        assert!(emphasized.width >= baseline.width);
-        assert!(emphasized.height > baseline.height);
+        let baseline_area = baseline.width * baseline.height;
+        let emphasized_area = emphasized.width * emphasized.height;
+
+        assert!(emphasized.width >= baseline.width || emphasized.height >= baseline.height);
+        assert!(emphasized_area > baseline_area);
 
         assert!(!wm.toggle_pane_emphasis(PaneId::Chart));
+    }
+
+    #[test]
+    fn markets_workspace_supports_matcher_focus_and_emphasis() {
+        let mut wm = WindowManager::default();
+
+        wm.switch_workspace(1);
+
+        assert!(wm.focus_pane(PaneId::Matcher));
+        assert_eq!(wm.active_pane, Some(PaneId::Matcher));
+        assert!(wm.toggle_pane_emphasis(PaneId::Matcher));
+        assert_eq!(
+            wm.current_workspace().emphasized_pane,
+            Some(PaneId::Matcher)
+        );
     }
 }

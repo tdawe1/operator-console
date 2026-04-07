@@ -37,7 +37,12 @@ fn help_text_mentions_core_operator_keys() {
     assert!(help.contains("D"));
     assert!(help.contains("h/j/k/l panes"));
     assert!(help.contains("1-3 workspaces"));
-    assert!(help.contains("left/right sections"));
+    assert!(help.contains("left/right adjacent pane") || help.contains("Left/Right adjacent pane"));
+    assert!(
+        help.contains("Ctrl+Left/Right switch sections")
+            || help.contains("ctrl+left/right switch sections")
+            || help.contains("ctrl+left/right sections")
+    );
     assert!(help.contains("f maximize pane"));
     assert!(help.contains("[/] cycle sport or suggestions"));
 }

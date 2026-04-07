@@ -65,7 +65,7 @@ fn accounts_panel_renders_venue_board() {
 }
 
 #[test]
-fn chart_pane_renders_market_curve() {
+fn chart_pane_prefers_quote_ladder_when_no_history_exists() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: sample_snapshot(),
     })
@@ -116,9 +116,9 @@ fn chart_pane_renders_market_curve() {
 
     let rendered = render_app(&mut app);
 
-    assert!(rendered.contains("Market Chart") || rendered.contains("CHART"));
-    assert!(rendered.contains("Curve"));
-    assert!(rendered.contains("market quotes"));
+    assert!(rendered.contains("Chart") || rendered.contains("CHART"));
+    assert!(rendered.contains("quote ladder"));
+    assert!(rendered.contains("Top Books") || rendered.contains("Book"));
     assert!(rendered.contains("Arsenal"));
     assert!(rendered.contains("Arsenal v Everton"));
 }

@@ -4,22 +4,32 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, OwlsFocus, OwlsMarketSelection, TradingSection};
-use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary};
+use crate::app::{App, OwlsFocus, TradingSection};
+use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary, OwlsMarketSelection};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let layout = Layout::vertical([Constraint::Length(11), Constraint::Min(13)]).split(area);
-    let body = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
-        .split(layout[1]);
-    let right = Layout::vertical([Constraint::Length(10), Constraint::Min(8)]).split(body[1]);
+    render_for_section(frame, area, app, app.active_trading_section());
+}
 
-    render_overview(frame, layout[0], app, app.selected_owls_endpoint());
-    render_endpoint_table(frame, body[0], app);
-    render_market_table(frame, right[0], app);
+pub fn render_for_section(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    section: TradingSection,
+) {
+    let layout = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Min(7),
+    ])
+    .split(area);
+
+    render_overview(frame, layout[0], app, section, app.selected_owls_endpoint());
+    render_market_table(frame, layout[1], app);
     render_overlay_preview(
         frame,
-        right[1],
-        app.active_trading_section(),
+        layout[2],
+        section,
         app.selected_owls_endpoint(),
         app.selected_owls_market_selection(),
     );
@@ -61,6 +71,7 @@ fn render_overview(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
+    section: TradingSection,
     selected: Option<&OwlsEndpointSummary>,
 ) {
     let owls = app.owls_dashboard();
@@ -88,7 +99,7 @@ fn render_overview(
                 endpoint.path,
                 endpoint.status,
                 endpoint.count,
-                endpoint.quotes.len(),
+                endpoint.quote_count,
                 endpoint.poll_count,
                 endpoint.change_count
             )
@@ -106,9 +117,6 @@ fn render_overview(
             )
         })
         .unwrap_or_else(|| String::from("No event market selected."));
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)]).areas(area);
-
     let body = Paragraph::new(vec![
         Line::from(vec![
             badge("Sport", owls.sport.as_str(), accent_blue()),
@@ -137,10 +145,7 @@ fn render_overview(
         ]),
         Line::from(vec![
             Span::styled("Coverage  ", Style::default().fg(accent_gold())),
-            Span::raw(group_summary_line(
-                &owls.groups,
-                app.active_trading_section(),
-            )),
+            Span::raw(group_summary_line(&owls.groups, section)),
         ]),
         Line::from(vec![
             Span::styled("Controls  ", Style::default().fg(accent_pink())),
@@ -166,95 +171,11 @@ fn render_overview(
         ]),
     ])
     .block(section_block(
-        section_title(app.active_trading_section()),
+        section_title(section),
         accent_blue(),
     ))
     .wrap(Wrap { trim: true });
-    frame.render_widget(body, left);
-
-    let board = Table::new(
-        vec![
-            Row::new(vec![
-                Cell::from("Focus"),
-                Cell::from(app.owls_focus().label()),
-            ]),
-            Row::new(vec![
-                Cell::from("View"),
-                Cell::from(section_title(app.active_trading_section())),
-            ]),
-            Row::new(vec![
-                Cell::from("Endpoints"),
-                Cell::from(app.visible_owls_endpoints().len().to_string()),
-            ]),
-            Row::new(vec![
-                Cell::from("Markets"),
-                Cell::from(app.owls_market_selections().len().to_string()),
-            ]),
-        ],
-        [Constraint::Length(10), Constraint::Min(8)],
-    )
-    .header(
-        Row::new(vec!["Metric", "Value"]).style(
-            Style::default()
-                .fg(accent_cyan())
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .column_spacing(1)
-    .block(section_block("Board", accent_cyan()));
-    frame.render_widget(board, right);
-}
-
-fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let rows = app
-        .visible_owls_endpoints()
-        .into_iter()
-        .map(|endpoint| {
-            Row::new(vec![
-                Cell::from(endpoint.group.short()),
-                Cell::from(endpoint.label.clone()),
-                Cell::from(endpoint.status.clone()).style(
-                    Style::default()
-                        .fg(status_color(&endpoint.status))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(endpoint.count.to_string()),
-                Cell::from(truncate(&endpoint.path, 28)).style(Style::default().fg(muted_text())),
-                Cell::from(truncate(&compact_endpoint_detail(&endpoint.detail), 18)),
-            ])
-        })
-        .collect::<Vec<_>>();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(18),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(30),
-            Constraint::Min(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["G", "Endpoint", "State", "Rows", "Route", "Detail"]).style(
-            Style::default()
-                .fg(accent_cyan())
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .row_highlight_style(
-        Style::default()
-            .fg(selected_text())
-            .bg(selected_background())
-            .add_modifier(Modifier::BOLD),
-    )
-    .column_spacing(1)
-    .block(section_block(
-        board_title(app.active_trading_section()),
-        accent_cyan(),
-    ));
-    frame.render_stateful_widget(table, area, app.owls_endpoint_table_state());
+    frame.render_widget(body, area);
 }
 
 fn render_market_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -319,7 +240,7 @@ fn render_market_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .bg(selected_background())
             .add_modifier(Modifier::BOLD),
     )
-    .column_spacing(1)
+    .column_spacing(2)
     .block(section_block("Event Markets", accent));
     frame.render_stateful_widget(table, area, app.owls_market_table_state());
 }
@@ -365,7 +286,7 @@ fn render_overlay_summary(
             Span::raw(endpoint.updated_at.as_str().if_empty("-")),
             Span::raw("  "),
             Span::styled("Quotes ", Style::default().fg(accent_green())),
-            Span::raw(endpoint.quotes.len().to_string()),
+            Span::raw(endpoint.quote_count.to_string()),
         ]),
     ])
     .block(section_block("Inspect", accent_gold()))
@@ -417,7 +338,7 @@ fn render_selection_meta(
         ]),
         Line::from(vec![
             Span::styled("Quotes", Style::default().fg(accent_cyan())),
-            Span::raw(format!(" {}", endpoint.quotes.len())),
+            Span::raw(format!(" {}", endpoint.quote_count)),
         ]),
         Line::from(vec![
             Span::styled("Books", Style::default().fg(accent_cyan())),
@@ -568,7 +489,7 @@ fn render_overlay_preview(
                         .add_modifier(Modifier::BOLD),
                 ),
             )
-            .column_spacing(1)
+            .column_spacing(2)
             .block(section_block(preview_title(section), accent_pink()));
             frame.render_widget(table, area);
         }
@@ -622,7 +543,7 @@ fn render_quote_ladder(
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .column_spacing(1)
+    .column_spacing(2)
     .block(section_block("Top Books", accent_green()));
     frame.render_widget(left_table, left);
 
@@ -699,7 +620,7 @@ fn render_quote_ladder(
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .column_spacing(1)
+    .column_spacing(2)
     .block(section_block("Field", accent_gold()));
     frame.render_widget(right_table, right);
 }
@@ -794,15 +715,6 @@ fn section_title(section: TradingSection) -> &'static str {
         TradingSection::Live => "Owls Live",
         TradingSection::Props => "Owls Props",
         _ => "Owls",
-    }
-}
-
-fn board_title(section: TradingSection) -> &'static str {
-    match section {
-        TradingSection::Markets => "Endpoint Board",
-        TradingSection::Live => "Live Board",
-        TradingSection::Props => "Props Board",
-        _ => "Board",
     }
 }
 

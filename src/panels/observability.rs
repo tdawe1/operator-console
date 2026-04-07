@@ -508,7 +508,7 @@ fn render_block(frame: &mut Frame<'_>, area: Rect, title: &str, rows: Vec<Line<'
                         .fg(crate::theme::accent_blue())
                         .add_modifier(Modifier::BOLD),
                 ))
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .style(
                     Style::default()
                         .bg(crate::theme::panel_background())
