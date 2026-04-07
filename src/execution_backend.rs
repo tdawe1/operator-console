@@ -218,6 +218,10 @@ pub fn submit_adhoc_execution(request: &AdhocExecutionRequest) -> Result<Executi
     decode_json_response(response, "ad hoc execution submit")
 }
 
+pub fn is_not_found_error(detail: &str) -> bool {
+    detail.contains("HTTP 404 during")
+}
+
 fn build_backend_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_millis(750))
@@ -298,17 +302,27 @@ fn dotenv_value_from_paths(name: &str, paths: &[PathBuf]) -> Option<String> {
 
 fn dotenv_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        let home_path = PathBuf::from(home);
-        paths.push(home_path.join(".env"));
-        paths.push(home_path.join(".env.local"));
-    }
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors() {
-            paths.push(ancestor.join(".env"));
             paths.push(ancestor.join(".env.local"));
+            paths.push(ancestor.join(".env"));
         }
     }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(executable_dir) = executable.parent() {
+            for ancestor in executable_dir.ancestors() {
+                paths.push(ancestor.join(".env.local"));
+                paths.push(ancestor.join(".env"));
+            }
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        paths.push(home_path.join(".env.local"));
+        paths.push(home_path.join(".env"));
+    }
+    paths.sort();
+    paths.dedup();
     paths
 }
 

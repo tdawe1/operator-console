@@ -12,8 +12,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::app::{
-    start_market_intel_worker, start_oddsmatcher_worker, MarketIntelJob, MarketIntelResult,
-    OddsMatcherJob, OddsMatcherResult, OwlsSyncJob, OwlsSyncResult, ProviderJob, ProviderResult,
+    start_backend_execution_worker, start_market_intel_worker, start_oddsmatcher_worker,
+    BackendExecutionJob, BackendExecutionResult, MarketIntelJob, MarketIntelResult, OddsMatcherJob,
+    OddsMatcherResult, OwlsSyncJob, OwlsSyncResult, ProviderJob, ProviderResult,
 };
 use crate::provider::ExchangeProvider;
 
@@ -52,6 +53,8 @@ impl AppRuntimeHost {
 pub(crate) struct AppRuntimeChannels {
     pub(crate) provider_tx: UnboundedSender<ProviderJob>,
     pub(crate) provider_rx: UnboundedReceiver<ProviderResult>,
+    pub(crate) backend_execution_tx: Sender<BackendExecutionJob>,
+    pub(crate) backend_execution_rx: Receiver<BackendExecutionResult>,
     pub(crate) oddsmatcher_tx: Sender<OddsMatcherJob>,
     pub(crate) oddsmatcher_rx: Receiver<OddsMatcherResult>,
     pub(crate) market_intel_tx: Sender<MarketIntelJob>,
@@ -69,6 +72,7 @@ impl AppRuntimeChannels {
     ) -> Self {
         debug!("starting current worker runtime channels");
         let (provider_tx, provider_rx) = Self::start_provider(host, provider);
+        let (backend_execution_tx, backend_execution_rx) = Self::start_backend_execution(host);
         let (oddsmatcher_tx, oddsmatcher_rx) = Self::start_oddsmatcher(host, oddsmatcher_client);
         let (market_intel_tx, market_intel_rx) = Self::start_market_intel(host);
         let (owls_sync_tx, owls_sync_rx) = Self::start_owls(host, owls_client);
@@ -76,6 +80,8 @@ impl AppRuntimeChannels {
         Self {
             provider_tx,
             provider_rx,
+            backend_execution_tx,
+            backend_execution_rx,
             oddsmatcher_tx,
             oddsmatcher_rx,
             market_intel_tx,
@@ -86,7 +92,7 @@ impl AppRuntimeChannels {
     }
 
     pub(crate) fn start_provider(
-        host: &AppRuntimeHost,
+        _host: &AppRuntimeHost,
         provider: Box<dyn ExchangeProvider + Send>,
     ) -> (
         UnboundedSender<ProviderJob>,
@@ -95,9 +101,9 @@ impl AppRuntimeChannels {
         let (job_tx, mut job_rx) = tokio_mpsc::unbounded_channel::<ProviderJob>();
         let (result_tx, result_rx) = tokio_mpsc::unbounded_channel::<ProviderResult>();
 
-        host.spawn(async move {
+        std::thread::spawn(move || {
             let mut provider = provider;
-            while let Some(job) = job_rx.recv().await {
+            while let Some(job) = job_rx.blocking_recv() {
                 let request = job.request.clone();
                 debug!(request = ?request, "provider runtime job started");
                 let result = provider
@@ -126,6 +132,15 @@ impl AppRuntimeChannels {
         (job_tx, result_rx)
     }
 
+    pub(crate) fn start_backend_execution(
+        _host: &AppRuntimeHost,
+    ) -> (
+        Sender<BackendExecutionJob>,
+        Receiver<BackendExecutionResult>,
+    ) {
+        start_backend_execution_worker()
+    }
+
     pub(crate) fn start_oddsmatcher(
         _host: &AppRuntimeHost,
         client: Client,
@@ -151,12 +166,12 @@ impl AppRuntimeChannels {
 
         host.spawn(async move {
             while let Some(job) = job_rx.recv().await {
-                debug!(reason = job.reason.label(), focused = ?job.focused, "owls runtime job started");
+                debug!(reason = job.reason.label(), section = ?job.section, "owls runtime job started");
                 let outcome = crate::owls::sync_dashboard_async(
                     &client,
                     &job.dashboard,
                     job.reason,
-                    job.focused,
+                    job.section,
                 )
                 .await;
                 info!(reason = job.reason.label(), checked = outcome.checked_count, changed = outcome.changed_count, "owls runtime job completed");

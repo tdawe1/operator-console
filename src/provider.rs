@@ -1,6 +1,6 @@
 use crate::domain::{ExchangePanelSnapshot, VenueId};
-use crate::horse_matcher::HorseMatcherQuery;
 use crate::exchange_api::MatchbookAccountState;
+use crate::horse_matcher::HorseMatcherQuery;
 use crate::trading_actions::TradingActionIntent;
 
 #[derive(Debug, Clone, PartialEq)]

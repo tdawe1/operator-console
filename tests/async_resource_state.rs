@@ -216,7 +216,6 @@ fn sample_live_snapshot() -> ExchangePanelSnapshot {
     snapshot
 }
 
-
 fn sample_ready_owls_dashboard() -> owls::OwlsDashboard {
     let mut dashboard = owls::dashboard_for_sport("soccer");
     if let Some(endpoint) = dashboard.endpoints.first_mut() {

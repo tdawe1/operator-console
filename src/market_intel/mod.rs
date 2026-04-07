@@ -132,8 +132,14 @@ fn operator_active_to_dashboard(active: OperatorActiveResponse) -> MarketIntelDa
             active.summary.arbitrage_matches,
             active.summary.positive_ev_matches
         ),
-        total_events: active.matches.iter().map(|m| m.event_id.clone()).collect::<HashSet<_>>().len(),
+        total_events: active
+            .matches
+            .iter()
+            .map(|m| m.event_id.clone())
+                .collect::<HashSet<_>>()
+                .len(),
         total_opportunities: active.summary.total_matches,
+        sources: inferred_sources_from_operator_active(&active),
         ..MarketIntelDashboard::default()
     };
 
@@ -149,6 +155,27 @@ fn operator_active_to_dashboard(active: OperatorActiveResponse) -> MarketIntelDa
     }
 
     dashboard
+}
+
+fn inferred_sources_from_operator_active(active: &OperatorActiveResponse) -> Vec<SourceHealth> {
+    let mut sources = active
+        .matches
+        .iter()
+        .map(|item| item.source.clone())
+        .collect::<Vec<_>>();
+    sources.sort_by(|left, right| left.key().cmp(right.key()));
+    sources.dedup_by(|left, right| left.key() == right.key());
+
+    sources
+        .into_iter()
+        .map(|source| SourceHealth {
+            source,
+            mode: SourceLoadMode::Live,
+            status: SourceHealthStatus::Ready,
+            detail: String::from("operator-active"),
+            refreshed_at: active.refreshed_at.clone(),
+        })
+        .collect()
 }
 
 fn operator_match_to_row(item: OperatorMatchOpportunity) -> MarketOpportunityRow {

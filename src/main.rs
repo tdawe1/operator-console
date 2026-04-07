@@ -14,10 +14,10 @@ use crossterm::execute;
 use operator_console::app::App;
 use operator_console::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus, WorkerSummary};
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
+use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
 };
-use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::theme::{self, Name as ThemeName};
 use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
@@ -82,7 +82,8 @@ fn main() -> Result<()> {
             }
         };
 
-    let mut app = App::from_provider_with_base_factory(provider, Box::new(default_configured_provider))?;
+    let mut app =
+        App::from_provider_with_base_factory(provider, Box::new(default_configured_provider))?;
     enable_mouse_capture()?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -184,13 +185,20 @@ fn sabisabi_is_healthy(base_url: &str) -> bool {
         .timeout(Duration::from_millis(500))
         .build()
         .ok()
-        .and_then(|client| {
-            client
-                .get(format!("{}/health", base_url.trim_end_matches('/')))
+        .is_some_and(|client| {
+            let base_url = base_url.trim_end_matches('/');
+            let health_ok = client
+                .get(format!("{base_url}/health"))
                 .send()
                 .ok()
+                .is_some_and(|response| response.status().is_success());
+            let snapshot_ok = client
+                .get(format!("{base_url}/api/v1/query/operator/snapshot"))
+                .send()
+                .ok()
+                .is_some_and(|response| response.status().is_success());
+            health_ok && snapshot_ok
         })
-        .is_some_and(|response| response.status().is_success())
 }
 
 #[cfg(test)]

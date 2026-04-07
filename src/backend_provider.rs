@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -70,7 +71,22 @@ impl BackendExchangeProvider {
                 .get(format!("{}{}", base_url.trim_end_matches('/'), path))
                 .send()
                 .wrap_err_with(|| format!("request failed for {path}"))?;
-            (path, response)
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                let fallback_path = "/api/v1/control/operator/snapshot";
+                let fallback_response = self
+                    .client
+                    .post(format!(
+                        "{}{}",
+                        base_url.trim_end_matches('/'),
+                        fallback_path
+                    ))
+                    .json(&OperatorSnapshotControlRequest::default())
+                    .send()
+                    .wrap_err_with(|| format!("request failed for {fallback_path}"))?;
+                (fallback_path, fallback_response)
+            } else {
+                (path, response)
+            }
         } else {
             let control = map_request(request)?;
             let path = "/api/v1/control/operator/snapshot";
@@ -92,20 +108,23 @@ impl BackendExchangeProvider {
 
 impl ExchangeProvider for BackendExchangeProvider {
     fn handle(&mut self, request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
-        self.handle_with_metadata(request).map(|snapshot| snapshot.snapshot)
+        self.handle_with_metadata(request)
+            .map(|snapshot| snapshot.snapshot)
     }
 
     fn handle_with_metadata(&mut self, request: ProviderRequest) -> Result<ProviderSnapshot> {
         match self.load_via_backend(request.clone()) {
             Ok(snapshot) => Ok(snapshot),
-            Err(error) if matches!(request, ProviderRequest::LoadDashboard) => {
-                Ok(ProviderSnapshot::from_snapshot(unavailable_snapshot(
-                    &error.to_string(),
-                )))
-            }
+            Err(error) if should_fallback_to_unavailable_snapshot(&request) => Ok(
+                ProviderSnapshot::from_snapshot(unavailable_snapshot(&error.to_string())),
+            ),
             Err(error) => Err(error),
         }
     }
+}
+
+fn should_fallback_to_unavailable_snapshot(request: &ProviderRequest) -> bool {
+    matches!(request, ProviderRequest::LoadDashboard)
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +134,13 @@ struct BackendOperatorSnapshotResponse {
     matchbook_account_state: Option<MatchbookAccountState>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BackendOperatorSnapshotPayload {
+    Envelope(BackendOperatorSnapshotResponse),
+    Snapshot(ExchangePanelSnapshot),
+}
+
 fn decode_snapshot_response(
     path: &str,
     response: reqwest::blocking::Response,
@@ -122,19 +148,35 @@ fn decode_snapshot_response(
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(eyre!(
-            "HTTP {} during operator snapshot request: {}",
-            status.as_u16(),
-            truncate(&body, 200)
-        ));
+        return Err(snapshot_request_http_error(path, status, &body));
     }
 
-    let payload = serde_json::from_str::<BackendOperatorSnapshotResponse>(&body)
+    let payload = serde_json::from_str::<BackendOperatorSnapshotPayload>(&body)
         .wrap_err_with(|| format!("failed to decode backend operator snapshot from {path}"))?;
-    Ok(ProviderSnapshot {
-        snapshot: payload.snapshot,
-        matchbook_account_state: payload.matchbook_account_state,
+    Ok(match payload {
+        BackendOperatorSnapshotPayload::Envelope(payload) => ProviderSnapshot {
+            snapshot: payload.snapshot,
+            matchbook_account_state: payload.matchbook_account_state,
+        },
+        BackendOperatorSnapshotPayload::Snapshot(snapshot) => ProviderSnapshot {
+            snapshot,
+            matchbook_account_state: None,
+        },
     })
+}
+
+fn snapshot_request_http_error(path: &str, status: StatusCode, body: &str) -> color_eyre::Report {
+    if status == StatusCode::UNAUTHORIZED && path == "/api/v1/control/operator/snapshot" {
+        return eyre!(
+            "HTTP 401 during operator snapshot control request: missing or invalid SABISABI_CONTROL_TOKEN"
+        );
+    }
+
+    eyre!(
+        "HTTP {} during operator snapshot request: {}",
+        status.as_u16(),
+        truncate(body, 200)
+    )
 }
 
 fn map_request(request: ProviderRequest) -> Result<OperatorSnapshotControlRequest> {
@@ -242,12 +284,21 @@ fn dotenv_value_from_paths(name: &str, paths: &[PathBuf]) -> Option<String> {
 
 fn dotenv_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    // Search repository tree (project directories) before home directory
+    // Search from current working directory first.
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors() {
-            // Within each directory, check .env.local before .env
             paths.push(ancestor.join(".env.local"));
             paths.push(ancestor.join(".env"));
+        }
+    }
+    // Also search upward from the executable location since the console may be launched
+    // from outside the repo while still living inside the workspace target tree.
+    if let Ok(executable) = env::current_exe() {
+        if let Some(executable_dir) = executable.parent() {
+            for ancestor in executable_dir.ancestors() {
+                paths.push(ancestor.join(".env.local"));
+                paths.push(ancestor.join(".env"));
+            }
         }
     }
     if let Some(home) = env::var_os("HOME") {
@@ -255,12 +306,18 @@ fn dotenv_candidates() -> Vec<PathBuf> {
         paths.push(home_path.join(".env.local"));
         paths.push(home_path.join(".env"));
     }
+    paths.sort();
+    paths.dedup();
     paths
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{map_request, BackendExchangeProvider};
+    use super::{
+        map_request, should_fallback_to_unavailable_snapshot, snapshot_request_http_error,
+        BackendExchangeProvider,
+    };
+    use reqwest::StatusCode;
     use operator_console::domain::VenueId;
     use operator_console::horse_matcher::HorseMatcherQuery;
     use operator_console::provider::ProviderRequest;
@@ -318,5 +375,36 @@ mod tests {
         })
         .expect("payload");
         assert!(payload.query.is_some());
+    }
+
+    #[test]
+    fn only_dashboard_bootstrap_falls_back_to_unavailable_snapshot() {
+        assert!(should_fallback_to_unavailable_snapshot(
+            &ProviderRequest::LoadDashboard
+        ));
+        assert!(!should_fallback_to_unavailable_snapshot(
+            &ProviderRequest::RefreshCached
+        ));
+        assert!(!should_fallback_to_unavailable_snapshot(
+            &ProviderRequest::RefreshLive
+        ));
+        assert!(!should_fallback_to_unavailable_snapshot(
+            &ProviderRequest::SelectVenue(VenueId::Betway)
+        ));
+    }
+
+    #[test]
+    fn unauthorized_control_error_mentions_control_token() {
+        let error = snapshot_request_http_error(
+            "/api/v1/control/operator/snapshot",
+            StatusCode::UNAUTHORIZED,
+            "",
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing or invalid SABISABI_CONTROL_TOKEN")
+        );
     }
 }

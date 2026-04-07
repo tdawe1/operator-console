@@ -39,15 +39,16 @@ use crate::manual_positions::{
 };
 use crate::market_intel::{self, MarketIntelDashboard, MarketOpportunityRow};
 use crate::market_normalization::{
-    market_matches, normalize_key, selection_matches, text_matches,
+    event_matches, market_matches, normalize_key, selection_matches, selection_matches_with_context,
+    text_matches,
 };
 use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
 };
 use crate::owls::{
-    self, OwlsDashboard, OwlsEndpointGroup, OwlsEndpointId, OwlsEndpointSummary, OwlsSyncReason,
-    SUPPORTED_SPORTS,
+    self, OwlsDashboard, OwlsEndpointGroup, OwlsEndpointId, OwlsEndpointSummary,
+    OwlsMarketSelection, OwlsSyncReason, SUPPORTED_SPORTS,
 };
 use crate::panels::trading_positions::{
     active_position_row_count, next_actionable_cash_out_bet_id, selected_active_position_seed,
@@ -86,10 +87,46 @@ pub(crate) struct ProviderResult {
     pub(crate) event_message: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum BackendExecutionRequest {
+    LoadPlan {
+        row: IntelRow,
+    },
+    ReviewMatch {
+        match_id: String,
+        stake: f64,
+    },
+    SubmitMatch {
+        match_id: String,
+        stake: f64,
+    },
+    ReviewAdhoc {
+        request: execution_backend::AdhocExecutionRequest,
+    },
+    SubmitAdhoc {
+        request: execution_backend::AdhocExecutionRequest,
+    },
+}
+
+pub(crate) struct BackendExecutionJob {
+    pub(crate) request: BackendExecutionRequest,
+}
+
+pub(crate) enum BackendExecutionResponse {
+    Plan(execution_backend::ExecutionPlanEnvelope),
+    Review(execution_backend::ExecutionReviewResponse),
+    Submit(execution_backend::ExecutionSubmitResponse),
+}
+
+pub(crate) struct BackendExecutionResult {
+    pub(crate) request: BackendExecutionRequest,
+    pub(crate) result: std::result::Result<BackendExecutionResponse, String>,
+}
+
 pub(crate) struct OwlsSyncJob {
     pub(crate) dashboard: OwlsDashboard,
     pub(crate) reason: OwlsSyncReason,
-    pub(crate) focused: Option<OwlsEndpointId>,
+    pub(crate) section: TradingSection,
 }
 
 pub(crate) struct OwlsSyncResult {
@@ -178,65 +215,14 @@ impl OwlsFocus {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct OwlsMarketSelection {
-    pub event: String,
-    pub market_key: String,
-    pub selection: String,
-    pub point: Option<f64>,
-    pub league: String,
-    pub country_code: String,
-    pub quotes: Vec<crate::owls::OwlsMarketQuote>,
-}
-
-impl OwlsMarketSelection {
-    pub fn quote_count(&self) -> usize {
-        self.quotes.len()
-    }
-
-    pub fn best_price(&self) -> Option<f64> {
-        self.quotes
-            .iter()
-            .filter_map(|quote| quote.decimal_price)
-            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-    }
-
-    pub fn low_price(&self) -> Option<f64> {
-        self.quotes
-            .iter()
-            .filter_map(|quote| quote.decimal_price)
-            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-    }
-
-    pub fn books(&self) -> usize {
-        self.quotes
-            .iter()
-            .map(|quote| normalize_key(&quote.book))
-            .collect::<HashSet<_>>()
-            .len()
-    }
-
-    pub fn market_label(&self) -> String {
-        match self.point {
-            Some(point) => format!("{} {point:+}", self.market_key),
-            None => self.market_key.clone(),
-        }
-    }
-
-    pub fn selection_label(&self) -> String {
-        if self.selection.trim().is_empty() {
-            String::from("-")
-        } else {
-            self.selection.clone()
-        }
-    }
-}
-
 pub struct App {
     runtime_host: AppRuntimeHost,
     provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderJob>,
     provider_rx: tokio::sync::mpsc::UnboundedReceiver<ProviderResult>,
     provider_in_flight: bool,
+    backend_execution_tx: Sender<BackendExecutionJob>,
+    backend_execution_rx: Receiver<BackendExecutionResult>,
+    backend_execution_in_flight_count: usize,
     provider_resource_state: ResourceState<ExchangePanelSnapshot>,
     provider_pending_job: Option<ProviderJob>,
     #[cfg(debug_assertions)]
@@ -502,7 +488,8 @@ impl App {
                 )
             });
         let runtime_host = AppRuntimeHost::new()?;
-        let initial_provider_snapshot = provider.handle_with_metadata(ProviderRequest::LoadDashboard)?;
+        let initial_provider_snapshot =
+            provider.handle_with_metadata(ProviderRequest::LoadDashboard)?;
         let snapshot = normalize_snapshot(
             initial_provider_snapshot.snapshot,
             &recorder_config.disabled_venues,
@@ -537,6 +524,9 @@ impl App {
             provider_tx: runtime.provider_tx,
             provider_rx: runtime.provider_rx,
             provider_in_flight: false,
+            backend_execution_tx: runtime.backend_execution_tx,
+            backend_execution_rx: runtime.backend_execution_rx,
+            backend_execution_in_flight_count: 0,
             provider_resource_state: ResourceState::ready(snapshot.clone()),
             provider_pending_job: None,
             #[cfg(debug_assertions)]
@@ -694,7 +684,24 @@ impl App {
     }
 
     pub fn intel_rows(&self) -> Vec<IntelRow> {
-        intel_rows_for_view(self.intel_view, self.market_intel_dashboard())
+        self.intel_rows_for(self.intel_view)
+    }
+
+    pub fn intel_rows_for(&self, view: IntelView) -> Vec<IntelRow> {
+        let rows = match view {
+            IntelView::Event => self.event_intel_rows(),
+            _ => intel_rows_for_view(view, self.market_intel_dashboard()),
+        };
+        if !rows.is_empty() {
+            return rows;
+        }
+
+        let selected_selection = self.selected_owls_market_selection();
+        owls_backed_intel_rows(
+            view,
+            &self.owls_market_selections(),
+            selected_selection.as_ref(),
+        )
     }
 
     pub fn selected_intel_row(&self) -> Option<IntelRow> {
@@ -710,12 +717,17 @@ impl App {
     }
 
     pub fn intel_source_statuses(&self) -> Vec<IntelSourceStatus> {
-        intel_source_statuses_for_view(
+        let statuses = intel_source_statuses_for_view(
             self.intel_view,
             self.market_intel_dashboard(),
             self.market_intel_phase(),
             self.market_intel_last_error(),
-        )
+        );
+        if !statuses.is_empty() {
+            return statuses;
+        }
+
+        owls_intel_source_statuses(self.selected_owls_endpoint())
     }
 
     pub fn intel_ready_sources(&self) -> usize {
@@ -726,16 +738,18 @@ impl App {
     }
 
     pub fn intel_freshness_label(&self) -> String {
-        if self.market_intel_dashboard().is_none() {
+        let statuses = self.intel_source_statuses();
+        if statuses.is_empty() {
             return self.market_intel_phase().to_string();
         }
 
-        let has_fixture = self
-            .intel_source_statuses()
-            .into_iter()
-            .any(|status| status.freshness == "fixture");
-        if has_fixture {
+        if statuses
+            .iter()
+            .any(|status| status.freshness == "fixture")
+        {
             String::from("fixture")
+        } else if statuses.iter().any(|status| status.source == IntelSource::Owls) {
+            String::from("owls")
         } else {
             String::from("live")
         }
@@ -766,52 +780,11 @@ impl App {
         let Some(endpoint) = self.selected_owls_endpoint() else {
             return Vec::new();
         };
-
-        let mut grouped = BTreeMap::<(String, String, String, String, String, String), OwlsMarketSelection>::new();
-        for quote in endpoint
-            .quotes
-            .iter()
-            .filter(|quote| quote.decimal_price.is_some())
-        {
-            let key = (
-                normalize_key(&quote.event),
-                normalize_key(&quote.market_key),
-                normalize_key(&quote.selection),
-                quote
-                    .point
-                    .map(|value| format!("{value:.3}"))
-                    .unwrap_or_default(),
-                normalize_key(&quote.league),
-                normalize_key(&quote.country_code),
-            );
-            let entry = grouped.entry(key).or_insert_with(|| OwlsMarketSelection {
-                event: quote.event.clone(),
-                market_key: quote.market_key.clone(),
-                selection: quote.selection.clone(),
-                point: quote.point,
-                league: quote.league.clone(),
-                country_code: quote.country_code.clone(),
-                quotes: Vec::new(),
-            });
-            entry.quotes.push(quote.clone());
+        if endpoint.market_selections.is_empty() {
+            owls::build_market_selections(&endpoint.quotes)
+        } else {
+            endpoint.market_selections.clone()
         }
-
-        let mut rows = grouped.into_values().collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            right
-                .quote_count()
-                .cmp(&left.quote_count())
-                .then_with(|| {
-                    right
-                        .best_price()
-                        .partial_cmp(&left.best_price())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| left.event.cmp(&right.event))
-                .then_with(|| left.market_key.cmp(&right.market_key))
-                .then_with(|| left.selection.cmp(&right.selection))
-        });
-        rows
     }
 
     pub fn selected_owls_market_selection(&self) -> Option<OwlsMarketSelection> {
@@ -875,6 +848,8 @@ impl App {
             self.trading_action_overlay = None;
         }
         if self.is_owls_context() {
+            let sport = self.owls_dashboard.sport.clone();
+            self.reset_owls_dashboard_for_section(&sport, section);
             self.align_owls_selection_for_section();
             self.request_owls_sync(OwlsSyncReason::Background);
         }
@@ -888,9 +863,10 @@ impl App {
     }
 
     pub fn set_trading_section(&mut self, section: TradingSection) {
+        let section = self.normalize_trading_section(section);
         self.apply_trading_section_state(section);
         let pane = pane_for_trading_section(section);
-        if let Some(workspace_index) = self.wm.workspace_index_for_pane(pane) {
+        if let Some(workspace_index) = self.preferred_workspace_index_for_pane(pane) {
             self.wm.switch_workspace(workspace_index);
             self.wm.focus_pane(pane);
             self.wm.maximized_pane = self
@@ -910,7 +886,7 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "? keymap | n notifications | q quit | o observability | 1-3 workspaces | left/right sections | h/j/k/l panes | up/down nav inside pane | tab rotate pane/tool | shift+tab reverse where supported | f maximize pane | r refresh cache | R recapture live\nenter edit/open | p place action | a manual entry | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "? keymap | n notifications | q quit | o observability | 1-3 workspaces | left/right adjacent pane | ctrl+left/right sections | h/j/k/l panes | up/down nav inside pane | tab rotate pane/tool | shift+tab reverse where supported | f maximize pane | r refresh cache | R recapture live\nenter edit/open | p place action | a manual entry | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
@@ -1097,9 +1073,7 @@ impl App {
             current_index - 1
         };
         let sport = SUPPORTED_SPORTS[next_index];
-        self.owls_dashboard = owls::dashboard_for_sport(sport);
-        self.owls_resource_state
-            .finish_ok(self.owls_dashboard.clone());
+        self.reset_owls_dashboard_for_section(sport, self.normalize_trading_section(self.trading_section));
         self.align_owls_selection_for_section();
         self.clamp_selected_owls_market();
         self.markets_overlay_visible = false;
@@ -1128,10 +1102,12 @@ impl App {
         let started = Instant::now();
         loop {
             self.drain_provider_results();
+            self.drain_backend_execution_results();
             self.drain_oddsmatcher_results();
             self.drain_market_intel_results();
             self.drain_owls_sync_results();
             if !self.provider_resource_state.is_loading()
+                && self.backend_execution_in_flight_count == 0
                 && !self.oddsmatcher_in_flight
                 && !self.market_intel_resource_state.is_loading()
                 && !self.owls_resource_state.is_loading()
@@ -2033,6 +2009,158 @@ impl App {
         }
     }
 
+    fn queue_backend_execution_job(
+        &mut self,
+        job: BackendExecutionJob,
+        queued_message: impl Into<String>,
+    ) -> bool {
+        self.drain_backend_execution_results();
+        match self.backend_execution_tx.send(job) {
+            Ok(()) => {
+                self.backend_execution_in_flight_count += 1;
+                self.status_message = queued_message.into();
+                self.status_scroll = 0;
+                true
+            }
+            Err(error) => {
+                self.status_message = format!("Trading action worker unavailable: {error}");
+                self.status_scroll = 0;
+                self.record_event("Trading action worker unavailable.");
+                false
+            }
+        }
+    }
+
+    fn drain_backend_execution_results(&mut self) {
+        while let Ok(result) = self.backend_execution_rx.try_recv() {
+            self.backend_execution_in_flight_count =
+                self.backend_execution_in_flight_count.saturating_sub(1);
+
+            match result.result {
+                Ok(BackendExecutionResponse::Plan(plan)) => {
+                    let BackendExecutionRequest::LoadPlan { row } = result.request else {
+                        continue;
+                    };
+                    match self.build_market_intel_overlay_seed_from_plan(&row, plan) {
+                        Ok((seed, backend_gateway)) => {
+                            self.open_trading_action_overlay(seed);
+                            if let (Some(gateway), Some(overlay)) =
+                                (backend_gateway, self.trading_action_overlay.as_mut())
+                            {
+                                overlay.backend_gateway = Some(gateway);
+                            }
+                        }
+                        Err(error) => self.fail_backend_execution_command(error.to_string()),
+                    }
+                }
+                Ok(BackendExecutionResponse::Review(response)) => {
+                    self.apply_backend_review_response(response);
+                }
+                Ok(BackendExecutionResponse::Submit(response)) => {
+                    self.apply_backend_submit_response(response);
+                }
+                Err(error) => match result.request {
+                    BackendExecutionRequest::LoadPlan { row } => {
+                        if execution_backend::is_not_found_error(&error) {
+                            self.fail_backend_execution_command(error);
+                            continue;
+                        }
+                        warn!(
+                            row_id = %row.id,
+                            error = %error,
+                            "market-intel execution plan unavailable, falling back to legacy seed"
+                        );
+                        match self.build_market_intel_overlay_seed_legacy(&row) {
+                            Ok(seed) => self.open_trading_action_overlay(seed),
+                            Err(legacy_error) => self.fail_backend_execution_command(format!(
+                                "{error}; fallback unavailable: {legacy_error}"
+                            )),
+                        }
+                    }
+                    BackendExecutionRequest::ReviewMatch { .. }
+                    | BackendExecutionRequest::SubmitMatch { .. }
+                    | BackendExecutionRequest::ReviewAdhoc { .. }
+                    | BackendExecutionRequest::SubmitAdhoc { .. } => {
+                        self.fail_backend_execution_command(error);
+                    }
+                },
+            }
+        }
+    }
+
+    fn apply_backend_review_response(
+        &mut self,
+        response: execution_backend::ExecutionReviewResponse,
+    ) {
+        if let Some(current) = self.trading_action_overlay.as_mut() {
+            let state =
+                current
+                    .backend_gateway
+                    .get_or_insert_with(|| BackendExecutionOverlayState {
+                        gateway: response.gateway.kind.clone(),
+                        mode: response.gateway.mode.clone(),
+                        detail: response.gateway.detail.clone(),
+                        last_status: None,
+                        last_detail: None,
+                        executable: None,
+                        accepted: None,
+                    });
+            state.gateway = response.gateway.kind.clone();
+            state.mode = response.gateway.mode.clone();
+            state.detail = response.gateway.detail.clone();
+            state.last_status = Some(response.review.status.clone());
+            state.last_detail = Some(response.review.detail.clone());
+            state.executable = Some(response.review.executable);
+            state.accepted = None;
+        }
+        self.status_message = format!(
+            "Execution review {}: {}",
+            response.review.status, response.review.detail
+        );
+        self.status_scroll = 0;
+        self.record_event(format!("Execution review {}.", response.review.status));
+    }
+
+    fn apply_backend_submit_response(
+        &mut self,
+        response: execution_backend::ExecutionSubmitResponse,
+    ) {
+        if let Some(current) = self.trading_action_overlay.as_mut() {
+            let state =
+                current
+                    .backend_gateway
+                    .get_or_insert_with(|| BackendExecutionOverlayState {
+                        gateway: response.gateway.kind.clone(),
+                        mode: response.gateway.mode.clone(),
+                        detail: response.gateway.detail.clone(),
+                        last_status: None,
+                        last_detail: None,
+                        executable: None,
+                        accepted: None,
+                    });
+            state.gateway = response.gateway.kind.clone();
+            state.mode = response.gateway.mode.clone();
+            state.detail = response.gateway.detail.clone();
+            state.last_status = Some(response.result.status.clone());
+            state.last_detail = Some(response.result.detail.clone());
+            state.executable = None;
+            state.accepted = Some(response.result.accepted);
+        }
+        self.status_message = format!(
+            "Execution submit {}: {}",
+            response.result.status, response.result.detail
+        );
+        self.status_scroll = 0;
+        self.record_event(format!("Execution submit {}.", response.result.status));
+    }
+
+    fn fail_backend_execution_command(&mut self, detail: impl Into<String>) {
+        let detail = detail.into();
+        self.status_message = format!("Trading action failed: {detail}");
+        self.status_scroll = 0;
+        self.record_event(self.status_message.clone());
+    }
+
     fn apply_provider_snapshot_result(
         &mut self,
         request: ProviderRequest,
@@ -2409,7 +2537,14 @@ impl App {
         self.recorder_startup_alerts_muted_until = None;
         // Clear pending write jobs before restarting provider to avoid replaying recorder-session writes
         if let Some(pending) = &self.provider_pending_job {
-            if !matches!(pending.request, ProviderRequest::LoadDashboard | ProviderRequest::RefreshCached | ProviderRequest::RefreshLive | ProviderRequest::SelectVenue(_) | ProviderRequest::LoadHorseMatcher { .. }) {
+            if !matches!(
+                pending.request,
+                ProviderRequest::LoadDashboard
+                    | ProviderRequest::RefreshCached
+                    | ProviderRequest::RefreshLive
+                    | ProviderRequest::SelectVenue(_)
+                    | ProviderRequest::LoadHorseMatcher { .. }
+            ) {
                 self.provider_pending_job = None;
             }
         }
@@ -2532,7 +2667,10 @@ impl App {
     pub fn next_section(&mut self) {
         match self.active_panel {
             Panel::Trading => {
-                self.focus_trading_section(next_from(self.trading_section, &TradingSection::ALL))
+                self.focus_trading_section(self.normalize_trading_section(next_from(
+                    self.trading_section,
+                    &TradingSection::ALL,
+                )))
             }
             Panel::Observability => {
                 self.observability_section =
@@ -2556,8 +2694,9 @@ impl App {
 
     pub fn previous_section(&mut self) {
         match self.active_panel {
-            Panel::Trading => self
-                .focus_trading_section(previous_from(self.trading_section, &TradingSection::ALL)),
+            Panel::Trading => self.focus_trading_section(self.normalize_trading_section(
+                previous_from(self.trading_section, &TradingSection::ALL),
+            )),
             Panel::Observability => {
                 self.observability_section =
                     previous_from(self.observability_section, &ObservabilitySection::ALL)
@@ -2586,6 +2725,7 @@ impl App {
         while self.running {
             self.poll_recorder();
             self.drain_provider_results();
+            self.drain_backend_execution_results();
             self.drain_oddsmatcher_results();
             self.poll_market_intel();
             self.poll_owls_dashboard();
@@ -2615,7 +2755,7 @@ impl App {
         let job = OwlsSyncJob {
             dashboard: self.owls_dashboard.clone(),
             reason,
-            focused: self.selected_owls_endpoint_id(),
+            section: self.normalize_trading_section(self.trading_section),
         };
         match self.owls_sync_tx.send(job) {
             Ok(()) => {
@@ -3125,8 +3265,8 @@ impl App {
             KeyCode::Char('j') => self.navigate_pane(NavDirection::Down),
             KeyCode::Char('k') => self.navigate_pane(NavDirection::Up),
             KeyCode::Char('l') => self.navigate_pane(NavDirection::Right),
-            KeyCode::Left => self.previous_section(),
-            KeyCode::Right => self.next_section(),
+            KeyCode::Left => self.navigate_pane(NavDirection::Left),
+            KeyCode::Right => self.navigate_pane(NavDirection::Right),
             KeyCode::Enter => {
                 if self.is_oddsmatcher_filters_context() {
                     self.begin_oddsmatcher_edit();
@@ -3140,16 +3280,7 @@ impl App {
                     self.load_calculator_from_selected_intel();
                 } else if self.active_panel == Panel::Trading && self.is_owls_context() {
                     if self.owls_focus == OwlsFocus::Markets {
-                        if let Some(selection) = self.selected_owls_market_selection() {
-                            self.status_message = format!(
-                                "{} • {} • {} [{} books]",
-                                selection.event,
-                                selection.market_label(),
-                                selection.selection_label(),
-                                selection.books()
-                            );
-                            self.status_scroll = 0;
-                        }
+                        self.focus_intel_event_for_selected_owls_market();
                     } else if let Some(endpoint) = self.selected_owls_endpoint() {
                         self.status_message = format!(
                             "{} {} [{}] {}",
@@ -3199,6 +3330,8 @@ impl App {
                     self.open_trading_action_overlay_from_horse_matcher();
                 } else if self.is_intel_context() {
                     self.open_trading_action_overlay_from_intel();
+                } else if self.active_panel == Panel::Trading && self.is_owls_context() {
+                    self.open_trading_action_overlay_from_selected_owls_market();
                 } else if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
                     && self.positions_focus == PositionsFocus::Active
@@ -3467,13 +3600,30 @@ impl App {
     }
 
     fn focus_trading_section(&mut self, section: TradingSection) {
+        let section = self.normalize_trading_section(section);
         let pane = pane_for_trading_section(section);
-        if let Some(workspace_index) = self.wm.workspace_index_for_pane(pane) {
+        if let Some(workspace_index) = self.preferred_workspace_index_for_pane(pane) {
             self.wm.switch_workspace(workspace_index);
             self.wm.focus_pane(pane);
         }
 
         self.apply_pane_context(pane);
+    }
+
+    fn preferred_workspace_index_for_pane(&self, pane: PaneId) -> Option<usize> {
+        self.wm
+            .current_workspace()
+            .contains_pane(pane)
+            .then_some(self.wm.active_workspace)
+            .or_else(|| self.wm.workspace_index_for_pane(pane))
+    }
+
+    fn normalize_trading_section(&self, section: TradingSection) -> TradingSection {
+        if matches!(section, TradingSection::Props) && self.owls_dashboard.sport == "soccer" {
+            TradingSection::Markets
+        } else {
+            section
+        }
     }
 
     fn apply_pane_context(&mut self, pane: PaneId) {
@@ -3546,21 +3696,39 @@ impl App {
     fn is_owls_context(&self) -> bool {
         self.active_panel == Panel::Trading
             && matches!(
-                self.trading_section,
+                self.normalize_trading_section(self.trading_section),
                 TradingSection::Markets | TradingSection::Live | TradingSection::Props
             )
     }
 
     fn visible_owls_groups(&self) -> &'static [OwlsEndpointGroup] {
-        match self.trading_section {
+        match self.normalize_trading_section(self.trading_section) {
             TradingSection::Live => &[
                 OwlsEndpointGroup::Realtime,
                 OwlsEndpointGroup::Scores,
                 OwlsEndpointGroup::Odds,
             ],
-            TradingSection::Props => &[OwlsEndpointGroup::Props, OwlsEndpointGroup::History],
-            _ => &OwlsEndpointGroup::ALL,
+            TradingSection::Props => &[OwlsEndpointGroup::Props],
+            _ => &[OwlsEndpointGroup::Odds],
         }
+    }
+
+    fn reset_owls_dashboard_for_section(&mut self, sport: &str, section: TradingSection) {
+        let section = self.normalize_trading_section(section);
+        let next = owls::dashboard_for_trading_section(sport, section);
+        let same_endpoints = self
+            .owls_dashboard
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id)
+            .eq(next.endpoints.iter().map(|endpoint| endpoint.id));
+        if same_endpoints && self.owls_dashboard.sport == next.sport {
+            return;
+        }
+        self.owls_dashboard = next;
+        self.owls_resource_state
+            .finish_ok(self.owls_dashboard.clone());
+        self.reset_selected_owls_market();
     }
 
     fn is_oddsmatcher_filters_context(&self) -> bool {
@@ -3690,6 +3858,70 @@ impl App {
         match self.intel_table_state.selected() {
             Some(index) if index < row_count => {}
             _ => self.intel_table_state.select(Some(0)),
+        }
+    }
+
+    fn event_intel_rows(&self) -> Vec<IntelRow> {
+        if let Some(dashboard) = self.market_intel_dashboard() {
+            if let Some(detail) = dashboard.event_detail.as_ref() {
+                return intel_rows_from_event_detail(detail);
+            }
+
+            if let Some(selection) = self.selected_owls_market_selection() {
+                let rows = event_scoped_intel_rows_from_dashboard(dashboard, &selection);
+                if !rows.is_empty() {
+                    return rows;
+                }
+                return owls_event_intel_rows(&selection);
+            }
+
+            return Vec::new();
+        }
+
+        self.selected_owls_market_selection()
+            .map(|selection| owls_event_intel_rows(&selection))
+            .unwrap_or_default()
+    }
+
+    fn focus_intel_event_for_selected_owls_market(&mut self) {
+        let Some(selection) = self.selected_owls_market_selection() else {
+            self.status_message = String::from("No event-scoped market is selected.");
+            self.status_scroll = 0;
+            return;
+        };
+
+        self.intel_view = IntelView::Event;
+        self.focus_trading_section(TradingSection::Intel);
+
+        let rows = self.intel_rows();
+        let selected_index = rows
+            .iter()
+            .position(|row| intel_row_matches_owls_selection(row, &selection));
+
+        if let Some(index) = selected_index {
+            self.intel_table_state.select(Some(index));
+            self.status_message = format!(
+                "Selected event intel for {} • {} • {}.",
+                selection.event,
+                selection.market_label(),
+                selection.selection_label()
+            );
+        } else {
+            self.intel_table_state.select(None);
+            self.status_message = format!(
+                "No event intel is available yet for {} • {} • {}.",
+                selection.event,
+                selection.market_label(),
+                selection.selection_label()
+            );
+        }
+        self.status_scroll = 0;
+    }
+
+    fn open_trading_action_overlay_from_selected_owls_market(&mut self) {
+        self.focus_intel_event_for_selected_owls_market();
+        if self.selected_intel_row().is_some() {
+            self.open_trading_action_overlay_from_intel();
         }
     }
 
@@ -4240,19 +4472,21 @@ impl App {
                             self.switch_workspace_with_status(index)
                         }
                         MouseTargetKind::Pane(pane) => {
-                            if self.wm.active_pane == Some(pane) {
-                                let emphasized = self.wm.toggle_pane_emphasis(pane);
-                                self.apply_pane_context(pane);
-                                self.status_message = if emphasized {
-                                    format!("Expanded {}.", pane.title())
+                            self.wm.focus_pane(pane);
+                            let emphasized =
+                                if self.wm.current_workspace().emphasized_pane == Some(pane) {
+                                    self.wm.toggle_pane_emphasis(pane);
+                                    false
                                 } else {
-                                    format!("Reset {} sizing.", pane.title())
+                                    self.wm.toggle_pane_emphasis(pane);
+                                    true
                                 };
+                            self.apply_pane_context(pane);
+                            self.status_message = if emphasized {
+                                format!("Expanded {}.", pane.title())
                             } else {
-                                self.wm.focus_pane(pane);
-                                self.apply_pane_context(pane);
-                                self.status_message = format!("Focused {}.", pane.title());
-                            }
+                                format!("Reset {} sizing.", pane.title())
+                            };
                             self.status_scroll = 0;
                         }
                         MouseTargetKind::PaneMinimize(pane) => {
@@ -4477,9 +4711,10 @@ impl App {
         if inferred_sport == self.owls_dashboard.sport || self.owls_dashboard.sport != "nba" {
             return;
         }
-        self.owls_dashboard = owls::dashboard_for_sport(inferred_sport);
-        self.owls_resource_state
-            .finish_ok(self.owls_dashboard.clone());
+        self.reset_owls_dashboard_for_section(
+            inferred_sport,
+            self.normalize_trading_section(self.trading_section),
+        );
         self.align_owls_selection_for_section();
         self.clamp_selected_owls_market();
         self.request_market_intel_sync(MarketIntelSyncReason::Background);
@@ -5102,46 +5337,24 @@ impl App {
             ));
         }
 
-        if overlay.mode == TradingActionMode::Review {
-            let response = execution_backend::review_execution(match_id, stake)?;
-            if let Some(current) = self.trading_action_overlay.as_mut() {
-                current.backend_gateway = Some(BackendExecutionOverlayState {
-                    gateway: response.gateway.kind,
-                    mode: response.gateway.mode,
-                    detail: response.gateway.detail,
-                    last_status: Some(response.review.status.clone()),
-                    last_detail: Some(response.review.detail.clone()),
-                    executable: Some(response.review.executable),
-                    accepted: None,
-                });
-            }
-            self.status_message = format!(
-                "Execution review {}: {}",
-                response.review.status, response.review.detail
-            );
-            self.status_scroll = 0;
-            self.record_event(format!("Execution review {}.", response.review.status));
-            return Ok(());
-        }
-
-        let response = execution_backend::submit_execution(match_id, stake)?;
-        if let Some(current) = self.trading_action_overlay.as_mut() {
-            current.backend_gateway = Some(BackendExecutionOverlayState {
-                gateway: response.gateway.kind,
-                mode: response.gateway.mode,
-                detail: response.gateway.detail,
-                last_status: Some(response.result.status.clone()),
-                last_detail: Some(response.result.detail.clone()),
-                executable: None,
-                accepted: Some(response.result.accepted),
-            });
-        }
-        self.status_message = format!(
-            "Execution submit {}: {}",
-            response.result.status, response.result.detail
-        );
-        self.status_scroll = 0;
-        self.record_event(format!("Execution submit {}.", response.result.status));
+        let (request, status_message) = if overlay.mode == TradingActionMode::Review {
+            (
+                BackendExecutionRequest::ReviewMatch {
+                    match_id: match_id.to_string(),
+                    stake,
+                },
+                String::from("Execution review queued."),
+            )
+        } else {
+            (
+                BackendExecutionRequest::SubmitMatch {
+                    match_id: match_id.to_string(),
+                    stake,
+                },
+                String::from("Execution submit queued."),
+            )
+        };
+        self.queue_backend_execution_job(BackendExecutionJob { request }, status_message);
         Ok(())
     }
 
@@ -5171,46 +5384,18 @@ impl App {
             selection_ref: overlay.seed.betslip_selection_id.clone(),
         };
 
-        if overlay.mode == TradingActionMode::Review {
-            let response = execution_backend::review_adhoc_execution(&request)?;
-            if let Some(current) = self.trading_action_overlay.as_mut() {
-                current.backend_gateway = Some(BackendExecutionOverlayState {
-                    gateway: response.gateway.kind,
-                    mode: response.gateway.mode,
-                    detail: response.gateway.detail,
-                    last_status: Some(response.review.status.clone()),
-                    last_detail: Some(response.review.detail.clone()),
-                    executable: Some(response.review.executable),
-                    accepted: None,
-                });
-            }
-            self.status_message = format!(
-                "Execution review {}: {}",
-                response.review.status, response.review.detail
-            );
-            self.status_scroll = 0;
-            self.record_event(format!("Execution review {}.", response.review.status));
-            return Ok(());
-        }
-
-        let response = execution_backend::submit_adhoc_execution(&request)?;
-        if let Some(current) = self.trading_action_overlay.as_mut() {
-            current.backend_gateway = Some(BackendExecutionOverlayState {
-                gateway: response.gateway.kind,
-                mode: response.gateway.mode,
-                detail: response.gateway.detail,
-                last_status: Some(response.result.status.clone()),
-                last_detail: Some(response.result.detail.clone()),
-                executable: None,
-                accepted: Some(response.result.accepted),
-            });
-        }
-        self.status_message = format!(
-            "Execution submit {}: {}",
-            response.result.status, response.result.detail
-        );
-        self.status_scroll = 0;
-        self.record_event(format!("Execution submit {}.", response.result.status));
+        let (request, status_message) = if overlay.mode == TradingActionMode::Review {
+            (
+                BackendExecutionRequest::ReviewAdhoc { request },
+                String::from("Execution review queued."),
+            )
+        } else {
+            (
+                BackendExecutionRequest::SubmitAdhoc { request },
+                String::from("Execution submit queued."),
+            )
+        };
+        self.queue_backend_execution_job(BackendExecutionJob { request }, status_message);
         Ok(())
     }
 
@@ -5545,33 +5730,19 @@ impl App {
             return;
         }
 
-        let (seed, backend_gateway) =
-            match self.build_market_intel_overlay_seed(&row).or_else(|error| {
-                warn!("market-intel execution plan unavailable, falling back to row seed: {error}");
-                self.build_market_intel_overlay_seed_legacy(&row)
-                    .map(|seed| (seed, None))
-            }) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.status_message = error.to_string();
-                    self.status_scroll = 0;
-                    return;
-                }
-            };
-
-        self.open_trading_action_overlay(seed);
-        if let (Some(gateway), Some(overlay)) =
-            (backend_gateway, self.trading_action_overlay.as_mut())
-        {
-            overlay.backend_gateway = Some(gateway);
-        }
+        self.queue_backend_execution_job(
+            BackendExecutionJob {
+                request: BackendExecutionRequest::LoadPlan { row },
+            },
+            String::from("Loading trading action plan."),
+        );
     }
 
-    fn build_market_intel_overlay_seed(
+    fn build_market_intel_overlay_seed_from_plan(
         &self,
         row: &IntelRow,
+        plan: execution_backend::ExecutionPlanEnvelope,
     ) -> Result<(TradingActionSeed, Option<BackendExecutionOverlayState>)> {
-        let plan = execution_backend::fetch_execution_plan(&row.id)?;
         let action = plan.plan.primary.clone();
         let venue = exchange_venue_from_bookmaker("", &action.venue).ok_or_else(|| {
             color_eyre::eyre::eyre!(
@@ -6761,6 +6932,36 @@ fn intel_source_statuses_for_view(
         .collect()
 }
 
+fn owls_intel_source_statuses(selected: Option<&OwlsEndpointSummary>) -> Vec<IntelSourceStatus> {
+    let Some(endpoint) = selected else {
+        return Vec::new();
+    };
+
+    let health = match endpoint.status.as_str() {
+        "ready" => "ready",
+        "waiting" => "loading",
+        "error" => "error",
+        other if !other.trim().is_empty() => other,
+        _ => "idle",
+    };
+    let freshness = endpoint.updated_at.trim();
+    vec![IntelSourceStatus {
+        source: IntelSource::Owls,
+        health: String::from(health),
+        freshness: if freshness.is_empty() {
+            String::from("owls")
+        } else {
+            freshness.to_string()
+        },
+        transport: String::from("REST"),
+        detail: if endpoint.detail.trim().is_empty() {
+            endpoint.label.clone()
+        } else {
+            endpoint.detail.clone()
+        },
+    }]
+}
+
 fn intel_rows_for_view(view: IntelView, dashboard: Option<&MarketIntelDashboard>) -> Vec<IntelRow> {
     let Some(dashboard) = dashboard else {
         return Vec::new();
@@ -6847,6 +7048,222 @@ fn intel_rows_from_event_detail(detail: &crate::market_intel::MarketEventDetail)
         .collect()
 }
 
+fn owls_backed_intel_rows(
+    view: IntelView,
+    selections: &[OwlsMarketSelection],
+    selected: Option<&OwlsMarketSelection>,
+) -> Vec<IntelRow> {
+    match view {
+        IntelView::Event => selected.map(owls_event_intel_rows).unwrap_or_default(),
+        IntelView::Markets => owls_market_candidate_rows(selections, 0.0),
+        IntelView::Arbitrages => owls_market_candidate_rows(selections, 2.5),
+        IntelView::PlusEv | IntelView::Value => owls_market_candidate_rows(selections, 1.0),
+        IntelView::Drops => Vec::new(),
+    }
+}
+
+fn owls_market_candidate_rows(
+    selections: &[OwlsMarketSelection],
+    min_signal_pct: f64,
+) -> Vec<IntelRow> {
+    let mut rows = selections
+        .iter()
+        .filter_map(owls_selection_to_intel_candidate_row)
+        .filter(|row| row.edge_pct.unwrap_or_default() >= min_signal_pct)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .edge_pct
+            .unwrap_or_default()
+            .partial_cmp(&left.edge_pct.unwrap_or_default())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .back_odds
+                    .partial_cmp(&left.back_odds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.event.cmp(&right.event))
+    });
+    rows
+}
+
+fn owls_selection_to_intel_candidate_row(selection: &OwlsMarketSelection) -> Option<IntelRow> {
+    let mut quotes = selection
+        .quotes
+        .iter()
+        .filter(|quote| quote.decimal_price.is_some())
+        .collect::<Vec<_>>();
+    if quotes.is_empty() {
+        return None;
+    }
+    quotes.sort_by(|left, right| {
+        right
+            .decimal_price
+            .unwrap_or_default()
+            .partial_cmp(&left.decimal_price.unwrap_or_default())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.book.cmp(&right.book))
+    });
+
+    let primary = quotes.first().copied()?;
+    let back_odds = primary.decimal_price?;
+    let field = quotes.get(1).copied();
+    let field_price = field
+        .and_then(|quote| quote.decimal_price)
+        .or_else(|| selection.low_price());
+    let signal_pct = field_price
+        .filter(|price| *price > 1.0 && back_odds > *price)
+        .map(|price| ((back_odds / price) - 1.0) * 100.0);
+    let comparison_note = field
+        .and_then(|quote| quote.decimal_price.map(|price| (quote.book.as_str(), price)))
+        .map(|(book, price)| format!("best vs {book} @ {price:.2}"))
+        .unwrap_or_else(|| String::from("single-book quote"));
+
+    Some(IntelRow {
+        id: format!(
+            "owls:{}:{}:{}",
+            normalize_key(&selection.event),
+            normalize_key(&selection.market_key),
+            normalize_key(&selection.selection)
+        ),
+        source: IntelSource::Owls,
+        event: selection.event.clone(),
+        competition: if selection.league.trim().is_empty() {
+            selection.country_code.clone()
+        } else {
+            selection.league.clone()
+        },
+        market: selection.market_label(),
+        selection: selection.selection_label(),
+        bookmaker: primary.book.clone(),
+        exchange: field
+            .map(|quote| quote.book.clone())
+            .unwrap_or_else(|| String::from("-")),
+        back_odds,
+        lay_odds: None,
+        fair_odds: field_price,
+        edge_pct: signal_pct,
+        arb_pct: signal_pct,
+        liquidity: primary.limit_amount,
+        status: if primary.suspended {
+            String::from("watch")
+        } else {
+            String::from("ready")
+        },
+        updated_at: String::from("owls"),
+        route: primary.event_link.clone(),
+        deep_link_url: primary.event_link.clone(),
+        note: format!("{comparison_note} • {} books", selection.books()),
+    })
+}
+
+fn owls_event_intel_rows(selection: &OwlsMarketSelection) -> Vec<IntelRow> {
+    let best_price = selection.best_price();
+    let mut rows = selection
+        .quotes
+        .iter()
+        .filter_map(|quote| {
+            let price = quote.decimal_price?;
+            let signal_pct = best_price
+                .filter(|best| *best > price && price > 1.0)
+                .map(|best| ((best / price) - 1.0) * 100.0);
+            Some(IntelRow {
+                id: format!(
+                    "owls:event:{}:{}:{}:{}",
+                    normalize_key(&selection.event),
+                    normalize_key(&selection.market_key),
+                    normalize_key(&selection.selection),
+                    normalize_key(&quote.book)
+                ),
+                source: IntelSource::Owls,
+                event: selection.event.clone(),
+                competition: if selection.league.trim().is_empty() {
+                    selection.country_code.clone()
+                } else {
+                    selection.league.clone()
+                },
+                market: selection.market_label(),
+                selection: selection.selection_label(),
+                bookmaker: quote.book.clone(),
+                exchange: String::from("-"),
+                back_odds: price,
+                lay_odds: None,
+                fair_odds: best_price,
+                edge_pct: signal_pct,
+                arb_pct: signal_pct,
+                liquidity: quote.limit_amount,
+                status: if quote.suspended {
+                    String::from("watch")
+                } else {
+                    String::from("ready")
+                },
+                updated_at: String::from("owls"),
+                route: quote.event_link.clone(),
+                deep_link_url: quote.event_link.clone(),
+                note: best_price
+                    .map(|best| format!("field best {best:.2}"))
+                    .unwrap_or_else(|| String::from("owls quote")),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .back_odds
+            .partial_cmp(&left.back_odds)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.bookmaker.cmp(&right.bookmaker))
+    });
+    rows
+}
+
+fn event_scoped_intel_rows_from_dashboard(
+    dashboard: &MarketIntelDashboard,
+    selection: &OwlsMarketSelection,
+) -> Vec<IntelRow> {
+    [
+        &dashboard.markets,
+        &dashboard.arbitrages,
+        &dashboard.plus_ev,
+        &dashboard.drops,
+        &dashboard.value,
+    ]
+    .into_iter()
+    .flat_map(|rows| rows.iter())
+    .filter(|row| opportunity_matches_owls_selection(row, selection))
+    .map(intel_row_from_opportunity)
+    .collect()
+}
+
+fn opportunity_matches_owls_selection(
+    row: &MarketOpportunityRow,
+    selection: &OwlsMarketSelection,
+) -> bool {
+    event_matches(&row.event_name, &selection.event)
+        && market_matches(&row.market_name, &selection.market_key)
+        && selection_matches_with_context(
+            &row.selection_name,
+            &row.event_name,
+            &row.market_name,
+            &selection.selection,
+            &selection.event,
+            &selection.market_key,
+        )
+}
+
+fn intel_row_matches_owls_selection(row: &IntelRow, selection: &OwlsMarketSelection) -> bool {
+    event_matches(&row.event, &selection.event)
+        && market_matches(&row.market, &selection.market_key)
+        && selection_matches_with_context(
+            &row.selection,
+            &row.event,
+            &row.market,
+            &selection.selection,
+            &selection.event,
+            &selection.market_key,
+        )
+}
+
 fn intel_row_from_opportunity(row: &MarketOpportunityRow) -> IntelRow {
     let primary = row.primary_quote();
     let secondary = row.secondary_quote();
@@ -6912,6 +7329,49 @@ fn new_trading_action_request_id(source: TradingActionSource) -> String {
         .unwrap_or_default()
         .as_millis();
     format!("{source:?}-{millis}").to_lowercase()
+}
+
+pub(crate) fn start_backend_execution_worker() -> (
+    Sender<BackendExecutionJob>,
+    Receiver<BackendExecutionResult>,
+) {
+    let (job_tx, job_rx) = mpsc::channel::<BackendExecutionJob>();
+    let (result_tx, result_rx) = mpsc::channel::<BackendExecutionResult>();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let request = job.request.clone();
+            let result = match request.clone() {
+                BackendExecutionRequest::LoadPlan { row } => {
+                    execution_backend::fetch_execution_plan(&row.id)
+                        .map(BackendExecutionResponse::Plan)
+                }
+                BackendExecutionRequest::ReviewMatch { match_id, stake } => {
+                    execution_backend::review_execution(&match_id, stake)
+                        .map(BackendExecutionResponse::Review)
+                }
+                BackendExecutionRequest::SubmitMatch { match_id, stake } => {
+                    execution_backend::submit_execution(&match_id, stake)
+                        .map(BackendExecutionResponse::Submit)
+                }
+                BackendExecutionRequest::ReviewAdhoc { request } => {
+                    execution_backend::review_adhoc_execution(&request)
+                        .map(BackendExecutionResponse::Review)
+                }
+                BackendExecutionRequest::SubmitAdhoc { request } => {
+                    execution_backend::submit_adhoc_execution(&request)
+                        .map(BackendExecutionResponse::Submit)
+                }
+            }
+            .map_err(|error| error.to_string());
+            if result_tx
+                .send(BackendExecutionResult { request, result })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
 }
 
 pub(crate) fn start_oddsmatcher_worker(
@@ -7058,7 +7518,12 @@ mod tests {
         WorkerSummary,
     };
     use crate::manual_positions::ManualPositionEntry;
-    use crate::owls::{self, OwlsDashboard, OwlsEndpointId, OwlsMarketQuote, OwlsPreviewRow, OwlsSyncReason};
+    use crate::market_intel::{
+        MarketIntelDashboard, MarketIntelSourceId, MarketOpportunityRow, OpportunityKind,
+    };
+    use crate::owls::{
+        self, OwlsDashboard, OwlsEndpointId, OwlsMarketQuote, OwlsPreviewRow, OwlsSyncReason,
+    };
     use crate::provider::{ExchangeProvider, ProviderRequest, ProviderSnapshot};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
     use crate::resource_state::ResourcePhase;
@@ -7068,11 +7533,13 @@ mod tests {
         TradingActionSource, TradingActionSourceContext, TradingExecutionPolicy, TradingRiskReport,
         TradingTimeInForce,
     };
+    use crate::wm::PaneId;
     use crossterm::event::KeyCode;
 
     use super::{
-        App, NotificationLevel, OwlsSyncJob, OwlsSyncResult, Panel, ProviderJob, ProviderResult,
-        TradingSection, MAX_EVENT_HISTORY,
+        App, BackendExecutionJob, BackendExecutionRequest, BackendExecutionResult, IntelSource,
+        IntelView, NotificationLevel, OwlsSyncJob, OwlsSyncResult, Panel, ProviderJob,
+        ProviderResult, TradingActionOverlayState, TradingSection, MAX_EVENT_HISTORY,
     };
 
     struct RefreshingProvider {
@@ -9123,6 +9590,155 @@ mod tests {
     }
 
     #[test]
+    fn intel_plan_404_reports_command_failure_without_opening_overlay() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<BackendExecutionJob>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<BackendExecutionResult>();
+        app.backend_execution_tx = job_tx;
+        app.backend_execution_rx = result_rx;
+        app.market_intel_resource_state =
+            crate::resource_state::ResourceState::ready(sample_market_intel_dashboard());
+        app.intel_table_state.select(Some(0));
+
+        app.open_trading_action_overlay_from_intel();
+
+        let job = job_rx.recv().expect("queued execution plan request");
+        let BackendExecutionRequest::LoadPlan { row } = job.request else {
+            panic!("expected load-plan request");
+        };
+        result_tx
+            .send(BackendExecutionResult {
+                request: BackendExecutionRequest::LoadPlan { row },
+                result: Err(String::from("HTTP 404 during execution plan: not found")),
+            })
+            .expect("send plan failure");
+
+        app.drain_backend_execution_results();
+
+        assert!(app.trading_action_overlay().is_none());
+        assert_eq!(
+            app.status_message(),
+            "Trading action failed: HTTP 404 during execution plan: not found"
+        );
+    }
+
+    #[test]
+    fn backend_market_intel_review_is_queued_off_the_ui_thread() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<BackendExecutionJob>();
+        let (_result_tx, result_rx) = std::sync::mpsc::channel::<BackendExecutionResult>();
+        app.backend_execution_tx = job_tx;
+        app.backend_execution_rx = result_rx;
+        app.trading_action_overlay = Some(TradingActionOverlayState::new(
+            sample_market_intel_trading_seed(),
+            TradingRiskReport::default(),
+        ));
+
+        let overlay = app
+            .trading_action_overlay()
+            .expect("trading action overlay")
+            .clone();
+        app.execute_market_intel_action_via_backend(&overlay, 12.5)
+            .expect("queue execution");
+
+        let job = job_rx.recv().expect("queued backend execution");
+        assert_eq!(app.backend_execution_in_flight_count, 1);
+        assert_eq!(app.status_message(), "Execution review queued.");
+        match job.request {
+            BackendExecutionRequest::ReviewMatch { match_id, stake } => {
+                assert_eq!(match_id, "intel-row-1");
+                assert_eq!(stake, 12.5);
+            }
+            other => panic!("unexpected backend execution request: {other:?}"),
+        }
+    }
+
+    fn sample_market_intel_dashboard() -> MarketIntelDashboard {
+        MarketIntelDashboard {
+            markets: vec![MarketOpportunityRow {
+                source: MarketIntelSourceId::oddsentry(),
+                kind: OpportunityKind::Market,
+                id: String::from("intel-row-1"),
+                sport: String::from("soccer"),
+                competition_name: String::from("Premier League"),
+                event_id: String::from("evt-1"),
+                event_name: String::from("Arsenal vs Everton"),
+                market_name: String::from("Player Shots"),
+                selection_name: String::from("Bukayo Saka"),
+                secondary_selection_name: String::new(),
+                venue: String::from("fanduel"),
+                secondary_venue: String::from("matchbook"),
+                price: Some(2.3),
+                secondary_price: Some(2.4),
+                fair_price: Some(2.2),
+                liquidity: Some(50.0),
+                edge_percent: Some(4.2),
+                arbitrage_margin: None,
+                stake_hint: Some(10.0),
+                start_time: String::from("2026-04-07T18:00:00Z"),
+                updated_at: String::from("2026-04-07T17:55:00Z"),
+                event_url: String::from("https://example.com/event"),
+                deep_link_url: String::from("https://example.com/deep"),
+                is_live: false,
+                quotes: Vec::new(),
+                notes: vec![String::from("fixture")],
+                raw_data: serde_json::Value::Null,
+            }],
+            ..MarketIntelDashboard::default()
+        }
+    }
+
+    fn sample_market_intel_trading_seed() -> crate::trading_actions::TradingActionSeed {
+        crate::trading_actions::TradingActionSeed {
+            source: TradingActionSource::MarketIntel,
+            venue: VenueId::Matchbook,
+            source_ref: String::from("intel-row-1"),
+            event_name: String::from("Arsenal vs Everton"),
+            market_name: String::from("Player Shots"),
+            selection_name: String::from("Bukayo Saka"),
+            event_url: Some(String::from("https://example.com/event")),
+            deep_link_url: Some(String::from("https://example.com/deep")),
+            betslip_event_id: None,
+            betslip_market_id: None,
+            betslip_selection_id: None,
+            buy_price: None,
+            sell_price: Some(2.4),
+            default_side: TradingActionSide::Sell,
+            default_stake: Some(10.0),
+            source_context: TradingActionSourceContext::default(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
     fn owls_market_selections_group_quotes_by_event_market_and_selection() {
         let mut app = App::default();
         let mut dashboard = owls::dashboard_for_sport("soccer");
@@ -9168,8 +9784,8 @@ mod tests {
             ];
         }
 
-        app.set_owls_dashboard_for_test(dashboard);
         app.set_trading_section(TradingSection::Markets);
+        app.set_owls_dashboard_for_test(dashboard);
 
         let selections = app.owls_market_selections();
         assert_eq!(selections.len(), 3);
@@ -9178,6 +9794,103 @@ mod tests {
         assert_eq!(selections[0].quote_count(), 2);
         assert_eq!(selections[0].books(), 2);
         assert_eq!(selections[0].best_price(), Some(2.28));
+    }
+
+    #[test]
+    fn intel_rows_fall_back_to_owls_candidates_when_backend_rows_are_empty() {
+        let mut app = App::default();
+        let mut dashboard = owls::dashboard_for_sport("soccer");
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Odds)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.quotes = vec![
+                OwlsMarketQuote {
+                    book: String::from("polymarket"),
+                    event: String::from("T1 vs DN S00Pers"),
+                    selection: String::from("T1"),
+                    market_key: String::from("base_map_1_winner"),
+                    decimal_price: Some(2.083),
+                    event_link: String::from("https://polymarket.example/t1"),
+                    league: String::from("league-of-legends"),
+                    ..OwlsMarketQuote::default()
+                },
+                OwlsMarketQuote {
+                    book: String::from("esportsbet"),
+                    event: String::from("T1 vs DN S00Pers"),
+                    selection: String::from("T1"),
+                    market_key: String::from("base_map_1_winner"),
+                    decimal_price: Some(1.72),
+                    event_link: String::from("https://esportsbet.example/t1"),
+                    league: String::from("league-of-legends"),
+                    ..OwlsMarketQuote::default()
+                },
+            ];
+        }
+
+        app.set_owls_dashboard_for_test(dashboard);
+        app.set_market_intel_dashboard_for_test(MarketIntelDashboard::default());
+
+        let rows = app.intel_rows_for(IntelView::Markets);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, IntelSource::Owls);
+        assert_eq!(rows[0].event, "T1 vs DN S00Pers");
+        assert!(rows[0].edge_pct.unwrap_or_default() > 10.0);
+    }
+
+    #[test]
+    fn intel_source_statuses_fall_back_to_owls_when_backend_sources_are_missing() {
+        let mut app = App::default();
+        let mut dashboard = owls::dashboard_for_sport("soccer");
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Odds)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.detail = String::from("books 2 • ready");
+            endpoint.quotes = vec![OwlsMarketQuote {
+                book: String::from("polymarket"),
+                event: String::from("T1 vs DN S00Pers"),
+                selection: String::from("T1"),
+                market_key: String::from("base_map_1_winner"),
+                decimal_price: Some(2.083),
+                ..OwlsMarketQuote::default()
+            }];
+        }
+
+        app.set_owls_dashboard_for_test(dashboard);
+        app.set_market_intel_dashboard_for_test(MarketIntelDashboard::default());
+
+        let statuses = app.intel_source_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].source, IntelSource::Owls);
+        assert_eq!(statuses[0].health, "ready");
+    }
+
+    #[test]
+    fn switching_to_markets_workspace_does_not_bounce_on_shared_intel_pane() {
+        let mut app = App::default();
+
+        app.switch_workspace_with_status(1);
+
+        assert_eq!(app.wm.active_workspace, 1);
+        assert_eq!(app.active_pane(), Some(PaneId::Intel));
+        assert_eq!(app.active_trading_section(), TradingSection::Intel);
+    }
+
+    #[test]
+    fn shared_matcher_section_prefers_current_markets_workspace() {
+        let mut app = App::default();
+
+        app.switch_workspace_with_status(1);
+        app.set_trading_section(TradingSection::Matcher);
+
+        assert_eq!(app.wm.active_workspace, 1);
+        assert_eq!(app.active_pane(), Some(PaneId::Matcher));
+        assert_eq!(app.active_trading_section(), TradingSection::Matcher);
     }
 
     fn sample_owls_dashboard_with_quote(event: &str, selection: &str, price: f64) -> OwlsDashboard {

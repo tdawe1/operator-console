@@ -11,15 +11,19 @@ use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
 use reqwest::Url;
 use rust_socketio::{asynchronous::ClientBuilder as SocketClientBuilder, Payload, TransportType};
+use serde::Deserialize;
 use serde_json::Value;
 
+use crate::app_state::TradingSection;
 use crate::market_normalization::{
     event_matches, market_matches, normalize_key, selection_matches_with_context,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.owlsinsight.com";
 const API_KEY_ENV_NAMES: [&str; 2] = ["OWLS_INSIGHT_API_KEY", "OWLSINSIGHT_API_KEY"];
-const DEFAULT_SPORT: &str = "nba";
+const SABISABI_BASE_URL_ENV: &str = "SABISABI_BASE_URL";
+const DEFAULT_SABISABI_BASE_URL: &str = "http://127.0.0.1:4080";
+const DEFAULT_SPORT: &str = "soccer";
 const DEFAULT_PLAYER: &str = "LeBron James";
 const DEFAULT_PROP_TYPE: &str = "points";
 const DEFAULT_BOOK_PROPS_PLAYER: &str = "LeBron";
@@ -34,7 +38,8 @@ pub const SUPPORTED_SPORTS: &[&str] = &[
     "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "soccer", "epl", "mma", "tennis", "cs2",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OwlsEndpointGroup {
     Odds,
     Props,
@@ -81,7 +86,8 @@ impl OwlsEndpointGroup {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OwlsEndpointId {
     Odds,
     Moneyline,
@@ -112,7 +118,7 @@ pub enum OwlsEndpointId {
     Realtime,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OwlsDashboard {
     pub sport: String,
     pub status_line: String,
@@ -124,6 +130,7 @@ pub struct OwlsDashboard {
     pub groups: Vec<OwlsGroupSummary>,
     pub endpoints: Vec<OwlsEndpointSummary>,
     pub team_normalizations: Vec<OwlsTeamNormalization>,
+    #[serde(skip)]
     seeds: OwlsSeeds,
 }
 
@@ -133,7 +140,7 @@ impl Default for OwlsDashboard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OwlsGroupSummary {
     pub group: OwlsEndpointGroup,
     pub label: String,
@@ -143,7 +150,7 @@ pub struct OwlsGroupSummary {
     pub waiting: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OwlsEndpointSummary {
     pub id: OwlsEndpointId,
     pub group: OwlsEndpointGroup,
@@ -165,8 +172,11 @@ pub struct OwlsEndpointSummary {
     pub freshness_age_seconds: Option<u64>,
     pub freshness_stale: Option<bool>,
     pub freshness_threshold_seconds: Option<u64>,
+    pub quote_count: usize,
+    pub market_selections: Vec<OwlsMarketSelection>,
     pub quotes: Vec<OwlsMarketQuote>,
     pub live_scores: Vec<OwlsLiveScoreEvent>,
+    #[serde(skip)]
     last_checked_at: Option<Instant>,
 }
 
@@ -197,6 +207,8 @@ impl OwlsEndpointSummary {
             freshness_age_seconds: None,
             freshness_stale: None,
             freshness_threshold_seconds: None,
+            quote_count: 0,
+            market_selections: Vec::new(),
             quotes: Vec::new(),
             live_scores: Vec::new(),
             last_checked_at: None,
@@ -204,14 +216,14 @@ impl OwlsEndpointSummary {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsPreviewRow {
     pub label: String,
     pub detail: String,
     pub metric: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsMarketQuote {
     pub book: String,
     pub event: String,
@@ -227,14 +239,68 @@ pub struct OwlsMarketQuote {
     pub suspended: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct OwlsMarketSelection {
+    pub event: String,
+    pub market_key: String,
+    pub selection: String,
+    pub point: Option<f64>,
+    pub league: String,
+    pub country_code: String,
+    pub quotes: Vec<OwlsMarketQuote>,
+}
+
+impl OwlsMarketSelection {
+    pub fn quote_count(&self) -> usize {
+        self.quotes.len()
+    }
+
+    pub fn best_price(&self) -> Option<f64> {
+        self.quotes
+            .iter()
+            .filter_map(|quote| quote.decimal_price)
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    pub fn low_price(&self) -> Option<f64> {
+        self.quotes
+            .iter()
+            .filter_map(|quote| quote.decimal_price)
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    pub fn books(&self) -> usize {
+        self.quotes
+            .iter()
+            .map(|quote| normalize_key(&quote.book))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn market_label(&self) -> String {
+        match self.point {
+            Some(point) => format!("{} {point:+}", self.market_key),
+            None => self.market_key.clone(),
+        }
+    }
+
+    pub fn selection_label(&self) -> String {
+        if self.selection.trim().is_empty() {
+            String::from("-")
+        } else {
+            self.selection.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsTeamNormalization {
     pub input: String,
     pub canonical: String,
     pub simplified: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsLiveStat {
     pub key: String,
     pub label: String,
@@ -242,7 +308,7 @@ pub struct OwlsLiveStat {
     pub away_value: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsLiveIncident {
     pub minute: Option<u64>,
     pub incident_type: String,
@@ -251,14 +317,14 @@ pub struct OwlsLiveIncident {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsPlayerRating {
     pub player_name: String,
     pub team_side: String,
     pub rating: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct OwlsLiveScoreEvent {
     pub sport: String,
     pub event_id: String,
@@ -378,6 +444,36 @@ pub fn dashboard_for_sport(sport: &str) -> OwlsDashboard {
     }
 }
 
+pub fn dashboard_for_trading_section(sport: &str, section: TradingSection) -> OwlsDashboard {
+    let normalized_sport = normalize_sport(sport);
+    let endpoints = endpoint_ids_for_trading_section(section)
+        .iter()
+        .map(|id| OwlsEndpointSummary::from_spec_for_sport(spec_for(*id), &normalized_sport))
+        .collect::<Vec<_>>();
+    let groups = build_group_summaries(&endpoints);
+    OwlsDashboard {
+        sport: normalized_sport,
+        status_line: startup_status_line(),
+        refreshed_at: String::new(),
+        last_sync_mode: String::from("idle"),
+        sync_checks: 0,
+        sync_changes: 0,
+        total_polls: 0,
+        groups,
+        endpoints,
+        team_normalizations: Vec::new(),
+        seeds: OwlsSeeds::default(),
+    }
+}
+
+pub fn endpoint_ids_for_trading_section(section: TradingSection) -> &'static [OwlsEndpointId] {
+    match section {
+        TradingSection::Live => &[OwlsEndpointId::Realtime, OwlsEndpointId::ScoresSport],
+        TradingSection::Props => &[OwlsEndpointId::Props, OwlsEndpointId::PropsHistory],
+        _ => &[OwlsEndpointId::Odds],
+    }
+}
+
 pub fn sync_dashboard(
     client: &Client,
     previous: &OwlsDashboard,
@@ -490,115 +586,42 @@ pub async fn sync_dashboard_async(
     client: &AsyncClient,
     previous: &OwlsDashboard,
     reason: OwlsSyncReason,
-    focused: Option<OwlsEndpointId>,
+    section: TradingSection,
 ) -> OwlsSyncOutcome {
-    let mut dashboard = previous.clone();
-    if dashboard.endpoints.is_empty() {
-        dashboard = dashboard_for_sport(&dashboard.sport);
-    }
-    let sport = normalize_sport(&dashboard.sport);
-    dashboard.sport = sport.clone();
-
-    let api_key = match load_api_key() {
-        Ok(value) => value,
-        Err(error) => {
-            let previous_dashboard = dashboard.clone();
-            let detail = normalize_owls_error(&error.to_string());
-            if is_missing_owls_api_key_detail(&detail) {
-                mark_all_endpoints_waiting(&mut dashboard, &detail);
-                dashboard.status_line = missing_owls_api_key_status_line();
-            } else {
-                mark_all_endpoints_error(&mut dashboard, &detail);
-                dashboard.status_line = format!("Owls unavailable: {detail}");
-            }
+    let sport = normalize_sport(&previous.sport);
+    let previous_dashboard = previous.clone();
+    match fetch_backend_dashboard_async(client, &sabisabi_base_url(), &sport, section).await {
+        Ok(mut dashboard) => {
+            dashboard.sport = sport;
             dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
-            return OwlsSyncOutcome {
+            let checked_count = dashboard.endpoints.len();
+            let changed = dashboard_semantically_changed(&previous_dashboard, &dashboard);
+            let changed_count = if changed { checked_count } else { 0 };
+            dashboard.sync_checks = checked_count;
+            dashboard.sync_changes = changed_count;
+            dashboard.total_polls = previous_dashboard.total_polls.saturating_add(checked_count);
+            OwlsSyncOutcome {
+                changed,
+                dashboard,
+                checked_count,
+                changed_count,
+            }
+        }
+        Err(error) => {
+            let mut dashboard = dashboard_for_trading_section(&sport, section);
+            let detail = normalize_owls_error(&error.to_string());
+            mark_all_endpoints_error(&mut dashboard, &detail);
+            dashboard.status_line = format!("Owls backend unavailable: {detail}");
+            dashboard.last_sync_mode = String::from(reason.label());
+            dashboard.groups = build_group_summaries(&dashboard.endpoints);
+            OwlsSyncOutcome {
                 changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
                 dashboard,
                 checked_count: 0,
                 changed_count: 0,
-            };
+            }
         }
-    };
-
-    let base_url = env::var("OWLS_INSIGHT_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
-    let due_ids = due_endpoint_ids(&dashboard, reason, focused);
-
-    if due_ids.is_empty() {
-        dashboard.last_sync_mode = String::from(reason.label());
-        return OwlsSyncOutcome {
-            dashboard,
-            checked_count: 0,
-            changed_count: 0,
-            changed: false,
-        };
-    }
-
-    let previous_dashboard = dashboard.clone();
-    let mut checked_count = 0usize;
-    let mut changed_count = 0usize;
-
-    for id in due_ids {
-        checked_count += 1;
-        let summary = fetch_endpoint_summary_async(
-            client,
-            &base_url,
-            &api_key,
-            &sport,
-            id,
-            &mut dashboard.seeds,
-        )
-        .await;
-        if merge_endpoint(&mut dashboard, summary) {
-            changed_count += 1;
-        }
-    }
-
-    if sport_supports_team_normalization(&sport) {
-        refresh_dashboard_team_normalizations_async(
-            client,
-            &base_url,
-            &api_key,
-            &sport,
-            &mut dashboard,
-        )
-        .await;
-    }
-
-    dashboard.groups = build_group_summaries(&dashboard.endpoints);
-    dashboard.refreshed_at = dashboard
-        .endpoints
-        .iter()
-        .find_map(|endpoint| {
-            (!endpoint.updated_at.is_empty()).then_some(endpoint.updated_at.clone())
-        })
-        .unwrap_or_else(|| previous_dashboard.refreshed_at.clone());
-    dashboard.last_sync_mode = String::from(reason.label());
-    dashboard.sync_checks = checked_count;
-    dashboard.sync_changes = changed_count;
-    dashboard.total_polls += checked_count;
-    dashboard.status_line = if changed_count == 0 {
-        format!(
-            "Owls monitor steady: checked {checked_count} endpoint{} and found no changes.",
-            if checked_count == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "Owls {} sync applied {changed_count} endpoint change{} after checking {checked_count}.",
-            reason.label(),
-            if changed_count == 1 { "" } else { "s" }
-        )
-    };
-
-    OwlsSyncOutcome {
-        changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
-        dashboard,
-        checked_count,
-        changed_count,
     }
 }
 
@@ -635,9 +658,31 @@ pub fn matching_market_quotes(
         else {
             continue;
         };
-        for quote in &endpoint.quotes {
-            if quote_matches_target(dashboard, quote, event, market, selection) {
-                matches.push(quote.clone());
+        if endpoint.quotes.is_empty() {
+            for grouped in &endpoint.market_selections {
+                if !event_matches_with_team_normalization(dashboard, &grouped.event, event) {
+                    continue;
+                }
+                if !grouped.market_key.trim().is_empty() && !market_matches(&grouped.market_key, market) {
+                    continue;
+                }
+                if !selection_matches_with_context(
+                    &grouped.selection,
+                    &grouped.event,
+                    &grouped.market_key,
+                    selection,
+                    event,
+                    market,
+                ) {
+                    continue;
+                }
+                matches.extend(grouped.quotes.iter().cloned());
+            }
+        } else {
+            for quote in &endpoint.quotes {
+                if quote_matches_target(dashboard, quote, event, market, selection) {
+                    matches.push(quote.clone());
+                }
             }
         }
     }
@@ -2055,6 +2100,8 @@ fn merge_endpoint(dashboard: &mut OwlsDashboard, mut summary: OwlsEndpointSummar
             summary.freshness_age_seconds = slot.freshness_age_seconds;
             summary.freshness_stale = slot.freshness_stale;
             summary.freshness_threshold_seconds = slot.freshness_threshold_seconds;
+            summary.quote_count = slot.quote_count;
+            summary.market_selections = slot.market_selections.clone();
             summary.quotes = slot.quotes.clone();
             summary.live_scores = slot.live_scores.clone();
         }
@@ -2082,6 +2129,8 @@ fn endpoint_semantically_changed(
         || current.freshness_age_seconds != next.freshness_age_seconds
         || current.freshness_stale != next.freshness_stale
         || current.freshness_threshold_seconds != next.freshness_threshold_seconds
+        || current.quote_count != next.quote_count
+        || current.market_selections != next.market_selections
         || current.quotes != next.quotes
         || current.live_scores != next.live_scores
         || current.preview.len() != next.preview.len()
@@ -2179,6 +2228,32 @@ async fn fetch_json_async(
     path: &str,
     query: &[(&str, &str)],
 ) -> Result<Value> {
+    if api_key.trim().is_empty() {
+        return match fetch_backend_json_async(client, base_url, path, query).await {
+            Ok(value) => Ok(value),
+            Err(backend_error) => {
+                tracing::warn!("owls backend fetch failed for {path}: {backend_error}");
+                let direct_api_key = load_api_key()?;
+                let direct_base_url = env::var("OWLS_INSIGHT_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
+                fetch_upstream_json_async(client, &direct_base_url, &direct_api_key, path, query)
+                    .await
+                    .wrap_err_with(|| format!("backend request failed for {path}: {backend_error}"))
+            }
+        };
+    }
+    fetch_upstream_json_async(client, base_url, api_key, path, query).await
+}
+
+async fn fetch_upstream_json_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value> {
     let response = client
         .get(format!("{}{}", base_url.trim_end_matches('/'), path))
         .bearer_auth(api_key)
@@ -2201,25 +2276,98 @@ async fn fetch_json_async(
     serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
 }
 
+async fn fetch_backend_dashboard_async(
+    client: &AsyncClient,
+    base_url: &str,
+    sport: &str,
+    section: TradingSection,
+) -> Result<OwlsDashboard> {
+    let response = client
+        .get(format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            owls_backend_dashboard_path(sport)
+        ))
+        .query(&[("section", owls_section_key(section))])
+        .send()
+        .await
+        .wrap_err_with(|| format!("backend dashboard request failed for {sport}"))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .wrap_err("failed to read backend Owls dashboard body")?;
+    if !status.is_success() {
+        return Err(eyre!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate(&payload, 120)
+        ));
+    }
+    serde_json::from_str(&payload).wrap_err("failed to decode backend Owls dashboard")
+}
+
+async fn fetch_backend_json_async(
+    client: &AsyncClient,
+    base_url: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value> {
+    let response = client
+        .get(format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            owls_backend_path(path)
+        ))
+        .query(query)
+        .send()
+        .await
+        .wrap_err_with(|| format!("backend request failed for {path}"))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .wrap_err("failed to read backend Owls response body")?;
+    if !status.is_success() {
+        return Err(eyre!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate(&payload, 120)
+        ));
+    }
+    serde_json::from_str(&payload).wrap_err("failed to decode backend Owls response")
+}
+
 async fn fetch_realtime_payload_async(
     client: &AsyncClient,
     base_url: &str,
     api_key: &str,
     sport: &str,
 ) -> Result<Value> {
-    match fetch_socketio_realtime_payload(base_url, api_key, sport).await {
-        Ok(payload) => Ok(payload),
-        Err(error) => {
-            tracing::warn!("owls socket.io realtime fallback to REST: {error}");
-            fetch_json_async(
-                client,
-                base_url,
-                api_key,
-                &format!("/api/v1/{sport}/realtime"),
-                &[],
-            )
-            .await
-        }
+    fetch_json_async(
+        client,
+        base_url,
+        api_key,
+        &format!("/api/v1/{sport}/realtime"),
+        &[],
+    )
+    .await
+}
+
+fn owls_backend_path(path: &str) -> String {
+    let suffix = path.strip_prefix("/api/v1").unwrap_or(path);
+    format!("/api/v1/owls{suffix}")
+}
+
+fn owls_backend_dashboard_path(sport: &str) -> String {
+    format!("/api/v1/owls/dashboard/{sport}")
+}
+
+fn owls_section_key(section: TradingSection) -> &'static str {
+    match section {
+        TradingSection::Live => "live",
+        TradingSection::Props => "props",
+        _ => "markets",
     }
 }
 
@@ -2414,6 +2562,7 @@ fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointS
         .pointer("/meta/freshness/stale")
         .and_then(Value::as_bool);
     summary.freshness_threshold_seconds = unsigned_number_at(value, "/meta/freshness/threshold");
+    summary.quote_count = quotes.len();
     summary.detail = format!(
         "books {} • market {} • age {}s{}",
         books_returned_len(value),
@@ -2429,7 +2578,7 @@ fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointS
         }
     );
     summary.preview = preview;
-    summary.quotes = quotes;
+    summary.market_selections = build_market_selections(&quotes);
     summary
 }
 
@@ -2495,7 +2644,11 @@ fn parse_book_props_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSu
 }
 
 fn parse_props_history_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummary {
-    let rows = extract_array(value, &["/data/history", "/data/snapshots", "/data"]);
+    let rows = ["/data/history", "/data/snapshots", "/data"]
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let preview = rows
         .iter()
         .take(4)
@@ -2507,7 +2660,9 @@ fn parse_props_history_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpoin
         .collect::<Vec<_>>();
     let mut summary = OwlsEndpointSummary::from_spec(spec_for(id));
     summary.status = String::from("ready");
-    summary.count = rows.len();
+    summary.count = unsigned_number_at(value, "/meta/totalCount")
+        .map(|count| count as usize)
+        .unwrap_or(rows.len());
     summary.updated_at = first_pointer_string(value, &["/meta/timestamp", "/data/timestamp"]);
     summary.detail =
         first_pointer_string(value, &["/meta/game_id", "/data/gameId"]).if_empty("line history");
@@ -3143,6 +3298,67 @@ fn extract_market_quotes(event: &Value, book_hint: Option<&str>) -> Vec<OwlsMark
     quotes
 }
 
+pub fn build_market_selections(quotes: &[OwlsMarketQuote]) -> Vec<OwlsMarketSelection> {
+    const MAX_SELECTIONS: usize = 256;
+    const MAX_QUOTES_PER_SELECTION: usize = 8;
+
+    let mut grouped =
+        std::collections::BTreeMap::<(String, String, String, String), OwlsMarketSelection>::new();
+
+    for quote in quotes.iter().filter(|quote| quote.decimal_price.is_some()) {
+        let key = (
+            normalize_key(&quote.event),
+            normalize_key(&quote.market_key),
+            normalize_key(&quote.selection),
+            quote
+                .point
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_default(),
+        );
+        let entry = grouped.entry(key).or_insert_with(|| OwlsMarketSelection {
+            event: quote.event.clone(),
+            market_key: quote.market_key.clone(),
+            selection: quote.selection.clone(),
+            point: quote.point,
+            league: quote.league.clone(),
+            country_code: quote.country_code.clone(),
+            quotes: Vec::new(),
+        });
+        entry.quotes.push(quote.clone());
+    }
+
+    let mut rows = grouped.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .books()
+            .cmp(&left.books())
+            .then_with(|| {
+                right
+                    .best_price()
+                    .partial_cmp(&left.best_price())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.event.cmp(&right.event))
+            .then_with(|| left.market_key.cmp(&right.market_key))
+            .then_with(|| left.selection.cmp(&right.selection))
+    });
+
+    for row in &mut rows {
+        row.quotes.sort_by(|left, right| {
+            right
+                .decimal_price
+                .unwrap_or_default()
+                .partial_cmp(&left.decimal_price.unwrap_or_default())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.book.cmp(&right.book))
+        });
+        row.quotes.truncate(MAX_QUOTES_PER_SELECTION);
+    }
+
+    rows.truncate(MAX_SELECTIONS);
+    rows
+}
+
 fn format_outcome_price(outcome: &Value) -> String {
     let selection = first_non_empty(outcome, &["name", "label", "selection"]).if_empty("-");
     let point = numeric_value(outcome.get("point"));
@@ -3259,6 +3475,13 @@ fn truncate(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     format!("{}...", &value[..limit.saturating_sub(3)])
+}
+
+fn sabisabi_base_url() -> String {
+    env::var(SABISABI_BASE_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from(DEFAULT_SABISABI_BASE_URL))
 }
 
 fn load_api_key() -> Result<String> {
@@ -3644,6 +3867,8 @@ impl EmptyFallback for String {
 
 #[cfg(test)]
 mod tests {
+    use crate::app_state::TradingSection;
+
     use super::*;
 
     #[test]
@@ -3704,6 +3929,18 @@ mod tests {
             .expect("async json payload");
 
         assert_eq!(value["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn owls_backend_path_rewrites_upstream_api_prefix() {
+        assert_eq!(
+            owls_backend_path("/api/v1/nba/props/history"),
+            "/api/v1/owls/nba/props/history"
+        );
+        assert_eq!(
+            owls_backend_path("/api/v1/normalize/batch"),
+            "/api/v1/owls/normalize/batch"
+        );
     }
 
     #[test]
@@ -3821,6 +4058,17 @@ mod tests {
     }
 
     #[test]
+    fn trading_section_dashboard_limits_markets_to_odds_endpoints() {
+        let dashboard = dashboard_for_trading_section("soccer", TradingSection::Markets);
+        let ids = dashboard
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![OwlsEndpointId::Odds]);
+    }
+
+    #[test]
     fn parse_book_market_summary_extracts_quote_rows_and_metadata() {
         let value = serde_json::json!({
             "data": {
@@ -3866,12 +4114,6 @@ mod tests {
         });
 
         let summary = parse_book_market_summary(OwlsEndpointId::Moneyline, &value);
-        let draw = summary
-            .quotes
-            .iter()
-            .find(|quote| quote.book == "pinnacle" && quote.selection == "Draw")
-            .expect("draw quote");
-
         assert_eq!(summary.books_returned, vec!["pinnacle", "bet365"]);
         assert_eq!(
             summary.available_books,
@@ -3880,13 +4122,18 @@ mod tests {
         assert_eq!(summary.requested_books, vec!["pinnacle", "bet365"]);
         assert_eq!(summary.freshness_age_seconds, Some(2));
         assert!(!summary.freshness_stale.unwrap_or(true));
+        assert_eq!(summary.quote_count, 4);
+        assert!(summary.quotes.is_empty());
+        assert_eq!(summary.market_selections.len(), 3);
+        let draw = summary
+            .market_selections
+            .iter()
+            .find(|selection| selection.selection == "Draw")
+            .expect("draw market selection");
         assert_eq!(draw.event, "Arsenal @ Everton");
         assert_eq!(draw.market_key, "h2h");
-        assert_eq!(draw.limit_amount, Some(1500.0));
-        assert_eq!(
-            draw.decimal_price.map(|value| value.round() as i64),
-            Some(3)
-        );
+        assert_eq!(draw.books(), 2);
+        assert_eq!(draw.best_price().map(|value| value.round() as i64), Some(3));
         assert!(summary.detail.contains("age 2s"));
     }
 

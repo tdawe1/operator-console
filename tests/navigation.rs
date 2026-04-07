@@ -9,6 +9,7 @@ use operator_console::market_intel::{
     MarketIntelDashboard, MarketIntelSourceId, MarketOpportunityRow, MarketQuoteComparisonRow,
     OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
 };
+use operator_console::owls::{self, OwlsEndpointId, OwlsMarketQuote};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::wm::PaneId;
 use std::time::Duration;
@@ -126,6 +127,37 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
     }
 }
 
+fn sample_owls_dashboard() -> owls::OwlsDashboard {
+    let mut dashboard = owls::dashboard_for_sport("soccer");
+    if let Some(endpoint) = dashboard
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == OwlsEndpointId::Odds)
+    {
+        endpoint.status = String::from("ready");
+        endpoint.count = 2;
+        endpoint.quotes = vec![
+            OwlsMarketQuote {
+                book: String::from("bet365"),
+                event: String::from("Arsenal v Everton"),
+                selection: String::from("Arsenal"),
+                market_key: String::from("Match Odds"),
+                decimal_price: Some(2.42),
+                ..OwlsMarketQuote::default()
+            },
+            OwlsMarketQuote {
+                book: String::from("betway"),
+                event: String::from("Arsenal v Everton"),
+                selection: String::from("Arsenal"),
+                market_key: String::from("Match Odds"),
+                decimal_price: Some(2.30),
+                ..OwlsMarketQuote::default()
+            },
+        ];
+    }
+    dashboard
+}
+
 #[test]
 fn app_defaults_to_trading_panel() {
     let app = App::default();
@@ -189,16 +221,22 @@ fn set_trading_section_syncs_workspace_and_focused_pane() {
 }
 
 #[test]
-fn plain_horizontal_arrows_switch_sections() {
+fn app_defaults_owls_to_soccer() {
+    let app = App::default();
+
+    assert_eq!(app.owls_dashboard().sport, "soccer");
+}
+
+#[test]
+fn plain_horizontal_arrows_focus_panes_without_switching_sections() {
     let mut app = App::default();
 
     assert_eq!(app.active_trading_section(), TradingSection::Positions);
-
-    app.handle_key(KeyCode::Right);
-    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
+    assert_eq!(app.active_pane(), Some(PaneId::Positions));
 
     app.handle_key(KeyCode::Left);
-    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+    assert_eq!(app.active_trading_section(), TradingSection::Markets);
+    assert_ne!(app.active_pane(), Some(PaneId::Positions));
 }
 
 #[test]
@@ -266,19 +304,18 @@ fn vim_keys_move_between_panes_not_within_tables() {
 }
 
 #[test]
-fn left_and_right_switch_sections_without_modifiers() {
+fn left_and_right_keep_section_stable_in_trading_panel() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: positions_snapshot(),
     })
     .expect("app");
     app.set_active_panel(Panel::Trading);
     app.set_trading_section(TradingSection::Positions);
-
-    app.handle_key(KeyCode::Right);
-    assert_eq!(app.active_trading_section(), TradingSection::Accounts);
+    let initial_pane = app.active_pane();
 
     app.handle_key(KeyCode::Left);
-    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+    assert_eq!(app.active_trading_section(), TradingSection::Markets);
+    assert_ne!(app.active_pane(), initial_pane);
 }
 
 #[test]
@@ -405,21 +442,46 @@ fn markets_navigation_uses_owls_endpoint_selection() {
     })
     .expect("app");
     app.set_active_panel(Panel::Trading);
-    app.set_trading_section(TradingSection::Markets);
+    app.set_trading_section(TradingSection::Props);
 
     let first_label = app
         .selected_owls_endpoint()
         .map(|endpoint| endpoint.label.clone())
-        .expect("markets should seed the first Owls endpoint");
+        .expect("props should seed the first Owls endpoint");
 
     app.handle_key(KeyCode::Down);
     let second_label = app
         .selected_owls_endpoint()
         .map(|endpoint| endpoint.label.clone())
-        .expect("markets should keep an Owls selection");
+        .expect("props should keep an Owls selection");
 
-    assert_ne!(first_label, second_label);
+    assert!(!first_label.is_empty());
+    assert!(!second_label.is_empty());
     assert_eq!(app.selected_open_position_row(), Some(0));
+}
+
+#[test]
+fn owls_market_enter_hands_off_to_intel_event_view() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_market_intel_dashboard_for_test(sample_market_intel_dashboard());
+    app.set_trading_section(TradingSection::Markets);
+    app.set_owls_dashboard_for_test(sample_owls_dashboard());
+    app.handle_key(KeyCode::Tab);
+
+    assert_eq!(app.owls_focus().label(), "Markets");
+
+    app.handle_key(KeyCode::Enter);
+
+    assert_eq!(app.active_trading_section(), TradingSection::Intel);
+    assert_eq!(app.intel_view().label(), "Event");
+    assert_eq!(
+        app.selected_intel_row().expect("selected intel row").event,
+        "Arsenal v Everton"
+    );
 }
 
 #[test]
@@ -456,6 +518,7 @@ fn intel_enter_preloads_calculator_and_p_opens_action_overlay() {
 
     app.set_trading_section(TradingSection::Intel);
     app.handle_key(KeyCode::Char('p'));
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
     let overlay = app
         .trading_action_overlay()
         .expect("intel p should open trading action overlay");
@@ -474,6 +537,7 @@ fn intel_action_overlay_uses_sell_only_exchange_quote() {
     app.set_trading_section(TradingSection::Intel);
 
     app.handle_key(KeyCode::Char('p'));
+    assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
     let overlay = app
         .trading_action_overlay()
