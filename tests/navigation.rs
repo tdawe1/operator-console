@@ -154,6 +154,8 @@ fn sample_owls_dashboard() -> owls::OwlsDashboard {
                 ..OwlsMarketQuote::default()
             },
         ];
+        endpoint.quote_count = endpoint.quotes.len();
+        endpoint.market_selections = owls::build_market_selections(&endpoint.quotes);
     }
     dashboard
 }

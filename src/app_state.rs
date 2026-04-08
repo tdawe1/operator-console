@@ -417,6 +417,7 @@ impl TradingActionField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TradingActionOverlayState {
+    pub overlay_id: String,
     pub seed: TradingActionSeed,
     pub selected_field: TradingActionField,
     pub mode: TradingActionMode,
@@ -445,7 +446,13 @@ impl TradingActionOverlayState {
         seed: TradingActionSeed,
         risk_report: crate::trading_actions::TradingRiskReport,
     ) -> Self {
+        let overlay_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
         Self {
+            overlay_id,
             mode: TradingActionMode::Review,
             side: seed.default_side,
             time_in_force: seed.default_time_in_force(),

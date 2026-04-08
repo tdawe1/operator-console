@@ -141,11 +141,17 @@ fn render_trading_workspace(
     ])
     .split(center[6]);
 
+    let center_pane = match app.active_trading_section() {
+        crate::app_state::TradingSection::Live => PaneId::Live,
+        crate::app_state::TradingSection::Props => PaneId::Props,
+        _ => PaneId::Markets,
+    };
+
     render_pane(frame, left[0], app, PaneId::Intel);
     render_pane(frame, left[2], app, PaneId::Accounts);
     render_market_strip(frame, center[0], app);
     render_pane(frame, center[2], app, PaneId::Chart);
-    render_pane(frame, center[4], app, PaneId::Markets);
+    render_pane(frame, center[4], app, center_pane);
     render_pane(frame, analyst[0], app, PaneId::History);
     render_pane(frame, analyst[2], app, PaneId::Stats);
     render_action_strip(frame, center[8], app);

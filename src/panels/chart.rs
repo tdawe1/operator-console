@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let header_height = if inner.width >= 78 { 3 } else { 2 };
+    let header_height = if inner.width >= 78 { 4 } else { 2 };
     let [legend_area, content_area] =
         Layout::vertical([Constraint::Length(header_height), Constraint::Min(6)]).areas(inner);
     render_legend(frame, legend_area, &model);
@@ -381,10 +381,15 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     if !compact && area.height >= 4 {
         let [headline_area, meta_area] =
             Layout::horizontal([Constraint::Length(22), Constraint::Min(24)]).areas(area);
+        let best_price = if is_distribution {
+            model.price_points.first().map(|(_, p)| *p).unwrap_or(model.high_price)
+        } else {
+            model.last_price
+        };
         let big_price = BigText::builder()
             .pixel_size(PixelSize::HalfHeight)
             .style(Style::default().fg(move_color))
-            .lines(vec![Line::from(format!("{:.2}", model.last_price))])
+            .lines(vec![Line::from(format!("{:.2}", best_price))])
             .build();
         frame.render_widget(big_price, headline_area);
 

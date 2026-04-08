@@ -276,7 +276,8 @@ fn render_selected_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled("Source ", Style::default().fg(accent_green())),
                 Span::raw(
                     statuses
-                        .first()
+                        .iter()
+                        .find(|s| s.source == row.source)
                         .map(|status| {
                             format!("{} • {}", status.source.label(), truncate(&status.detail, 24))
                         })

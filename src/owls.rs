@@ -597,7 +597,11 @@ pub async fn sync_dashboard_async(
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
             let checked_count = dashboard.endpoints.len();
             let changed = dashboard_semantically_changed(&previous_dashboard, &dashboard);
-            let changed_count = if changed { checked_count } else { 0 };
+            let changed_count = if changed {
+                count_changed_endpoints(&previous_dashboard.endpoints, &dashboard.endpoints)
+            } else {
+                0
+            };
             dashboard.sync_checks = checked_count;
             dashboard.sync_changes = changed_count;
             dashboard.total_polls = previous_dashboard.total_polls.saturating_add(checked_count);
@@ -2155,6 +2159,17 @@ fn dashboard_semantically_changed(current: &OwlsDashboard, next: &OwlsDashboard)
             .any(|(left, right)| endpoint_semantically_changed(left, right))
 }
 
+fn count_changed_endpoints(
+    current_endpoints: &[OwlsEndpointSummary],
+    next_endpoints: &[OwlsEndpointSummary],
+) -> usize {
+    current_endpoints
+        .iter()
+        .zip(next_endpoints.iter())
+        .filter(|(left, right)| endpoint_semantically_changed(left, right))
+        .count()
+}
+
 fn hydrate_result(
     id: OwlsEndpointId,
     payload: Result<Value>,
@@ -3299,9 +3314,6 @@ fn extract_market_quotes(event: &Value, book_hint: Option<&str>) -> Vec<OwlsMark
 }
 
 pub fn build_market_selections(quotes: &[OwlsMarketQuote]) -> Vec<OwlsMarketSelection> {
-    const MAX_SELECTIONS: usize = 256;
-    const MAX_QUOTES_PER_SELECTION: usize = 8;
-
     let mut grouped =
         std::collections::BTreeMap::<(String, String, String, String), OwlsMarketSelection>::new();
 
@@ -3352,10 +3364,8 @@ pub fn build_market_selections(quotes: &[OwlsMarketQuote]) -> Vec<OwlsMarketSele
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.book.cmp(&right.book))
         });
-        row.quotes.truncate(MAX_QUOTES_PER_SELECTION);
     }
 
-    rows.truncate(MAX_SELECTIONS);
     rows
 }
 

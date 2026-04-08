@@ -90,26 +90,32 @@ pub(crate) struct ProviderResult {
 #[derive(Debug, Clone)]
 pub(crate) enum BackendExecutionRequest {
     LoadPlan {
+        overlay_id: String,
         row: IntelRow,
     },
     ReviewMatch {
+        overlay_id: String,
         match_id: String,
         stake: f64,
     },
     SubmitMatch {
+        overlay_id: String,
         match_id: String,
         stake: f64,
     },
     ReviewAdhoc {
+        overlay_id: String,
         request: execution_backend::AdhocExecutionRequest,
     },
     SubmitAdhoc {
+        overlay_id: String,
         request: execution_backend::AdhocExecutionRequest,
     },
 }
 
 pub(crate) struct BackendExecutionJob {
     pub(crate) request: BackendExecutionRequest,
+    pub(crate) overlay_id: String,
 }
 
 pub(crate) enum BackendExecutionResponse {
@@ -120,6 +126,7 @@ pub(crate) enum BackendExecutionResponse {
 
 pub(crate) struct BackendExecutionResult {
     pub(crate) request: BackendExecutionRequest,
+    pub(crate) overlay_id: String,
     pub(crate) result: std::result::Result<BackendExecutionResponse, String>,
 }
 
@@ -223,6 +230,7 @@ pub struct App {
     backend_execution_tx: Sender<BackendExecutionJob>,
     backend_execution_rx: Receiver<BackendExecutionResult>,
     backend_execution_in_flight_count: usize,
+    backend_execution_submission_in_flight: HashMap<String, bool>,
     provider_resource_state: ResourceState<ExchangePanelSnapshot>,
     provider_pending_job: Option<ProviderJob>,
     #[cfg(debug_assertions)]
@@ -527,6 +535,7 @@ impl App {
             backend_execution_tx: runtime.backend_execution_tx,
             backend_execution_rx: runtime.backend_execution_rx,
             backend_execution_in_flight_count: 0,
+            backend_execution_submission_in_flight: HashMap::new(),
             provider_resource_state: ResourceState::ready(snapshot.clone()),
             provider_pending_job: None,
             #[cfg(debug_assertions)]
@@ -2015,8 +2024,21 @@ impl App {
         queued_message: impl Into<String>,
     ) -> bool {
         self.drain_backend_execution_results();
-        match self.backend_execution_tx.send(job) {
+
+        let is_submit = matches!(job.request, BackendExecutionRequest::SubmitMatch { .. } | BackendExecutionRequest::SubmitAdhoc { .. });
+        if is_submit {
+            if self.backend_execution_submission_in_flight.get(&job.overlay_id) == Some(&true) {
+                self.status_message = String::from("Submission already in progress for this overlay.");
+                self.status_scroll = 0;
+                return false;
+            }
+        }
+
+        match self.backend_execution_tx.send(job.clone()) {
             Ok(()) => {
+                if is_submit {
+                    self.backend_execution_submission_in_flight.insert(job.overlay_id, true);
+                }
                 self.backend_execution_in_flight_count += 1;
                 self.status_message = queued_message.into();
                 self.status_scroll = 0;
@@ -2036,17 +2058,26 @@ impl App {
             self.backend_execution_in_flight_count =
                 self.backend_execution_in_flight_count.saturating_sub(1);
 
+            let is_submit = matches!(result.request, BackendExecutionRequest::SubmitMatch { .. } | BackendExecutionRequest::SubmitAdhoc { .. });
+            if is_submit {
+                self.backend_execution_submission_in_flight.remove(&result.overlay_id);
+            }
+
+            let current_overlay_id = self.trading_action_overlay.as_ref().map(|o| o.overlay_id.clone());
+            let result_is_stale = current_overlay_id.as_ref() != Some(&result.overlay_id);
+
             match result.result {
                 Ok(BackendExecutionResponse::Plan(plan)) => {
-                    let BackendExecutionRequest::LoadPlan { row } = result.request else {
+                    let BackendExecutionRequest::LoadPlan { overlay_id, row } = result.request else {
                         continue;
                     };
                     match self.build_market_intel_overlay_seed_from_plan(&row, plan) {
-                        Ok((seed, backend_gateway)) => {
+                        Ok((mut seed, backend_gateway)) => {
                             self.open_trading_action_overlay(seed);
                             if let (Some(gateway), Some(overlay)) =
                                 (backend_gateway, self.trading_action_overlay.as_mut())
                             {
+                                overlay.overlay_id = overlay_id;
                                 overlay.backend_gateway = Some(gateway);
                             }
                         }
@@ -2054,13 +2085,19 @@ impl App {
                     }
                 }
                 Ok(BackendExecutionResponse::Review(response)) => {
+                    if result_is_stale {
+                        continue;
+                    }
                     self.apply_backend_review_response(response);
                 }
                 Ok(BackendExecutionResponse::Submit(response)) => {
+                    if result_is_stale {
+                        continue;
+                    }
                     self.apply_backend_submit_response(response);
                 }
                 Err(error) => match result.request {
-                    BackendExecutionRequest::LoadPlan { row } => {
+                    BackendExecutionRequest::LoadPlan { overlay_id, row } => {
                         if execution_backend::is_not_found_error(&error) {
                             self.fail_backend_execution_command(error);
                             continue;
@@ -3863,16 +3900,22 @@ impl App {
 
     fn event_intel_rows(&self) -> Vec<IntelRow> {
         if let Some(dashboard) = self.market_intel_dashboard() {
-            if let Some(detail) = dashboard.event_detail.as_ref() {
-                return intel_rows_from_event_detail(detail);
-            }
-
             if let Some(selection) = self.selected_owls_market_selection() {
+                if let Some(detail) = dashboard.event_detail.as_ref() {
+                    if event_matches(&detail.event_name, &selection.event) {
+                        return intel_rows_from_event_detail(detail);
+                    }
+                }
+
                 let rows = event_scoped_intel_rows_from_dashboard(dashboard, &selection);
                 if !rows.is_empty() {
                     return rows;
                 }
                 return owls_event_intel_rows(&selection);
+            }
+
+            if let Some(detail) = dashboard.event_detail.as_ref() {
+                return intel_rows_from_event_detail(detail);
             }
 
             return Vec::new();
@@ -3920,7 +3963,7 @@ impl App {
 
     fn open_trading_action_overlay_from_selected_owls_market(&mut self) {
         self.focus_intel_event_for_selected_owls_market();
-        if self.selected_intel_row().is_some() {
+        if self.intel_table_state.selected().is_some() {
             self.open_trading_action_overlay_from_intel();
         }
     }
@@ -5337,9 +5380,11 @@ impl App {
             ));
         }
 
+        let overlay_id = overlay.overlay_id.clone();
         let (request, status_message) = if overlay.mode == TradingActionMode::Review {
             (
                 BackendExecutionRequest::ReviewMatch {
+                    overlay_id: overlay_id.clone(),
                     match_id: match_id.to_string(),
                     stake,
                 },
@@ -5348,13 +5393,14 @@ impl App {
         } else {
             (
                 BackendExecutionRequest::SubmitMatch {
+                    overlay_id: overlay_id.clone(),
                     match_id: match_id.to_string(),
                     stake,
                 },
                 String::from("Execution submit queued."),
             )
         };
-        self.queue_backend_execution_job(BackendExecutionJob { request }, status_message);
+        self.queue_backend_execution_job(BackendExecutionJob { request, overlay_id }, status_message);
         Ok(())
     }
 
@@ -5366,7 +5412,7 @@ impl App {
         let price = overlay.seed.price_for_side(overlay.side).ok_or_else(|| {
             color_eyre::eyre::eyre!("No executable price is available for this side.")
         })?;
-        let request = execution_backend::AdhocExecutionRequest {
+        let adhoc_request = execution_backend::AdhocExecutionRequest {
             venue: overlay.seed.venue.as_str().to_string(),
             side: match overlay.side {
                 TradingActionSide::Buy => String::from("back"),
@@ -5384,18 +5430,19 @@ impl App {
             selection_ref: overlay.seed.betslip_selection_id.clone(),
         };
 
+        let overlay_id = overlay.overlay_id.clone();
         let (request, status_message) = if overlay.mode == TradingActionMode::Review {
             (
-                BackendExecutionRequest::ReviewAdhoc { request },
+                BackendExecutionRequest::ReviewAdhoc { overlay_id: overlay_id.clone(), request: adhoc_request },
                 String::from("Execution review queued."),
             )
         } else {
             (
-                BackendExecutionRequest::SubmitAdhoc { request },
+                BackendExecutionRequest::SubmitAdhoc { overlay_id: overlay_id.clone(), request: adhoc_request },
                 String::from("Execution submit queued."),
             )
         };
-        self.queue_backend_execution_job(BackendExecutionJob { request }, status_message);
+        self.queue_backend_execution_job(BackendExecutionJob { request, overlay_id }, status_message);
         Ok(())
     }
 
@@ -5730,9 +5777,16 @@ impl App {
             return;
         }
 
+        let overlay_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
+
         self.queue_backend_execution_job(
             BackendExecutionJob {
-                request: BackendExecutionRequest::LoadPlan { row },
+                request: BackendExecutionRequest::LoadPlan { overlay_id: overlay_id.clone(), row },
+                overlay_id,
             },
             String::from("Loading trading action plan."),
         );
@@ -7340,31 +7394,32 @@ pub(crate) fn start_backend_execution_worker() -> (
     thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
             let request = job.request.clone();
+            let overlay_id = job.overlay_id.clone();
             let result = match request.clone() {
-                BackendExecutionRequest::LoadPlan { row } => {
+                BackendExecutionRequest::LoadPlan { overlay_id, row } => {
                     execution_backend::fetch_execution_plan(&row.id)
                         .map(BackendExecutionResponse::Plan)
                 }
-                BackendExecutionRequest::ReviewMatch { match_id, stake } => {
+                BackendExecutionRequest::ReviewMatch { overlay_id, match_id, stake } => {
                     execution_backend::review_execution(&match_id, stake)
                         .map(BackendExecutionResponse::Review)
                 }
-                BackendExecutionRequest::SubmitMatch { match_id, stake } => {
+                BackendExecutionRequest::SubmitMatch { overlay_id, match_id, stake } => {
                     execution_backend::submit_execution(&match_id, stake)
                         .map(BackendExecutionResponse::Submit)
                 }
-                BackendExecutionRequest::ReviewAdhoc { request } => {
+                BackendExecutionRequest::ReviewAdhoc { overlay_id, request } => {
                     execution_backend::review_adhoc_execution(&request)
                         .map(BackendExecutionResponse::Review)
                 }
-                BackendExecutionRequest::SubmitAdhoc { request } => {
+                BackendExecutionRequest::SubmitAdhoc { overlay_id, request } => {
                     execution_backend::submit_adhoc_execution(&request)
                         .map(BackendExecutionResponse::Submit)
                 }
             }
             .map_err(|error| error.to_string());
             if result_tx
-                .send(BackendExecutionResult { request, result })
+                .send(BackendExecutionResult { request, overlay_id, result })
                 .is_err()
             {
                 break;
@@ -9617,12 +9672,13 @@ mod tests {
         app.open_trading_action_overlay_from_intel();
 
         let job = job_rx.recv().expect("queued execution plan request");
-        let BackendExecutionRequest::LoadPlan { row } = job.request else {
+        let BackendExecutionRequest::LoadPlan { overlay_id, row } = job.request else {
             panic!("expected load-plan request");
         };
         result_tx
             .send(BackendExecutionResult {
-                request: BackendExecutionRequest::LoadPlan { row },
+                request: BackendExecutionRequest::LoadPlan { overlay_id: overlay_id.clone(), row },
+                overlay_id,
                 result: Err(String::from("HTTP 404 during execution plan: not found")),
             })
             .expect("send plan failure");

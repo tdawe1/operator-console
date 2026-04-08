@@ -197,7 +197,7 @@ fn sabisabi_is_healthy(base_url: &str) -> bool {
                 .send()
                 .ok()
                 .is_some_and(|response| response.status().is_success());
-            health_ok && snapshot_ok
+            health_ok || snapshot_ok
         })
 }
 

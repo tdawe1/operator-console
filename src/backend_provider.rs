@@ -73,14 +73,18 @@ impl BackendExchangeProvider {
                 .wrap_err_with(|| format!("request failed for {path}"))?;
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 let fallback_path = "/api/v1/control/operator/snapshot";
-                let fallback_response = self
+                let mut fallback_request = self
                     .client
                     .post(format!(
                         "{}{}",
                         base_url.trim_end_matches('/'),
                         fallback_path
                     ))
-                    .json(&OperatorSnapshotControlRequest::default())
+                    .json(&OperatorSnapshotControlRequest::default());
+                if let Some(token) = sabisabi_control_token() {
+                    fallback_request = fallback_request.bearer_auth(token);
+                }
+                let fallback_response = fallback_request
                     .send()
                     .wrap_err_with(|| format!("request failed for {fallback_path}"))?;
                 (fallback_path, fallback_response)
