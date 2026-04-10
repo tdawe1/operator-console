@@ -218,8 +218,27 @@ pub fn submit_adhoc_execution(request: &AdhocExecutionRequest) -> Result<Executi
     decode_json_response(response, "ad hoc execution submit")
 }
 
-pub fn is_not_found_error(detail: &str) -> bool {
-    detail.contains("HTTP 404 during")
+#[derive(Debug)]
+pub struct ExecutionHttpError {
+    pub status: u16,
+    pub label: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for ExecutionHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} during {}: {}", self.status, self.label, self.body)
+    }
+}
+
+impl std::error::Error for ExecutionHttpError {}
+
+pub fn is_not_found_error(error: &color_eyre::eyre::Report) -> bool {
+    if let Some(http_error) = error.downcast_ref::<ExecutionHttpError>() {
+        http_error.status == 404
+    } else {
+        false
+    }
 }
 
 fn build_backend_client() -> Result<Client> {
@@ -248,12 +267,12 @@ fn decode_json_response<T: for<'de> Deserialize<'de>>(
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(eyre!(
-            "HTTP {} during {}: {}",
-            status.as_u16(),
-            label,
-            truncate(&body, 200)
-        ));
+        return Err(ExecutionHttpError {
+            status: status.as_u16(),
+            label: label.to_string(),
+            body: truncate(&body, 200),
+        }
+        .into());
     }
     serde_json::from_str(&body).wrap_err_with(|| format!("failed to decode {label} response"))
 }

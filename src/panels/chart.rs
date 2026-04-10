@@ -16,10 +16,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let model = build_chart_model(app);
     if area.width < 24 || area.height < 10 {
         return;
     }
+    let model = build_chart_model(app);
 
     let block = panel_block(" Price Chart ");
     let inner = block.inner(area).inner(Margin {

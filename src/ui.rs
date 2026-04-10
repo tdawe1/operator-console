@@ -474,6 +474,8 @@ fn render_top_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     );
 }
 
+#[allow(dead_code)]
+// TODO: map app.wm.active_workspace to TradingSection variants
 fn workspace_sections(app: &App) -> Vec<crate::app_state::TradingSection> {
     use crate::app_state::TradingSection;
 

@@ -2236,6 +2236,8 @@ fn fetch_json(
     serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
 }
 
+static BACKEND_UNHEALTHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn fetch_json_async(
     client: &AsyncClient,
     base_url: &str,
@@ -2244,20 +2246,23 @@ async fn fetch_json_async(
     query: &[(&str, &str)],
 ) -> Result<Value> {
     if api_key.trim().is_empty() {
-        return match fetch_backend_json_async(client, base_url, path, query).await {
-            Ok(value) => Ok(value),
-            Err(backend_error) => {
-                tracing::warn!("owls backend fetch failed for {path}: {backend_error}");
-                let direct_api_key = load_api_key()?;
-                let direct_base_url = env::var("OWLS_INSIGHT_BASE_URL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
-                fetch_upstream_json_async(client, &direct_base_url, &direct_api_key, path, query)
-                    .await
-                    .wrap_err_with(|| format!("backend request failed for {path}: {backend_error}"))
+        if !BACKEND_UNHEALTHY.load(std::sync::atomic::Ordering::Relaxed) {
+            match fetch_backend_json_async(client, base_url, path, query).await {
+                Ok(value) => return Ok(value),
+                Err(backend_error) => {
+                    tracing::warn!("owls backend fetch failed for {path}: {backend_error}");
+                    BACKEND_UNHEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
-        };
+        }
+        let direct_api_key = load_api_key()?;
+        let direct_base_url = env::var("OWLS_INSIGHT_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
+        return fetch_upstream_json_async(client, &direct_base_url, &direct_api_key, path, query)
+            .await
+            .wrap_err_with(|| format!("backend request failed for {path}"));
     }
     fetch_upstream_json_async(client, base_url, api_key, path, query).await
 }

@@ -138,7 +138,10 @@ struct BackendOperatorSnapshotResponse {
     matchbook_account_state: Option<MatchbookAccountState>,
 }
 
-#[derive(Debug, Deserialize)]
+// The Envelope variant must be ordered before Snapshot because ExchangePanelSnapshot
+// has #[serde(default)] fields, which could cause serde to eagerly mis-parse an
+// Envelope payload into an empty Snapshot if evaluated first.
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum BackendOperatorSnapshotPayload {
     Envelope(BackendOperatorSnapshotResponse),
@@ -310,8 +313,8 @@ fn dotenv_candidates() -> Vec<PathBuf> {
         paths.push(home_path.join(".env.local"));
         paths.push(home_path.join(".env"));
     }
-    paths.sort();
-    paths.dedup();
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
     paths
 }
 
