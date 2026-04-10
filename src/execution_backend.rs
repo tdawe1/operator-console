@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -340,8 +341,8 @@ fn dotenv_candidates() -> Vec<PathBuf> {
         paths.push(home_path.join(".env.local"));
         paths.push(home_path.join(".env"));
     }
-    paths.sort();
-    paths.dedup();
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     paths
 }
 

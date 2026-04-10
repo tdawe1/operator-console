@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use futures_util::FutureExt;
@@ -24,9 +25,9 @@ const API_KEY_ENV_NAMES: [&str; 2] = ["OWLS_INSIGHT_API_KEY", "OWLSINSIGHT_API_K
 const SABISABI_BASE_URL_ENV: &str = "SABISABI_BASE_URL";
 const DEFAULT_SABISABI_BASE_URL: &str = "http://127.0.0.1:4080";
 const DEFAULT_SPORT: &str = "soccer";
-const DEFAULT_PLAYER: &str = "LeBron James";
-const DEFAULT_PROP_TYPE: &str = "points";
-const DEFAULT_BOOK_PROPS_PLAYER: &str = "LeBron";
+const DEFAULT_PLAYER: &str = "Lionel Messi";
+const DEFAULT_PROP_TYPE: &str = "goals";
+const DEFAULT_BOOK_PROPS_PLAYER: &str = "Lionel";
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const HOT_SYNC_INTERVAL: Duration = Duration::from_secs(3);
 const WARM_SYNC_INTERVAL: Duration = Duration::from_secs(10);
@@ -34,6 +35,7 @@ const COOL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const COLD_SYNC_INTERVAL: Duration = Duration::from_secs(120);
 const BACKGROUND_SYNC_BATCH: usize = 3;
 const MANUAL_SYNC_BATCH: usize = 6;
+const BACKEND_UNHEALTHY_TTL_MS: u64 = 30_000;
 pub const SUPPORTED_SPORTS: &[&str] = &[
     "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "soccer", "epl", "mma", "tennis", "cs2",
 ];
@@ -86,7 +88,7 @@ impl OwlsEndpointGroup {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwlsEndpointId {
     Odds,
@@ -613,7 +615,7 @@ pub async fn sync_dashboard_async(
             }
         }
         Err(error) => {
-            let mut dashboard = dashboard_for_trading_section(&sport, section);
+            let mut dashboard = previous_dashboard.clone();
             let detail = normalize_owls_error(&error.to_string());
             mark_all_endpoints_error(&mut dashboard, &detail);
             dashboard.status_line = format!("Owls backend unavailable: {detail}");
@@ -1827,6 +1829,12 @@ async fn refresh_dashboard_team_normalizations_async(
 fn collect_dashboard_team_names(dashboard: &OwlsDashboard) -> Vec<String> {
     let mut names = BTreeSet::new();
     for endpoint in &dashboard.endpoints {
+        for selection in &endpoint.market_selections {
+            if let Some((left, right)) = split_event_teams(&selection.event) {
+                names.insert(left);
+                names.insert(right);
+            }
+        }
         for quote in &endpoint.quotes {
             if let Some((left, right)) = split_event_teams(&quote.event) {
                 names.insert(left);
@@ -2163,11 +2171,32 @@ fn count_changed_endpoints(
     current_endpoints: &[OwlsEndpointSummary],
     next_endpoints: &[OwlsEndpointSummary],
 ) -> usize {
-    current_endpoints
+    let current_by_id = current_endpoints
         .iter()
-        .zip(next_endpoints.iter())
-        .filter(|(left, right)| endpoint_semantically_changed(left, right))
-        .count()
+        .map(|endpoint| (endpoint.id, endpoint))
+        .collect::<HashMap<_, _>>();
+    let next_by_id = next_endpoints
+        .iter()
+        .map(|endpoint| (endpoint.id, endpoint))
+        .collect::<HashMap<_, _>>();
+
+    let mut changed_count = 0;
+    for (id, current) in &current_by_id {
+        match next_by_id.get(id) {
+            Some(next) => {
+                if endpoint_semantically_changed(current, next) {
+                    changed_count += 1;
+                }
+            }
+            None => changed_count += 1,
+        }
+    }
+    for id in next_by_id.keys() {
+        if !current_by_id.contains_key(id) {
+            changed_count += 1;
+        }
+    }
+    changed_count
 }
 
 fn hydrate_result(
@@ -2236,7 +2265,14 @@ fn fetch_json(
     serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
 }
 
-static BACKEND_UNHEALTHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BACKEND_UNHEALTHY_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
 
 async fn fetch_json_async(
     client: &AsyncClient,
@@ -2246,12 +2282,19 @@ async fn fetch_json_async(
     query: &[(&str, &str)],
 ) -> Result<Value> {
     if api_key.trim().is_empty() {
-        if !BACKEND_UNHEALTHY.load(std::sync::atomic::Ordering::Relaxed) {
+        let now_ms = current_epoch_millis();
+        let backend_unhealthy_at = BACKEND_UNHEALTHY_AT_MS.load(Ordering::Relaxed);
+        let backend_is_healthy = backend_unhealthy_at == 0
+            || now_ms.saturating_sub(backend_unhealthy_at) >= BACKEND_UNHEALTHY_TTL_MS;
+        if backend_is_healthy {
             match fetch_backend_json_async(client, base_url, path, query).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    BACKEND_UNHEALTHY_AT_MS.store(0, Ordering::Relaxed);
+                    return Ok(value);
+                }
                 Err(backend_error) => {
                     tracing::warn!("owls backend fetch failed for {path}: {backend_error}");
-                    BACKEND_UNHEALTHY.store(true, std::sync::atomic::Ordering::Relaxed);
+                    BACKEND_UNHEALTHY_AT_MS.store(now_ms, Ordering::Relaxed);
                 }
             }
         }

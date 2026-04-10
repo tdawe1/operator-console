@@ -832,6 +832,7 @@ impl App {
             self.live_view_overlay_visible = false;
             self.markets_overlay_visible = false;
             self.notifications_overlay_visible = false;
+            self.pending_load_plan_id = None;
             self.trading_action_overlay = None;
         }
     }
@@ -857,6 +858,9 @@ impl App {
             TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
         ) {
             self.trading_action_overlay = None;
+        }
+        if section != TradingSection::Intel {
+            self.pending_load_plan_id = None;
         }
         if self.is_owls_context() {
             let sport = self.owls_dashboard.sport.clone();
@@ -2066,20 +2070,28 @@ impl App {
                 self.backend_execution_submission_in_flight.remove(&result.overlay_id);
             }
 
-            let current_overlay_id = self.trading_action_overlay.as_ref().map(|o| o.overlay_id.clone());
-            let result_is_stale = current_overlay_id.as_ref() != Some(&result.overlay_id);
+            let current_overlay_id = self
+                .trading_action_overlay
+                .as_ref()
+                .map(|overlay| overlay.overlay_id.as_str());
+            let result_is_stale =
+                current_overlay_id.is_some_and(|overlay_id| overlay_id != result.overlay_id);
 
             match result.result {
                 Ok(BackendExecutionResponse::Plan(plan)) => {
                     let BackendExecutionRequest::LoadPlan { overlay_id, row } = result.request else {
                         continue;
                     };
-                    if Some(row.id.as_str()) != self.pending_load_plan_id.as_deref() {
+                    if Some(overlay_id.as_str()) != self.pending_load_plan_id.as_deref() {
+                        continue;
+                    }
+                    if result_is_stale {
+                        self.pending_load_plan_id = None;
                         continue;
                     }
                     self.pending_load_plan_id = None;
                     match self.build_market_intel_overlay_seed_from_plan(&row, plan) {
-                        Ok((mut seed, backend_gateway)) => {
+                        Ok((seed, backend_gateway)) => {
                             self.open_trading_action_overlay(seed);
                             if let (Some(gateway), Some(overlay)) =
                                 (backend_gateway, self.trading_action_overlay.as_mut())
@@ -2104,8 +2116,12 @@ impl App {
                     self.apply_backend_submit_response(response);
                 }
                 Err(error) => match result.request {
-                    BackendExecutionRequest::LoadPlan { row, .. } => {
-                        if Some(row.id.as_str()) != self.pending_load_plan_id.as_deref() {
+                    BackendExecutionRequest::LoadPlan { overlay_id, row } => {
+                        if Some(overlay_id.as_str()) != self.pending_load_plan_id.as_deref() {
+                            continue;
+                        }
+                        if result_is_stale {
+                            self.pending_load_plan_id = None;
                             continue;
                         }
                         self.pending_load_plan_id = None;
@@ -2715,10 +2731,9 @@ impl App {
     pub fn next_section(&mut self) {
         match self.active_panel {
             Panel::Trading => {
-                self.focus_trading_section(self.normalize_trading_section(next_from(
-                    self.trading_section,
-                    &TradingSection::ALL,
-                )))
+                let sections = self.normalized_trading_sections();
+                let current = self.normalize_trading_section(self.trading_section);
+                self.focus_trading_section(next_from(current, &sections))
             }
             Panel::Observability => {
                 self.observability_section =
@@ -2742,9 +2757,11 @@ impl App {
 
     pub fn previous_section(&mut self) {
         match self.active_panel {
-            Panel::Trading => self.focus_trading_section(self.normalize_trading_section(
-                previous_from(self.trading_section, &TradingSection::ALL),
-            )),
+            Panel::Trading => {
+                let sections = self.normalized_trading_sections();
+                let current = self.normalize_trading_section(self.trading_section);
+                self.focus_trading_section(previous_from(current, &sections))
+            }
             Panel::Observability => {
                 self.observability_section =
                     previous_from(self.observability_section, &ObservabilitySection::ALL)
@@ -3672,6 +3689,17 @@ impl App {
         } else {
             section
         }
+    }
+
+    fn normalized_trading_sections(&self) -> Vec<TradingSection> {
+        let mut sections = Vec::new();
+        for section in TradingSection::ALL {
+            let normalized = self.normalize_trading_section(section);
+            if !sections.contains(&normalized) {
+                sections.push(normalized);
+            }
+        }
+        sections
     }
 
     fn apply_pane_context(&mut self, pane: PaneId) {
@@ -5177,6 +5205,7 @@ impl App {
     }
 
     fn close_trading_action_overlay(&mut self, message: &str) {
+        self.pending_load_plan_id = None;
         self.trading_action_overlay = None;
         self.status_message = String::from(message);
     }
@@ -5788,19 +5817,21 @@ impl App {
             return;
         }
 
-        self.pending_load_plan_id = Some(row.id.clone());
         let overlay_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .to_string();
-        self.queue_backend_execution_job(
+        self.pending_load_plan_id = Some(overlay_id.clone());
+        if !self.queue_backend_execution_job(
             BackendExecutionJob {
                 request: BackendExecutionRequest::LoadPlan { overlay_id: overlay_id.clone(), row },
                 overlay_id,
             },
             String::from("Loading trading action plan."),
-        );
+        ) {
+            self.pending_load_plan_id = None;
+        }
     }
 
     fn build_market_intel_overlay_seed_from_plan(
@@ -7407,7 +7438,7 @@ pub(crate) fn start_backend_execution_worker() -> (
             let request = job.request.clone();
             let overlay_id = job.overlay_id.clone();
             let result = match request.clone() {
-                BackendExecutionRequest::LoadPlan { overlay_id, row } => {
+                BackendExecutionRequest::LoadPlan { row, .. } => {
                     execution_backend::fetch_execution_plan(&row.id)
                         .map(BackendExecutionResponse::Plan)
                 }
@@ -7415,15 +7446,15 @@ pub(crate) fn start_backend_execution_worker() -> (
                     execution_backend::review_execution(&match_id, stake)
                         .map(BackendExecutionResponse::Review)
                 }
-                BackendExecutionRequest::SubmitMatch { overlay_id, match_id, stake } => {
+                BackendExecutionRequest::SubmitMatch { match_id, stake, .. } => {
                     execution_backend::submit_execution(&match_id, stake)
                         .map(BackendExecutionResponse::Submit)
                 }
-                BackendExecutionRequest::ReviewAdhoc { overlay_id, request } => {
+                BackendExecutionRequest::ReviewAdhoc { request, .. } => {
                     execution_backend::review_adhoc_execution(&request)
                         .map(BackendExecutionResponse::Review)
                 }
-                BackendExecutionRequest::SubmitAdhoc { overlay_id, request } => {
+                BackendExecutionRequest::SubmitAdhoc { request, .. } => {
                     execution_backend::submit_adhoc_execution(&request)
                         .map(BackendExecutionResponse::Submit)
                 }

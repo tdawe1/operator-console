@@ -180,10 +180,15 @@ fn render_markets_workspace(
     ])
     .split(center_col);
     let right = Layout::vertical([Constraint::Min(12)]).split(right_col);
+    let center_pane = match app.active_trading_section() {
+        crate::app_state::TradingSection::Live => PaneId::Live,
+        crate::app_state::TradingSection::Props => PaneId::Props,
+        _ => PaneId::Markets,
+    };
 
     render_pane(frame, left[0], app, PaneId::Intel);
     render_market_strip(frame, center[0], app);
-    render_pane(frame, center[2], app, PaneId::Markets);
+    render_pane(frame, center[2], app, center_pane);
     render_pane(frame, center[4], app, PaneId::Chart);
     render_action_strip(frame, center[6], app);
     render_pane(frame, right[0], app, PaneId::Matcher);
