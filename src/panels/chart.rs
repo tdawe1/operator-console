@@ -68,6 +68,7 @@ struct ChartModel {
     title: String,
     subtitle: String,
     source: String,
+    is_distribution: bool,
     price_points: Vec<(f64, f64)>,
     volume_points: Vec<(f64, f64)>,
     ladder_quotes: Vec<LadderQuote>,
@@ -139,6 +140,7 @@ fn chart_from_intel_history(app: &App) -> Option<ChartModel> {
         selected.selection,
         format!("{} • {}", truncate(&selected.event, 34), selected.market),
         String::from("event history"),
+        false,
         price_points,
         volume_points,
         ladder_quotes,
@@ -175,7 +177,7 @@ fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
                 index as f64,
                 quote
                     .limit_amount
-                    .unwrap_or_else(|| (quotes.len().saturating_sub(index)) as f64),
+                    .unwrap_or(0.0),
             )
         })
         .collect::<Vec<_>>();
@@ -192,6 +194,7 @@ fn chart_from_owls_quotes(app: &App) -> Option<ChartModel> {
             selection.market_label()
         ),
         String::from("book distribution"),
+        true,
         price_points,
         volume_points,
         ladder_quotes,
@@ -226,10 +229,15 @@ fn chart_from_intel_snapshot(selected: Option<&IntelRow>) -> Option<ChartModel> 
     if ladder_quotes.is_empty() {
         return None;
     }
-    let sorted_prices = ladder_quotes
+    let mut sorted_prices = ladder_quotes
         .iter()
+        .map(|quote| quote.price)
+        .collect::<Vec<_>>();
+    sorted_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sorted_prices = sorted_prices
+        .into_iter()
         .enumerate()
-        .map(|(index, quote)| (index as f64, quote.price))
+        .map(|(index, price)| (index as f64, price))
         .collect::<Vec<_>>();
     let comparison_series = comparison_series_from_ladder_quotes(
         &ladder_quotes,
@@ -240,6 +248,7 @@ fn chart_from_intel_snapshot(selected: Option<&IntelRow>) -> Option<ChartModel> 
         row.selection.clone(),
         format!("{} • {}", truncate(&row.event, 34), row.market),
         String::from("snapshot ladder"),
+        true,
         sorted_prices,
         Vec::new(),
         ladder_quotes,
@@ -251,6 +260,7 @@ fn finalize_chart_model(
     title: String,
     subtitle: String,
     source: String,
+    is_distribution: bool,
     price_points: Vec<(f64, f64)>,
     volume_points: Vec<(f64, f64)>,
     ladder_quotes: Vec<LadderQuote>,
@@ -319,6 +329,7 @@ fn finalize_chart_model(
         title,
         subtitle,
         source,
+        is_distribution,
         price_points: price_points.clone(),
         volume_points,
         ladder_quotes,
@@ -344,6 +355,7 @@ fn empty_chart_model() -> ChartModel {
         String::from("No Market Selected"),
         String::from("Awaiting endpoint quotes or event history"),
         String::from("idle"),
+        false,
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -353,7 +365,7 @@ fn empty_chart_model() -> ChartModel {
 
 fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     let compact = area.width < 72;
-    let is_distribution = model.source == "book distribution";
+    let is_distribution = model.is_distribution;
     let base_price = model
         .price_points
         .first()
@@ -574,7 +586,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 
 fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     let block = section_block(
-        if model.source == "book distribution" {
+        if model.is_distribution {
             "Price Distribution"
         } else {
             "Price Action"
@@ -596,7 +608,7 @@ fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
         return;
     }
 
-    let is_distribution = model.source == "book distribution";
+    let is_distribution = model.is_distribution;
     let fill_color = if is_distribution || model.trend_up {
         elevated_background()
     } else {
@@ -658,7 +670,7 @@ fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 
 fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
     let block = section_block(
-        if model.source == "book distribution" {
+        if model.is_distribution {
             "Liquidity Profile"
         } else {
             "Volume"
@@ -692,7 +704,7 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
         Paragraph::new(Line::from(vec![
             Span::styled(" ░ ", Style::default().fg(accent_pink())),
             Span::styled(
-                if model.source == "book distribution" {
+                if model.is_distribution {
                     "Limit "
                 } else {
                     "Volume "
@@ -705,7 +717,7 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
             ),
             Span::styled(" █ ", Style::default().fg(accent_green())),
             Span::styled(
-                if model.source == "book distribution" {
+                if model.is_distribution {
                     "Avg "
                 } else {
                     "SMAVG(5) "
